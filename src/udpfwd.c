@@ -133,7 +133,7 @@ static struct sockaddr_inx g_src_addr;
 static struct sockaddr_inx g_dst_addr;
 static const char *g_pidfile;
 
-#define CONN_TBL_HASH_SIZE  (1 < 8)
+#define CONN_TBL_HASH_SIZE  (1 << 8)
 static struct list_head conn_tbl_hbase[CONN_TBL_HASH_SIZE];
 static unsigned conn_tbl_len;
 static unsigned proxy_conn_timeo = 60;
