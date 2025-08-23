@@ -48,6 +48,20 @@ On receipt, the main loop exits cleanly; registered `atexit` handlers remove the
 - Robust events are registered and handled uniformly: `EPOLLRDHUP | EPOLLHUP | EPOLLERR`.
 - Listener sockets are level-triggered and also watch `EPOLLERR | EPOLLHUP` to avoid spurious accepts.
 
+## Portability: no-epoll fallback
+
+On non-Linux platforms where epoll is unavailable, the project uses a lightweight compatibility layer in `src/no-epoll.h`:
+
+- Implements the epoll API on top of `poll()` for portability.
+- Dynamically allocates handles and file descriptor arrays (no FD_SETSIZE cap, no fixed handle count).
+- Supports common flags: `EPOLLIN`, `EPOLLOUT`, `EPOLLERR`, `EPOLLHUP`, `EPOLLRDHUP`. `EPOLLET` is accepted but edge-triggered semantics are not emulated.
+- `epoll_event.data` is preserved across `epoll_ctl()`/`epoll_wait()`.
+
+Limitations:
+
+- Behavior is level-triggered; do not rely on edge-triggered wakeups when built with the fallback.
+- Performance may differ from native epoll; consider libevent/libuv for advanced cross-platform needs.
+
 ## UDP performance tunables (build-time)
 
 The UDP forwarder (`udpfwd`) supports kernel/userspace buffer and batching tunables. Set via CFLAGS at build time:
@@ -93,3 +107,7 @@ make -C src
 ```
 
 Override tunables with `CFLAGS` as shown in the examples above.
+
+Notes:
+
+- On Linux, native epoll is used. On other platforms, `no-epoll.h` is included automatically by the source as a shim.

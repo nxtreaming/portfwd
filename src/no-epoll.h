@@ -9,6 +9,8 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <stdlib.h>
 
 typedef union epoll_data {
     void *ptr;
@@ -36,63 +38,105 @@ struct epoll_event {
 #define EPOLL_CTL_MOD 3
 
 struct pseudo_epoll_handle {
-    int allocated;
-    fd_set rset;
-    fd_set wset;
-    int max_fd;
-    struct epoll_event events[FD_SETSIZE];
+    struct pollfd *pfds;              /* dynamic array of pollfd */
+    struct epoll_event *evs;          /* parallel epoll_event (stores .data) */
+    size_t len;                        /* number of active fds */
+    size_t cap;                        /* capacity of arrays */
 };
 
-#define PSEUDO_EPOLL_LIST_SIZE  4
-static struct pseudo_epoll_handle pseudo_epolls[PSEUDO_EPOLL_LIST_SIZE];
+static struct pseudo_epoll_handle **pseudo_epolls = NULL;
+static size_t pseudo_epolls_cap = 0;
 
 static int epoll_create(int size)
 {
-    int i;
-
-    for (i = 0; i < PSEUDO_EPOLL_LIST_SIZE; i++) {
-        struct pseudo_epoll_handle *eh = &pseudo_epolls[i];
-        if (!eh->allocated) {
-            eh->allocated = 1;
-            FD_ZERO(&eh->rset);
-            FD_ZERO(&eh->wset);
-            eh->max_fd = -1;
-            return i;
+    (void)size;
+    size_t i;
+    /* Find a free slot */
+    for (i = 0; i < pseudo_epolls_cap; i++) {
+        if (pseudo_epolls[i] == NULL) {
+            struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
+            if (!eh) return -ENOMEM;
+            eh->cap = 16;
+            eh->pfds = (struct pollfd *)calloc(eh->cap, sizeof(struct pollfd));
+            eh->evs = (struct epoll_event *)calloc(eh->cap, sizeof(struct epoll_event));
+            if (!eh->pfds || !eh->evs) {
+                free(eh->pfds); free(eh->evs); free(eh);
+                return -ENOMEM;
+            }
+            pseudo_epolls[i] = eh;
+            return (int)i;
         }
     }
-
-    return -EINVAL;
+    /* Need to grow registry */
+    size_t old_cap = pseudo_epolls_cap;
+    size_t new_cap = old_cap ? (old_cap + 8) : 8;
+    void *np = realloc(pseudo_epolls, new_cap * sizeof(*pseudo_epolls));
+    if (!np) return -ENOMEM;
+    pseudo_epolls = (struct pseudo_epoll_handle **)np;
+    for (i = old_cap; i < new_cap; i++) pseudo_epolls[i] = NULL;
+    pseudo_epolls_cap = new_cap;
+    /* Allocate first new slot */
+    struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
+    if (!eh) return -ENOMEM;
+    eh->cap = 16;
+    eh->pfds = (struct pollfd *)calloc(eh->cap, sizeof(struct pollfd));
+    eh->evs = (struct epoll_event *)calloc(eh->cap, sizeof(struct epoll_event));
+    if (!eh->pfds || !eh->evs) { free(eh->pfds); free(eh->evs); free(eh); return -ENOMEM; }
+    pseudo_epolls[old_cap] = eh;
+    return (int)old_cap;
 }
 
 static int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 {
-    struct pseudo_epoll_handle *eh = &pseudo_epolls[epfd];
+    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd])
+        return -EINVAL;
+    struct pseudo_epoll_handle *eh = pseudo_epolls[epfd];
 
-    assert(fd < FD_SETSIZE);
+    /* find existing index */
+    size_t idx;
+    for (idx = 0; idx < eh->len; idx++) {
+        if (eh->pfds[idx].fd == fd) break;
+    }
 
     switch (op) {
     case EPOLL_CTL_ADD:
-    case EPOLL_CTL_MOD:
+    case EPOLL_CTL_MOD: {
         /* Allow commonly used flags; unsupported ones are ignored here */
-        assert((event->events & ~(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET)) == 0);
-        FD_CLR(fd, &eh->rset);
-        FD_CLR(fd, &eh->wset);
-        if ((event->events & EPOLLIN))
-            FD_SET(fd, &eh->rset);
-        if ((event->events & EPOLLOUT))
-            FD_SET(fd, &eh->wset);
-        if (event->events && fd > eh->max_fd)
-            eh->max_fd = fd;
-        eh->events[fd] = *event;
-        break;
-    case EPOLL_CTL_DEL:
-        FD_CLR(fd, &eh->rset);
-        FD_CLR(fd, &eh->wset);
-        if (eh->max_fd == fd) {
-            while (!FD_ISSET(eh->max_fd, &eh->rset) && ! FD_ISSET(eh->max_fd, &eh->wset))
-                eh->max_fd--;
+        if (!event) return -EINVAL;
+        short pev = 0;
+        if (event->events & EPOLLIN) pev |= POLLIN;
+        if (event->events & EPOLLOUT) pev |= POLLOUT;
+
+        if (idx == eh->len) {
+            /* append */
+            if (eh->len == eh->cap) {
+                size_t ncap = eh->cap * 2;
+                struct pollfd *npfds = (struct pollfd *)realloc(eh->pfds, ncap * sizeof(*npfds));
+                struct epoll_event *nevs = (struct epoll_event *)realloc(eh->evs, ncap * sizeof(*nevs));
+                if (!npfds || !nevs) { free(npfds); free(nevs); return -ENOMEM; }
+                eh->pfds = npfds; eh->evs = nevs; eh->cap = ncap;
+            }
+            eh->pfds[eh->len].fd = fd;
+            eh->pfds[eh->len].events = pev;
+            eh->pfds[eh->len].revents = 0;
+            eh->evs[eh->len] = *event; /* stores .data; events will be recomputed on wait */
+            eh->len++;
+        } else {
+            eh->pfds[idx].events = pev;
+            eh->evs[idx] = *event;
         }
         break;
+    }
+    case EPOLL_CTL_DEL: {
+        if (idx == eh->len) return 0; /* not found */
+        size_t last = eh->len - 1;
+        if (idx != last) {
+            eh->pfds[idx] = eh->pfds[last];
+            eh->evs[idx] = eh->evs[last];
+        }
+        eh->len--;
+        break;
+    }
     default:
         fprintf(stderr, "*** Unsupported operation: %d\n", op);
         abort();
@@ -103,53 +147,27 @@ static int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 
 static int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
-    struct pseudo_epoll_handle *eh = &pseudo_epolls[epfd];
-    fd_set rset, wset;
-    struct timeval timeo;
-    int nr_events = 0, nfds, fd;
+    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd])
+        return -EINVAL;
+    struct pseudo_epoll_handle *eh = pseudo_epolls[epfd];
 
-    /* Remove closed fds from the poll list. */
-    for (fd = 0; fd <= eh->max_fd; fd++) {
-        if (fcntl(fd, F_GETFL) < 0 && errno == EBADF) {
-            FD_CLR(fd, &eh->rset);
-            FD_CLR(fd, &eh->wset);
-            if (eh->max_fd == fd) {
-                while (!FD_ISSET(eh->max_fd, &eh->rset) && ! FD_ISSET(eh->max_fd, &eh->wset))
-                    eh->max_fd--;
-            }
+    int nfds = poll(eh->pfds, (nfds_t)eh->len, timeout);
+    if (nfds <= 0) return nfds;
+
+    int out = 0;
+    for (size_t i = 0; i < eh->len && out < maxevents; i++) {
+        if (eh->pfds[i].revents) {
+            uint32_t evs = 0;
+            if (eh->pfds[i].revents & (POLLIN | POLLHUP)) evs |= EPOLLIN; /* readable or hup */
+            if (eh->pfds[i].revents & POLLOUT) evs |= EPOLLOUT;
+            if (eh->pfds[i].revents & POLLERR) evs |= EPOLLERR;
+            if (eh->pfds[i].revents & POLLHUP) evs |= EPOLLHUP;
+            events[out] = eh->evs[i];
+            events[out].events = evs;
+            out++;
         }
     }
-
-    rset = eh->rset;
-    wset = eh->wset;
-
-    if (timeout >= 0) {
-        timeo.tv_sec = timeout / 1000;
-        timeo.tv_usec = (timeout % 1000) * 1000;
-        nfds = select(eh->max_fd + 1, &rset, &wset, NULL, &timeo);
-    } else {
-        nfds = select(eh->max_fd + 1, &rset, &wset, NULL, NULL);
-    }
-
-    if (nfds <= 0)
-        return nfds;
-
-    /* Copy all popped events to result. */
-    for (fd = 0; fd <= eh->max_fd; fd++) {
-        uint32_t evs = 0;
-        if (FD_ISSET(fd, &rset))
-            evs |= EPOLLIN;
-        if (FD_ISSET(fd, &wset))
-            evs |= EPOLLOUT;
-        if (evs) {
-            events[nr_events] = eh->events[fd];
-            events[nr_events].events = evs;
-            if (++nr_events >= maxevents)
-                break;
-        }
-    }
-
-    return nr_events;
+    return out;
 }
 
 #endif /* __NO_EPOLL_H */
