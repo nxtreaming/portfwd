@@ -366,7 +366,6 @@ static void release_proxy_conn(struct proxy_conn *conn,
         if (ev->data.ptr == &conn->magic_client ||
             ev->data.ptr == &conn->magic_server) {
             ev->data.ptr = NULL;
-            break;
         }
     }
 
