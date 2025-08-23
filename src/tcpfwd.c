@@ -94,7 +94,9 @@ static void write_pidfile(const char *filepath)
 
 static void set_nonblock(int sockfd)
 {
-	fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFD, 0) | O_NONBLOCK);
+	int flags = fcntl(sockfd, F_GETFL, 0);
+	if (flags >= 0)
+		fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 }
 
 static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
