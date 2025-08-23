@@ -376,6 +376,7 @@ struct proxy_conn {
     time_t last_active;
     struct sockaddr_inx cli_addr;  /* <-- key */
     int svr_sock;
+    struct list_head lru;          /* LRU linkage: oldest at head, newest at tail */
 };
 
 static unsigned int proxy_conn_hash(struct sockaddr_inx *sa)
@@ -394,6 +395,17 @@ static unsigned int proxy_conn_hash(struct sockaddr_inx *sa)
     return hash;
 }
 
+/* Global LRU list for O(1) oldest selection */
+static LIST_HEAD(g_lru_list);
+
+static inline void touch_proxy_conn(struct proxy_conn *conn)
+{
+    /* Move to MRU (tail) and refresh timestamp */
+    conn->last_active = time(NULL);
+    list_del(&conn->lru);
+    list_add_tail(&conn->lru, &g_lru_list);
+}
+
 static struct proxy_conn *proxy_conn_get_or_create(
         struct sockaddr_inx *cli_addr, int epfd)
 {
@@ -406,7 +418,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
 
     list_for_each_entry (conn, chain, list) {
         if (is_sockaddr_inx_equal(cli_addr, &conn->cli_addr)) {
-            conn->last_active = time(NULL);
+            touch_proxy_conn(conn);
             return conn;
         }
     }
@@ -450,6 +462,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
     memset(conn, 0x0, sizeof(*conn));
     conn->svr_sock = svr_sock;
     conn->cli_addr = *cli_addr;
+    INIT_LIST_HEAD(&conn->lru);
 
     ev.data.ptr = conn;
     ev.events = EPOLLIN;
@@ -460,6 +473,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
     /* ------------------------------------------ */
 
     list_add_tail(&conn->list, chain);
+    list_add_tail(&conn->lru, &g_lru_list);
     conn_tbl_len++;
 
     inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
@@ -484,6 +498,8 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
 {
     list_del(&conn->list);
     conn_tbl_len--;
+    /* remove from LRU as well */
+    list_del(&conn->lru);
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF) {
         syslog(LOG_DEBUG, "epoll_ctl(DEL, svr_sock): %s", strerror(errno));
     }
@@ -493,52 +509,31 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
 
 static void proxy_conn_walk_continue(unsigned walk_max, int epfd)
 {
-    static unsigned bucket_index = 0;
-    unsigned __bucket_index = bucket_index;
-    unsigned walk_count = 0;
-    time_t current_ts = time(NULL);
-
-    if (walk_max > conn_tbl_len)
-        walk_max = conn_tbl_len;
-    if (walk_max == 0)
-        return;
-
-    do {
-        struct proxy_conn *conn, *__conn;
-        list_for_each_entry_safe (conn, __conn, &conn_tbl_hbase[bucket_index], list) {
-            if ((unsigned)(current_ts - conn->last_active) > proxy_conn_timeo) {
-                struct sockaddr_inx addr = conn->cli_addr;
-                char s_addr[50] = "";
-                release_proxy_conn(conn, epfd);
-                inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr),
-                        s_addr, sizeof(s_addr));
-                syslog(LOG_INFO, "Recycled %s:%d [%u]",
-                        s_addr, ntohs(port_of_sockaddr(&addr)), conn_tbl_len);
-            }
-            walk_count++;
+    unsigned walked = 0;
+    time_t now = time(NULL);
+    while (walked < walk_max && !list_empty(&g_lru_list)) {
+        struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
+        if ((unsigned)(now - oldest->last_active) <= proxy_conn_timeo)
+            break; /* oldest not expired -> none later are expired */
+        {
+            struct sockaddr_inx addr = oldest->cli_addr;
+            char s_addr[50] = "";
+            release_proxy_conn(oldest, epfd);
+            inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
+            syslog(LOG_INFO, "Recycled %s:%d [%u]",
+                   s_addr, ntohs(port_of_sockaddr(&addr)), conn_tbl_len);
         }
-        bucket_index = (bucket_index + 1) & (CONN_TBL_HASH_SIZE - 1);
-    } while (walk_count < walk_max && bucket_index != __bucket_index);
+        walked++;
+    }
 }
 
 /* Evict the least recently active connection (LRU-ish across all buckets). */
 static bool proxy_conn_evict_one(int epfd)
 {
-    struct proxy_conn *oldest = NULL, *pos;
-    unsigned bi;
-    time_t oldest_ts = 0;
-    for (bi = 0; bi < CONN_TBL_HASH_SIZE; bi++) {
-        list_for_each_entry(pos, &conn_tbl_hbase[bi], list) {
-            if (!oldest || pos->last_active < oldest_ts) {
-                oldest = pos;
-                oldest_ts = pos->last_active;
-            }
-        }
-    }
-    if (!oldest)
+    if (list_empty(&g_lru_list))
         return false;
-
     {
+        struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
         struct sockaddr_inx addr = oldest->cli_addr;
         char s_addr[50] = "";
         release_proxy_conn(oldest, epfd);
@@ -766,7 +761,7 @@ int main(int argc, char *argv[])
                         ssize_t len = c_msgs[j].msg_len;
                         if (!(conn = proxy_conn_get_or_create(sa, epfd)))
                             continue;
-                        conn->last_active = time(NULL);
+                        touch_proxy_conn(conn);
                         {
                             ssize_t wr = send(conn->svr_sock, c_bufs[j], len, 0);
                             if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -788,7 +783,7 @@ int main(int argc, char *argv[])
                 if (!(conn = proxy_conn_get_or_create(&cli_addr, epfd)))
                     continue;
                 /* refresh activity */
-                conn->last_active = time(NULL);
+                touch_proxy_conn(conn);
                 {
                     ssize_t wr = send(conn->svr_sock, buffer, r, 0);
                     if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -814,7 +809,7 @@ int main(int argc, char *argv[])
                         break;
                     }
                     /* r >= 0: forward even zero-length datagrams */
-                    conn->last_active = time(NULL);
+                    touch_proxy_conn(conn);
                     {
                         ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
                                 sizeof_sockaddr(&conn->cli_addr));
