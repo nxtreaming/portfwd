@@ -15,6 +15,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <time.h>
+#include <stdbool.h>
 
 #include "common.h"
 
@@ -25,10 +26,6 @@
     #define ERESTART 700
     #include "no-epoll.h"
 #endif
-
-typedef int bool;
-#define true 1
-#define false 0
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 
@@ -132,13 +129,13 @@ static inline int list_empty(const struct list_head *head)
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 struct config {
-    struct sockaddr_inx src_addr;
-    struct sockaddr_inx dst_addr;
+    union sockaddr_inx src_addr;
+    union sockaddr_inx dst_addr;
     const char *pidfile;
     unsigned proxy_conn_timeo;
-    bool daemonize;
-    bool v6only;
-    bool reuseaddr;
+    int daemonize;
+    int v6only;
+    int reuseaddr;
 };
 
 #ifndef UDP_PROXY_MAX_CONNS
@@ -152,7 +149,7 @@ static unsigned conn_tbl_len;
 
 /* Forward declarations */
 static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max, int epfd);
-static bool proxy_conn_evict_one(int epfd);
+static int proxy_conn_evict_one(int epfd);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -161,28 +158,6 @@ static void set_sock_buffers(int sockfd)
     int sz = UDP_PROXY_SOCKBUF_CAP;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
-}
-
-static bool is_sockaddr_inx_equal(struct sockaddr_inx *sa1, struct sockaddr_inx *sa2)
-{
-    if (sa1->sa.sa_family != sa2->sa.sa_family)
-        return false;
-
-    if (sa1->sa.sa_family == AF_INET) {
-        if (sa1->in.sin_addr.s_addr != sa2->in.sin_addr.s_addr)
-            return false;
-        if (sa1->in.sin_port != sa2->in.sin_port)
-            return false;
-        return true;
-    } else if (sa1->sa.sa_family == AF_INET6) {
-        if (memcmp(&sa1->in6.sin6_addr, &sa2->in6.sin6_addr, sizeof(sa2->in6.sin6_addr)))
-            return false;
-        if (sa1->in6.sin6_port != sa2->in6.sin6_port)
-            return false;
-        return true;
-    }
-
-    return true;
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -194,12 +169,12 @@ static bool is_sockaddr_inx_equal(struct sockaddr_inx *sa1, struct sockaddr_inx 
 struct proxy_conn {
     struct list_head list;
     time_t last_active;
-    struct sockaddr_inx cli_addr;  /* <-- key */
+    union sockaddr_inx cli_addr;  /* <-- key */
     int svr_sock;
     struct list_head lru;          /* LRU linkage: oldest at head, newest at tail */
 };
 
-static unsigned int proxy_conn_hash(struct sockaddr_inx *sa)
+static unsigned int proxy_conn_hash(union sockaddr_inx *sa)
 {
     unsigned int hash = 0;
 
@@ -227,7 +202,7 @@ static inline void touch_proxy_conn(struct proxy_conn *conn)
 }
 
 static struct proxy_conn *proxy_conn_get_or_create(
-        const struct config *cfg, struct sockaddr_inx *cli_addr, int epfd)
+        const struct config *cfg, union sockaddr_inx *cli_addr, int epfd)
 {
     struct list_head *chain = &conn_tbl_hbase[
         proxy_conn_hash(cli_addr) & (CONN_TBL_HASH_SIZE - 1)];
@@ -252,7 +227,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
                 inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
                           s_addr, sizeof(s_addr));
                 syslog(LOG_WARNING, "Conn table full (%u). Drop %s:%d",
-                       conn_tbl_len, s_addr, ntohs(port_of_sockaddr(cli_addr)));
+                       conn_tbl_len, s_addr, ntohs(*port_of_sockaddr(cli_addr)));
                 goto err;
             }
         }
@@ -298,8 +273,8 @@ static struct proxy_conn *proxy_conn_get_or_create(
 
     inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
             s_addr, sizeof(s_addr));
-    syslog(LOG_INFO, "New connection %s:%d [%u]",
-            s_addr, ntohs(port_of_sockaddr(cli_addr)), conn_tbl_len);
+    syslog(LOG_INFO, "New UDP session for [%s]:%d, total %u",
+           s_addr, ntohs(*port_of_sockaddr(cli_addr)), conn_tbl_len);
 
     conn->last_active = time(NULL);
     return conn;
@@ -338,12 +313,12 @@ static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max
         if ((unsigned)(now - oldest->last_active) <= cfg->proxy_conn_timeo)
             break; /* oldest not expired -> none later are expired */
         {
-            struct sockaddr_inx addr = oldest->cli_addr;
+            union sockaddr_inx addr = oldest->cli_addr;
             char s_addr[50] = "";
             release_proxy_conn(oldest, epfd);
             inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
             syslog(LOG_INFO, "Recycled %s:%d [%u]",
-                   s_addr, ntohs(port_of_sockaddr(&addr)), conn_tbl_len);
+                   s_addr, ntohs(*port_of_sockaddr(&addr)), conn_tbl_len);
         }
         walked++;
     }
@@ -356,12 +331,12 @@ static bool proxy_conn_evict_one(int epfd)
         return false;
     {
         struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
-        struct sockaddr_inx addr = oldest->cli_addr;
+        union sockaddr_inx addr = oldest->cli_addr;
         char s_addr[50] = "";
         release_proxy_conn(oldest, epfd);
         inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
         syslog(LOG_WARNING, "Evicted LRU %s:%d [%u]",
-               s_addr, ntohs(port_of_sockaddr(&addr)), conn_tbl_len);
+               s_addr, ntohs(*port_of_sockaddr(&addr)), conn_tbl_len);
     }
     return true;
 }
@@ -559,7 +534,7 @@ int main(int argc, char *argv[])
                     syslog(LOG_WARNING, "listener: EPOLLERR/HUP");
                     continue;
                 }
-                struct sockaddr_inx cli_addr;
+                union sockaddr_inx cli_addr;
                 socklen_t cli_alen = sizeof(cli_addr);
 #ifdef __linux__
                 if (c_msgs) {
