@@ -11,6 +11,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 
@@ -34,6 +35,22 @@ typedef int bool;
 #endif
 #ifndef TCP_PROXY_SOCKBUF_CAP
 #define TCP_PROXY_SOCKBUF_CAP   (256 * 1024)  /* desired kernel socket buffer */
+#endif
+
+/* Backpressure watermark: when opposite TX backlog exceeds this, limit further reads */
+#ifndef TCP_PROXY_BACKPRESSURE_WM
+#define TCP_PROXY_BACKPRESSURE_WM   (TCP_PROXY_USERBUF_CAP * 3 / 4)
+#endif
+
+/* TCP Keepalive defaults (Linux specific tunables guarded at runtime) */
+#ifndef TCP_PROXY_KEEPALIVE_IDLE
+#define TCP_PROXY_KEEPALIVE_IDLE 60
+#endif
+#ifndef TCP_PROXY_KEEPALIVE_INTVL
+#define TCP_PROXY_KEEPALIVE_INTVL 10
+#endif
+#ifndef TCP_PROXY_KEEPALIVE_CNT
+#define TCP_PROXY_KEEPALIVE_CNT 6
 #endif
 
 #define container_of(ptr, type, member) ({          \
@@ -170,6 +187,20 @@ static void set_sock_buffers(int sockfd)
     int sz = TCP_PROXY_SOCKBUF_CAP;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+}
+
+static void set_keepalive(int sockfd)
+{
+    int on = 1;
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+#ifdef __linux__
+    int idle = TCP_PROXY_KEEPALIVE_IDLE;
+    int intvl = TCP_PROXY_KEEPALIVE_INTVL;
+    int cnt = TCP_PROXY_KEEPALIVE_CNT;
+    (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
 }
 
 static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
@@ -349,10 +380,10 @@ static void init_new_conn_epoll_fds(struct proxy_conn *conn, int epfd)
 {
     struct epoll_event ev_cli, ev_svr;
 
-    ev_cli.events = EPOLLIN | EPOLLET;
+    ev_cli.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
     ev_cli.data.ptr = &conn->magic_client;
 
-    ev_svr.events = EPOLLIN | EPOLLET;
+    ev_svr.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
     ev_svr.data.ptr = &conn->magic_server;
 
     epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &ev_cli);
@@ -386,16 +417,16 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
             if (conn->response.rpos < conn->response.dlen)
                 ev_cli.events |= EPOLLOUT;
             /* Edge-triggered for data sockets */
-            ev_cli.events |= EPOLLET;
-            ev_svr.events |= EPOLLET;
+            ev_cli.events |= EPOLLRDHUP | EPOLLET;
+            ev_svr.events |= EPOLLRDHUP | EPOLLET;
             break;
         case S_SERVER_CONNECTING:
             /* Wait for the server connection to establish. */
             if (conn->request.dlen < sizeof(conn->request.data))
                 ev_cli.events |= EPOLLIN; /* for detecting client close */
             ev_svr.events |= EPOLLOUT;
-            ev_cli.events |= EPOLLET;
-            ev_svr.events |= EPOLLET;
+            ev_cli.events |= EPOLLRDHUP | EPOLLET;
+            ev_svr.events |= EPOLLRDHUP | EPOLLET;
             break;
     }
 
@@ -428,6 +459,7 @@ static int handle_accept_new_connection(int sockfd, struct proxy_conn **conn_p)
     conn->cli_sock = cli_sock;
     set_nonblock(conn->cli_sock);
     set_sock_buffers(conn->cli_sock);
+    set_keepalive(conn->cli_sock);
 
     conn->cli_addr = cli_addr;
 
@@ -486,6 +518,7 @@ static int handle_accept_new_connection(int sockfd, struct proxy_conn **conn_p)
     conn->svr_sock = svr_sock;
     set_nonblock(conn->svr_sock);
     set_sock_buffers(conn->svr_sock);
+    set_keepalive(conn->svr_sock);
 
     if (connect(conn->svr_sock, (struct sockaddr *)&conn->svr_addr,
             sizeof_sockaddr(&conn->svr_addr)) == 0) {
@@ -596,7 +629,21 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         noefd = conn->cli_sock;
     }
 
-    if (ev->events & EPOLLIN) {
+    /* Fast-path: detect remote hangups/errors early */
+    if (ev->events & (EPOLLRDHUP | EPOLLHUP)) {
+        if (efd == conn->cli_sock)
+            conn->cli_in_eof = true;
+        else
+            conn->svr_in_eof = true;
+    }
+    if (ev->events & EPOLLERR) {
+        goto err;
+    }
+
+    if ((ev->events & EPOLLIN)) {
+        /* Backpressure: if opposite TX backlog is large, skip reading now */
+        if ((txb->dlen - txb->rpos) >= TCP_PROXY_BACKPRESSURE_WM)
+            goto skip_read;
         for (;;) {
             rc = recv(efd , rxb->data + rxb->dlen,
                     sizeof(rxb->data) - rxb->dlen, 0);
@@ -634,6 +681,7 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         if (rxb->rpos >= rxb->dlen)
             rxb->rpos = rxb->dlen = 0;
     }
+skip_read:
 
     if (ev->events & EPOLLOUT) {
         while (txb->rpos < txb->dlen) {
