@@ -277,7 +277,7 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     }
 }
 
-static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, const union sockaddr_inx *cli_addr, int epfd)
+static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, const union sockaddr_inx *cli_addr)
 {
     struct proxy_conn *conn = NULL;
     char s_addr1[50] = "", s_addr2[50] = "";
@@ -392,7 +392,7 @@ static int handle_accept_new_connection(int sockfd, struct config *cfg, int epfd
         goto err;
     }
 
-    *conn_p = create_proxy_conn(cfg, cli_sock, &cli_addr, epfd);
+    *conn_p = create_proxy_conn(cfg, cli_sock, &cli_addr);
     if (!*conn_p) {
         goto err;
     }

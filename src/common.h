@@ -28,7 +28,7 @@ union sockaddr_inx {
 };
 
 extern const char *g_pidfile;
-extern volatile bool g_terminate;
+extern volatile sig_atomic_t g_terminate;
 
 void on_signal(int sig);
 void cleanup_pidfile(void);

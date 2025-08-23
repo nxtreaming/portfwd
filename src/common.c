@@ -139,12 +139,12 @@ void *addr_of_sockaddr(const union sockaddr_inx *addr)
     return (void *)&addr->sin.sin_addr;
 }
 
-unsigned short port_of_sockaddr(const union sockaddr_inx *addr)
+unsigned short *port_of_sockaddr(const union sockaddr_inx *addr)
 {
-    assert(addr->sa.sa_family == AF_INET || addr->sa.sa_family == AF_INET6);
-    if (addr->sa.sa_family == AF_INET6)
-        return addr->sin6.sin6_port;
-    return addr->sin.sin_port;
+    if (addr->sa.sa_family == AF_INET)
+        return &addr->sin.sin_port;
+    else
+        return &addr->sin6.sin6_port;
 }
 
 size_t sizeof_sockaddr(const union sockaddr_inx *addr)
