@@ -317,11 +317,11 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
         }
 
         if (conn->svr_addr.sa.sa_family == AF_INET) {
-            addr_pos = (uint32_t *)&conn->svr_addr.in.sin_addr;
+            addr_pos = (uint32_t *)&conn->svr_addr.sin.sin_addr;
         } else {
-            addr_pos = (uint32_t *)&conn->svr_addr.in6.sin6_addr.s6_addr32[3];
+            addr_pos = (uint32_t *)&conn->svr_addr.sin6.sin6_addr.s6_addr32[3];
         }
-        port_offset = (int)(ntohs(port_of_sockaddr(&orig_dst)) - ntohs(port_of_sockaddr(&loc_addr)));
+        port_offset = (int)(ntohs(*port_of_sockaddr(&orig_dst)) - ntohs(*port_of_sockaddr(&loc_addr)));
 
         base = ntohl(*addr_pos);
         sum = (int64_t)base + (int64_t)(int32_t)port_offset;
@@ -339,8 +339,8 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
             s_addr2, sizeof(s_addr2));
     syslog(LOG_INFO, "New connection [%s]:%d -> [%s]:%d",
-            s_addr1, ntohs(port_of_sockaddr(&conn->cli_addr)),
-            s_addr2, ntohs(port_of_sockaddr(&conn->svr_addr)));
+            s_addr1, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+            s_addr2, ntohs(*port_of_sockaddr(&conn->svr_addr)));
 
     /* Initiate the connection to server right now. */
     if ((conn->svr_sock = socket(conn->svr_addr.sa.sa_family, SOCK_STREAM, 0)) < 0) {
@@ -363,7 +363,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     } else {
         /* Error occurs, drop the session. */
         syslog(LOG_WARNING, "Connection to [%s]:%d failed: %s",
-                s_addr2, ntohs(port_of_sockaddr(&conn->svr_addr)),
+                s_addr2, ntohs(*port_of_sockaddr(&conn->svr_addr)),
                 strerror(errno));
         goto err;
     }
@@ -417,7 +417,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
             inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
                     s_addr, sizeof(s_addr));
             syslog(LOG_WARNING, "Connection to [%s]:%d failed: %s",
-                    s_addr, ntohs(port_of_sockaddr(&conn->svr_addr)),
+                    s_addr, ntohs(*port_of_sockaddr(&conn->svr_addr)),
                     strerror(err ? err : errno));
             conn->state = S_CLOSING;
             return 0;
@@ -438,7 +438,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                         s_addr, sizeof(s_addr));
                 syslog(LOG_INFO, "Connection [%s]:%d closed during server handshake",
-                        s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+                        s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
                 conn->state = S_CLOSING;
                 return 0;
             } else if (rc < 0) {
@@ -447,7 +447,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                         s_addr, sizeof(s_addr));
                 syslog(LOG_INFO, "Connection [%s]:%d error during server handshake: %s",
-                        s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)), strerror(errno));
+                        s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), strerror(errno));
                 conn->state = S_CLOSING;
                 return 0;
             }
@@ -572,7 +572,7 @@ skip_read:
         conn->response.rpos >= conn->response.dlen) {
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
         syslog(LOG_INFO, "Connection [%s]:%d closed (both directions finished)",
-               s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+               s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
         conn->state = S_CLOSING;
         return 0;
     }
@@ -582,7 +582,7 @@ skip_read:
 
 err:
     inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
-    syslog(LOG_INFO, "Connection [%s]:%d closed", s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+    syslog(LOG_INFO, "Connection [%s]:%d closed", s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
     conn->state = S_CLOSING;
     return 0;
 }
