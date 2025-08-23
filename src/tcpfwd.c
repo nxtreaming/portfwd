@@ -349,10 +349,10 @@ static void init_new_conn_epoll_fds(struct proxy_conn *conn, int epfd)
 {
     struct epoll_event ev_cli, ev_svr;
 
-    ev_cli.events = EPOLLIN;
+    ev_cli.events = EPOLLIN | EPOLLET;
     ev_cli.data.ptr = &conn->magic_client;
 
-    ev_svr.events = EPOLLIN;
+    ev_svr.events = EPOLLIN | EPOLLET;
     ev_svr.data.ptr = &conn->magic_server;
 
     epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &ev_cli);
@@ -385,12 +385,17 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
                 ev_svr.events |= EPOLLOUT;
             if (conn->response.rpos < conn->response.dlen)
                 ev_cli.events |= EPOLLOUT;
+            /* Edge-triggered for data sockets */
+            ev_cli.events |= EPOLLET;
+            ev_svr.events |= EPOLLET;
             break;
         case S_SERVER_CONNECTING:
             /* Wait for the server connection to establish. */
             if (conn->request.dlen < sizeof(conn->request.data))
                 ev_cli.events |= EPOLLIN; /* for detecting client close */
             ev_svr.events |= EPOLLOUT;
+            ev_cli.events |= EPOLLET;
+            ev_svr.events |= EPOLLET;
             break;
     }
 
@@ -539,27 +544,30 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
         struct buffer_info *rxb = &conn->request;
         int rc;
 
-        rc = recv(efd , rxb->data + rxb->dlen,
-                sizeof(rxb->data) - rxb->dlen, 0);
-        if (rc == 0) {
-            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                    s_addr, sizeof(s_addr));
-            syslog(LOG_INFO, "Connection [%s]:%d closed during server handshake",
-                    s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
-            conn->state = S_CLOSING;
-            return 0;
-        } else if (rc < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                return -EAGAIN;
-            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                    s_addr, sizeof(s_addr));
-            syslog(LOG_INFO, "Connection [%s]:%d error during server handshake: %s",
-                    s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)), strerror(errno));
-            conn->state = S_CLOSING;
-            return 0;
+        for (;;) {
+            rc = recv(efd , rxb->data + rxb->dlen,
+                    sizeof(rxb->data) - rxb->dlen, 0);
+            if (rc == 0) {
+                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                        s_addr, sizeof(s_addr));
+                syslog(LOG_INFO, "Connection [%s]:%d closed during server handshake",
+                        s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+                conn->state = S_CLOSING;
+                return 0;
+            } else if (rc < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break; /* drained for now */
+                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                        s_addr, sizeof(s_addr));
+                syslog(LOG_INFO, "Connection [%s]:%d error during server handshake: %s",
+                        s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)), strerror(errno));
+                conn->state = S_CLOSING;
+                return 0;
+            }
+            rxb->dlen += rc;
+            if (rxb->dlen >= sizeof(rxb->data))
+                break; /* buffer full */
         }
-        rxb->dlen += rc;
-
         return -EAGAIN;
     }
 }
@@ -589,51 +597,59 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     }
 
     if (ev->events & EPOLLIN) {
-        rc = recv(efd , rxb->data + rxb->dlen,
-                sizeof(rxb->data) - rxb->dlen, 0);
-        if (rc == 0) {
-            /* Peer performed a half-close (FIN). Mark EOF for this direction. */
-            if (efd == conn->cli_sock)
-                conn->cli_in_eof = true;
-            else
-                conn->svr_in_eof = true;
-            /* Do not close now; we will propagate FIN after buffered data drains. */
-        } else if (rc < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* No data ready now */
+        for (;;) {
+            rc = recv(efd , rxb->data + rxb->dlen,
+                    sizeof(rxb->data) - rxb->dlen, 0);
+            if (rc == 0) {
+                /* Peer performed a half-close (FIN). Mark EOF for this direction. */
+                if (efd == conn->cli_sock)
+                    conn->cli_in_eof = true;
+                else
+                    conn->svr_in_eof = true;
+                break;
+            } else if (rc < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    /* fully drained for now */
+                    break;
+                }
+                goto err;
+            }
+            rxb->dlen += rc;
+            if (rxb->dlen >= sizeof(rxb->data))
+                break; /* buffer full */
+        }
+        /* After reading, try to flush to peer as much as possible */
+        while (rxb->rpos < rxb->dlen) {
+            rc = send(noefd, rxb->data + rxb->rpos, rxb->dlen - rxb->rpos, 0);
+            if (rc > 0) {
+                rxb->rpos += rc;
+            } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break; /* can't write now */
+            } else if (rc == 0) {
+                break; /* no progress */
             } else {
                 goto err;
             }
-        } else {
-            rxb->dlen += rc;
-            /* Try if we can send it out */
-            if ((rc = send(noefd, rxb->data + rxb->rpos, rxb->dlen - rxb->rpos, 0)) > 0) {
-                rxb->rpos += rc;
-                /* Buffer consumed, empty it */
-                if (rxb->rpos >= rxb->dlen)
-                    rxb->rpos = rxb->dlen = 0;
-            } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                /* can't write now, wait for EPOLLOUT */
-            }
         }
+        if (rxb->rpos >= rxb->dlen)
+            rxb->rpos = rxb->dlen = 0;
     }
 
     if (ev->events & EPOLLOUT) {
-        rc = send(efd, txb->data + txb->rpos, txb->dlen - txb->rpos, 0);
-        if (rc < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* not writable now */
+        while (txb->rpos < txb->dlen) {
+            rc = send(efd, txb->data + txb->rpos, txb->dlen - txb->rpos, 0);
+            if (rc > 0) {
+                txb->rpos += rc;
+            } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                break;
+            } else if (rc == 0) {
+                break;
             } else {
                 goto err;
             }
-        } else if (rc == 0) {
-            /* treat as no progress; wait for next event */
-        } else {
-            txb->rpos += rc;
-            /* Buffer consumed, empty it */
-            if (txb->rpos >= txb->dlen)
-                txb->rpos = txb->dlen = 0;
         }
+        if (txb->rpos >= txb->dlen)
+            txb->rpos = txb->dlen = 0;
     }
 
     /* If a half-close happened earlier and its corresponding buffer drained, propagate FIN */
