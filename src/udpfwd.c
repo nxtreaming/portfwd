@@ -185,29 +185,29 @@ static void set_nonblock(int sockfd)
 
 static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
 {
-    struct addrinfo hints, *result;
+    struct addrinfo hints, *result = NULL;
     char host[51] = "", s_port[20] = "";
     int port = 0, rc;
 
     if (sscanf(pair, "[%50[^]]]:%d", host, &port) == 2) {
-        /* Quoted IP and port: [10.0.0.1]:10000 */
+        /* Quoted IP and port: [::1]:10000 */
     } else if (sscanf(pair, "%50[^:]:%d", host, &port) == 2) {
         /* Regular IP and port: 10.0.0.1:10000 */
     } else {
-        /**
-         * A single port number, usually for local IPv4 listen address.
-         * e.g., "10000" stands for "0.0.0.0:10000"
-         */
+        /* Only a port number, default to 0.0.0.0 */
         const char *sp;
         for (sp = pair; *sp; sp++) {
             if (!(*sp >= '0' && *sp <= '9'))
                 return -EINVAL;
         }
-        sscanf(pair, "%d", &port);
-        strcpy(host, "0.0.0.0");
+        if (sscanf(pair, "%d", &port) != 1)
+            return -EINVAL;
+        if (snprintf(host, sizeof(host), "%s", "0.0.0.0") >= (int)sizeof(host))
+            return -EINVAL;
     }
-    sprintf(s_port, "%d", port);
     if (port <= 0 || port > 65535)
+        return -EINVAL;
+    if (snprintf(s_port, sizeof(s_port), "%d", port) >= (int)sizeof(s_port))
         return -EINVAL;
 
     memset(&hints, 0, sizeof(struct addrinfo));
@@ -215,16 +215,28 @@ static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags = AI_PASSIVE;  /* For wildcard IP address */
     hints.ai_protocol = 0;        /* Any protocol */
-    hints.ai_canonname = NULL;
-    hints.ai_addr = NULL;
-    hints.ai_next = NULL;
 
-    if ((rc = getaddrinfo(host, s_port, &hints, &result)))
-        return -EAGAIN;
+    rc = getaddrinfo(host, s_port, &hints, &result);
+    if (rc != 0) {
+        int err = -EINVAL;
+        switch (rc) {
+        case EAI_AGAIN:       err = -EAGAIN; break;
+        case EAI_NONAME:
+#ifdef EAI_NODATA
+        case EAI_NODATA:
+#endif
+            err = -ENOENT; break;
+        case EAI_FAIL:        err = -EHOSTUNREACH; break;
+        case EAI_FAMILY:      err = -EAFNOSUPPORT; break;
+        case EAI_SOCKTYPE:    err = -ESOCKTNOSUPPORT; break;
+        default:              err = -EINVAL; break;
+        }
+        syslog(LOG_ERR, "getaddrinfo(%s,%s): %s", host, s_port, gai_strerror(rc));
+        return err;
+    }
 
     /* Get the first resolution. */
     memcpy(sa, result->ai_addr, result->ai_addrlen);
-
     freeaddrinfo(result);
     return 0;
 }
