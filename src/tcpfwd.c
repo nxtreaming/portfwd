@@ -205,6 +205,12 @@ struct proxy_conn {
     /* Buffers for both direction */
     struct buffer_info request;
     struct buffer_info response;
+
+    /* Half-close tracking */
+    bool cli_in_eof;            /* received EOF from client (client->server) */
+    bool svr_in_eof;            /* received EOF from server (server->client) */
+    bool cli2svr_shutdown;      /* propagated FIN to server (shutdown server write) */
+    bool svr2cli_shutdown;      /* propagated FIN to client (shutdown client write) */
 };
 
 static inline struct proxy_conn *alloc_proxy_conn(void)
@@ -220,6 +226,11 @@ static inline struct proxy_conn *alloc_proxy_conn(void)
     conn->magic_client = EV_MAGIC_CLIENT;
     conn->magic_server = EV_MAGIC_SERVER;
     conn->state = S_INVALID;
+
+    conn->cli_in_eof = false;
+    conn->svr_in_eof = false;
+    conn->cli2svr_shutdown = false;
+    conn->svr2cli_shutdown = false;
 
     return conn;
 }
@@ -293,9 +304,9 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     switch(conn->state) {
         case S_FORWARDING:
             /* Connection established, data forwarding in progress. */
-            if (conn->request.dlen < sizeof(conn->request.data))
+            if (!conn->cli_in_eof && conn->request.dlen < sizeof(conn->request.data))
                 ev_cli.events |= EPOLLIN;
-            if (conn->response.dlen < sizeof(conn->response.data))
+            if (!conn->svr_in_eof && conn->response.dlen < sizeof(conn->response.data))
                 ev_svr.events |= EPOLLIN;
             if (conn->request.rpos < conn->request.dlen)
                 ev_svr.events |= EPOLLOUT;
@@ -505,9 +516,14 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     if (ev->events & EPOLLIN) {
         rc = recv(efd , rxb->data + rxb->dlen,
                 sizeof(rxb->data) - rxb->dlen, 0);
-        if (rc == 0)
-            goto peer_close;
-        if (rc < 0) {
+        if (rc == 0) {
+            /* Peer performed a half-close (FIN). Mark EOF for this direction. */
+            if (efd == conn->cli_sock)
+                conn->cli_in_eof = true;
+            else
+                conn->svr_in_eof = true;
+            /* Do not close now; we will propagate FIN after buffered data drains. */
+        } else if (rc < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* No data ready now */
             } else {
@@ -545,14 +561,29 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         }
     }
 
-    /* I/O not ready, handle in next event. */
-    return -EAGAIN;
+    /* If a half-close happened earlier and its corresponding buffer drained, propagate FIN */
+    if (conn->cli_in_eof && !conn->cli2svr_shutdown && conn->request.rpos >= conn->request.dlen) {
+        shutdown(conn->svr_sock, SHUT_WR);
+        conn->cli2svr_shutdown = true;
+    }
+    if (conn->svr_in_eof && !conn->svr2cli_shutdown && conn->response.rpos >= conn->response.dlen) {
+        shutdown(conn->cli_sock, SHUT_WR);
+        conn->svr2cli_shutdown = true;
+    }
 
-peer_close:
-    inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
-    syslog(LOG_INFO, "Connection [%s]:%d closed by peer", s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
-    conn->state = S_CLOSING;
-    return 0;
+    /* If both sides have sent EOF and buffers are drained, we can close */
+    if (conn->cli_in_eof && conn->svr_in_eof &&
+        conn->request.rpos >= conn->request.dlen &&
+        conn->response.rpos >= conn->response.dlen) {
+        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
+        syslog(LOG_INFO, "Connection [%s]:%d closed (both directions finished)",
+               s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+        conn->state = S_CLOSING;
+        return 0;
+    }
+
+    /* I/O not ready or waiting for further events (including FIN propagation). */
+    return -EAGAIN;
 
 err:
     inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
