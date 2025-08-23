@@ -307,7 +307,7 @@ static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
         if (snprintf(host, sizeof(host), "%s", "0.0.0.0") >= (int)sizeof(host))
             return -EINVAL;
     }
-    if (port <= 0 || port > 65535)
+    if (port < 1 || port > 65535)
         return -EINVAL;
     if (snprintf(s_port, sizeof(s_port), "%d", port) >= (int)sizeof(s_port))
         return -EINVAL;
