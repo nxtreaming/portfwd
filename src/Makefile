@@ -11,10 +11,10 @@ endif
 
 all: tcpfwd udpfwd
 
-tcpfwd: tcpfwd.o
+tcpfwd: tcpfwd.o common.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
-udpfwd: udpfwd.o
+udpfwd: udpfwd.o common.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c $(HEADERS)

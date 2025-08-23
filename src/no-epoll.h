@@ -47,8 +47,27 @@ struct pseudo_epoll_handle {
 static struct pseudo_epoll_handle **pseudo_epolls = NULL;
 static size_t pseudo_epolls_cap = 0;
 
+static void cleanup_pseudo_epolls(void)
+{
+    if (pseudo_epolls) {
+        for (size_t i = 0; i < pseudo_epolls_cap; i++) {
+            if (pseudo_epolls[i]) {
+                free(pseudo_epolls[i]->pfds);
+                free(pseudo_epolls[i]->evs);
+                free(pseudo_epolls[i]);
+            }
+        }
+        free(pseudo_epolls);
+        pseudo_epolls = NULL;
+        pseudo_epolls_cap = 0;
+    }
+}
+
 static int epoll_create(int size)
 {
+    if (pseudo_epolls == NULL) {
+        atexit(cleanup_pseudo_epolls);
+    }
     (void)size;
     size_t i;
     /* Find a free slot */
@@ -84,6 +103,19 @@ static int epoll_create(int size)
     if (!eh->pfds || !eh->evs) { free(eh->pfds); free(eh->evs); free(eh); return -ENOMEM; }
     pseudo_epolls[old_cap] = eh;
     return (int)old_cap;
+}
+
+static int epoll_close(int epfd)
+{
+    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd])
+        return -EINVAL;
+
+    struct pseudo_epoll_handle *eh = pseudo_epolls[epfd];
+    free(eh->pfds);
+    free(eh->evs);
+    free(eh);
+    pseudo_epolls[epfd] = NULL;
+    return 0;
 }
 
 static int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)

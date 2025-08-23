@@ -150,11 +150,17 @@ static inline int list_empty(const struct list_head *head)
          &pos->member != (head);                    \
          pos = n, n = list_next_entry(n, member))
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static struct sockaddr_inx g_src_addr;
-static struct sockaddr_inx g_dst_addr;
-static const char *g_pidfile;
+struct config {
+    struct sockaddr_inx src_addr;
+    struct sockaddr_inx dst_addr;
+    const char *pidfile;
+    unsigned proxy_conn_timeo;
+    bool daemonize;
+    bool v6only;
+    bool reuseaddr;
+};
 
 #ifndef UDP_PROXY_MAX_CONNS
 #define UDP_PROXY_MAX_CONNS   8192
@@ -162,12 +168,12 @@ static const char *g_pidfile;
 #define CONN_TBL_HASH_SIZE  (1 << 8)
 static struct list_head conn_tbl_hbase[CONN_TBL_HASH_SIZE];
 static unsigned conn_tbl_len;
-static unsigned proxy_conn_timeo = 60;
+static const char *g_pidfile;
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Forward declarations */
-static void proxy_conn_walk_continue(unsigned walk_max, int epfd);
+static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max, int epfd);
 static bool proxy_conn_evict_one(int epfd);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -287,28 +293,51 @@ static void set_sock_buffers(int sockfd)
 
 static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
 {
-    struct addrinfo hints, *result = NULL;
-    char host[51] = "", s_port[20] = "";
-    int port = 0, rc;
+    char host[51];
+    int port = 0;
+    const char *port_str = NULL;
 
-    if (sscanf(pair, "[%50[^]]]:%d", host, &port) == 2) {
-        /* Quoted IP and port: [::1]:10000 */
-    } else if (sscanf(pair, "%50[^:]:%d", host, &port) == 2) {
-        /* Regular IP and port: 10.0.0.1:10000 */
-    } else {
-        /* Only a port number, default to 0.0.0.0 */
-        const char *sp;
-        for (sp = pair; *sp; sp++) {
-            if (!(*sp >= '0' && *sp <= '9'))
-                return -EINVAL;
-        }
-        if (sscanf(pair, "%d", &port) != 1)
+    memset(host, 0, sizeof(host));
+
+    if (pair[0] == '[') {
+        const char *end = strchr(pair + 1, ']');
+        if (!end || *(end + 1) != ':' || *(end + 2) == '\0')
             return -EINVAL;
-        if (snprintf(host, sizeof(host), "%s", "0.0.0.0") >= (int)sizeof(host))
+        size_t len = end - (pair + 1);
+        if (len >= sizeof(host))
+            return -EINVAL;
+        memcpy(host, pair + 1, len);
+        host[len] = '\0';
+        port_str = end + 2;
+    } else {
+        port_str = strrchr(pair, ':');
+        if (port_str) {
+            size_t len = port_str - pair;
+            if (len >= sizeof(host))
+                return -EINVAL;
+            memcpy(host, pair, len);
+            host[len] = '\0';
+            port_str++;
+        } else {
+            port_str = pair;
+        }
+    }
+
+    if (host[0] == '\0') {
+        if (snprintf(host, sizeof(host), "0.0.0.0") >= (int)sizeof(host))
             return -EINVAL;
     }
+
+    char *endptr;
+    long p = strtol(port_str, &endptr, 10);
+    if (*endptr != '\0' || p <= 0 || p > 65535)
+        return -EINVAL;
+    port = (int)p;
     if (port < 1 || port > 65535)
         return -EINVAL;
+
+    struct addrinfo hints, *result = NULL;
+    char s_port[20];
     if (snprintf(s_port, sizeof(s_port), "%d", port) >= (int)sizeof(s_port))
         return -EINVAL;
 
@@ -318,7 +347,7 @@ static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
     hints.ai_flags = AI_PASSIVE;  /* For wildcard IP address */
     hints.ai_protocol = 0;        /* Any protocol */
 
-    rc = getaddrinfo(host, s_port, &hints, &result);
+    int rc = getaddrinfo(host, s_port, &hints, &result);
     if (rc != 0) {
         int err = -EINVAL;
         switch (rc) {
@@ -407,7 +436,7 @@ static inline void touch_proxy_conn(struct proxy_conn *conn)
 }
 
 static struct proxy_conn *proxy_conn_get_or_create(
-        struct sockaddr_inx *cli_addr, int epfd)
+        const struct config *cfg, struct sockaddr_inx *cli_addr, int epfd)
 {
     struct list_head *chain = &conn_tbl_hbase[
         proxy_conn_hash(cli_addr) & (CONN_TBL_HASH_SIZE - 1)];
@@ -426,7 +455,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
     /* Enforce connection cap before creating a new one */
     if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
         /* First, aggressively recycle timeouts */
-        proxy_conn_walk_continue(conn_tbl_len, epfd);
+        proxy_conn_walk_continue(cfg, conn_tbl_len, epfd);
         if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
             if (!proxy_conn_evict_one(epfd)) {
                 inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
@@ -440,13 +469,13 @@ static struct proxy_conn *proxy_conn_get_or_create(
 
     /* ------------------------------------------ */
     /* Establish the server-side connection */
-    if ((svr_sock = socket(g_dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
+    if ((svr_sock = socket(cfg->dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
         syslog(LOG_ERR, "*** socket(svr_sock): %s", strerror(errno));
         goto err;
     }
     /* Connect to real server. */
-    if (connect(svr_sock, (struct sockaddr *)&g_dst_addr,
-            sizeof_sockaddr(&g_dst_addr)) != 0) {
+    if (connect(svr_sock, (struct sockaddr *)&cfg->dst_addr,
+            sizeof_sockaddr(&cfg->dst_addr)) != 0) {
         /* Error occurs, drop the session. */
         syslog(LOG_WARNING, "Connection failed: %s", strerror(errno));
         goto err;
@@ -515,7 +544,7 @@ static void proxy_conn_walk_continue(unsigned walk_max, int epfd)
     time_t now = time(NULL);
     while (walked < walk_max && !list_empty(&g_lru_list)) {
         struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
-        if ((unsigned)(now - oldest->last_active) <= proxy_conn_timeo)
+        if ((unsigned)(now - oldest->last_active) <= cfg->proxy_conn_timeo)
             break; /* oldest not expired -> none later are expired */
         {
             struct sockaddr_inx addr = oldest->cli_addr;
@@ -558,7 +587,7 @@ static void show_help(int argc, char *argv[])
     printf("  %s 0.0.0.0:10000 10.0.0.1:20000\n", argv[0]);
     printf("  %s [::]:10000 [2001:db8::1]:20000\n", argv[0]);
     printf("Options:\n");
-    printf("  -t <seconds>     proxy session timeout (default: %u)\n", proxy_conn_timeo);
+    printf("  -t <seconds>     proxy session timeout (default: %u)\n", 60);
     printf("  -d               run in background\n");
     printf("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)\n");
     printf("  -r               set SO_REUSEADDR before binding local port\n");
@@ -568,10 +597,13 @@ static void show_help(int argc, char *argv[])
 int main(int argc, char *argv[])
 {
     int opt, b_true = 1, lsn_sock, epfd, i;
-    bool is_daemon = false, is_v6only = false, is_reuseaddr = false;
+    struct config cfg;
     struct epoll_event ev, events[1024];
     char buffer[1024 * 64], s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.proxy_conn_timeo = 60; /* default */
 #ifdef __linux__
     /* Batching resources (allocated at runtime) */
     struct mmsghdr *c_msgs = NULL;          /* client -> server */
@@ -583,23 +615,23 @@ int main(int argc, char *argv[])
     while ((opt = getopt(argc, argv, "t:dhorp:")) != -1) {
         switch (opt) {
         case 't':
-            proxy_conn_timeo = strtoul(optarg, NULL, 10);
+            cfg.proxy_conn_timeo = strtoul(optarg, NULL, 10);
             break;
         case 'd':
-            is_daemon = true;
+            cfg.daemonize = true;
             break;
         case 'h':
             show_help(argc, argv);
             exit(0);
             break;
         case 'o':
-            is_v6only = true;
+            cfg.v6only = true;
             break;
         case 'r':
-            is_reuseaddr = true;
+            cfg.reuseaddr = true;
             break;
         case 'p':
-            g_pidfile = optarg;
+            cfg.pidfile = optarg;
             break;
         case '?':
             exit(1);
@@ -612,14 +644,14 @@ int main(int argc, char *argv[])
     }
 
     /* Resolve source address */
-    if (get_sockaddr_inx_pair(argv[optind], &g_src_addr) < 0) {
+    if (get_sockaddr_inx_pair(argv[optind], &cfg.src_addr) < 0) {
         fprintf(stderr, "*** Invalid source address '%s'.\n", argv[optind]);
         exit(1);
     }
     optind++;
 
     /* Resolve destination addresse */
-    if (get_sockaddr_inx_pair(argv[optind], &g_dst_addr) < 0) {
+    if (get_sockaddr_inx_pair(argv[optind], &cfg.dst_addr) < 0) {
         fprintf(stderr, "*** Invalid destination address '%s'.\n", argv[optind]);
         exit(1);
     }
@@ -627,30 +659,30 @@ int main(int argc, char *argv[])
 
     openlog("udpfwd", LOG_PERROR|LOG_NDELAY, LOG_USER);
 
-    lsn_sock = socket(g_src_addr.sa.sa_family, SOCK_DGRAM, 0);
+    lsn_sock = socket(cfg.src_addr.sa.sa_family, SOCK_DGRAM, 0);
     if (lsn_sock < 0) {
         fprintf(stderr, "*** socket(): %s.\n", strerror(errno));
         exit(1);
     }
-    if (is_reuseaddr)
+    if (cfg.reuseaddr)
         setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true, sizeof(b_true));
-    if (g_src_addr.sa.sa_family == AF_INET6 && is_v6only)
+    if (cfg.src_addr.sa.sa_family == AF_INET6 && cfg.v6only)
         setsockopt(lsn_sock, IPPROTO_IPV6, IPV6_V6ONLY, &b_true, sizeof(b_true));
-    if (bind(lsn_sock, (struct sockaddr *)&g_src_addr,
-            sizeof_sockaddr(&g_src_addr)) < 0) {
+    if (bind(lsn_sock, (struct sockaddr *)&cfg.src_addr,
+            sizeof_sockaddr(&cfg.src_addr)) < 0) {
         fprintf(stderr, "*** bind(): %s.\n", strerror(errno));
         exit(1);
     }
     set_nonblock(lsn_sock);
     set_sock_buffers(lsn_sock);
 
-    inet_ntop(g_src_addr.sa.sa_family, addr_of_sockaddr(&g_src_addr),
+    inet_ntop(cfg.src_addr.sa.sa_family, addr_of_sockaddr(&cfg.src_addr),
             s_addr1, sizeof(s_addr1));
-    inet_ntop(g_dst_addr.sa.sa_family, addr_of_sockaddr(&g_dst_addr),
+    inet_ntop(cfg.dst_addr.sa.sa_family, addr_of_sockaddr(&cfg.dst_addr),
             s_addr2, sizeof(s_addr2));
     syslog(LOG_INFO, "UDP proxy [%s]:%d -> [%s]:%d",
-            s_addr1, ntohs(port_of_sockaddr(&g_src_addr)),
-            s_addr2, ntohs(port_of_sockaddr(&g_dst_addr)));
+            s_addr1, ntohs(port_of_sockaddr(&cfg.src_addr)),
+            s_addr2, ntohs(port_of_sockaddr(&cfg.dst_addr)));
 
     /* Create epoll table. */
     if ((epfd = epoll_create(2048)) < 0) {
@@ -658,10 +690,13 @@ int main(int argc, char *argv[])
         exit(1);
     }
 
-    if (is_daemon)
+    if (cfg.daemonize)
         do_daemonize();
-    if (g_pidfile)
-        write_pidfile(g_pidfile);
+    if (cfg.pidfile) {
+        g_pidfile = cfg.pidfile;
+        atexit(cleanup_pidfile);
+        write_pidfile(cfg.pidfile);
+    }
 
     signal(SIGPIPE, SIG_IGN);
     /* Install termination handlers to cleanup PID file via atexit */
@@ -720,7 +755,7 @@ int main(int argc, char *argv[])
 
         /* Timeout check and recycle */
         if ((unsigned)(current_ts - last_check) >= 2) {
-            proxy_conn_walk_continue(200, epfd);
+            proxy_conn_walk_continue(&cfg, 200, epfd);
             last_check = current_ts;
         }
 
@@ -762,7 +797,7 @@ int main(int argc, char *argv[])
                     for (j = 0; j < n; j++) {
                         struct sockaddr_inx *sa = (struct sockaddr_inx *)c_msgs[j].msg_hdr.msg_name;
                         ssize_t len = c_msgs[j].msg_len;
-                        if (!(conn = proxy_conn_get_or_create(sa, epfd)))
+                        if (!(conn = proxy_conn_get_or_create(&cfg, sa, epfd)))
                             continue;
                         touch_proxy_conn(conn);
                         {
@@ -783,7 +818,7 @@ int main(int argc, char *argv[])
                     syslog(LOG_WARNING, "recvfrom(): %s", strerror(errno));
                     continue; /* drop this datagram and move on */
                 }
-                if (!(conn = proxy_conn_get_or_create(&cli_addr, epfd)))
+                if (!(conn = proxy_conn_get_or_create(&cfg, &cli_addr, epfd)))
                     continue;
                 /* refresh activity */
                 touch_proxy_conn(conn);
@@ -826,6 +861,11 @@ int main(int argc, char *argv[])
             }
         }
     }
+
+    close(lsn_sock);
+#ifndef __linux__
+    epoll_close(epfd);
+#endif
 
     return 0;
 }
