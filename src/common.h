@@ -35,6 +35,7 @@ void cleanup_pidfile(void);
 void write_pidfile(const char *path);
 int do_daemonize(void);
 
+void setup_signal_handlers(void);
 void set_nonblock(int fd);
 void *addr_of_sockaddr(const union sockaddr_inx *addr);
 unsigned short *port_of_sockaddr(const union sockaddr_inx *addr);
