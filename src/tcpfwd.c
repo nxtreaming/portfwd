@@ -63,6 +63,7 @@ struct sockaddr_inx {
         struct sockaddr_in in;
         struct sockaddr_in6 in6;
     };
+};
 
 /* Termination flag for graceful shutdown and PID cleanup via atexit */
 static volatile sig_atomic_t g_terminate = 0;
@@ -71,7 +72,6 @@ static void on_signal(int sig)
     (void)sig;
     g_terminate = 1;
 }
-};
 
 #define port_of_sockaddr(s)  ((s)->sa.sa_family == AF_INET6 ? \
         (s)->in6.sin6_port : (s)->in.sin_port)
