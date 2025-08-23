@@ -6,9 +6,9 @@
 #include <sys/types.h>
 #include <sys/select.h>
 #include <time.h>
-
-/* NOTICE: To make sure being included once in a single program. */
-int build_error_on_linking = 0;
+#include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 
 typedef union epoll_data {
     void *ptr;
@@ -23,8 +23,13 @@ struct epoll_event {
 };
 
 
-#define EPOLLIN  0x001
-#define EPOLLOUT 0x004
+#define EPOLLIN       0x001
+#define EPOLLOUT      0x004
+#define EPOLLERR      0x008
+#define EPOLLHUP      0x010
+#define EPOLLRDHUP    0x2000
+/* Edge-triggered flag is accepted but ignored in this select()-based shim */
+#define EPOLLET       0x80000000u
 
 #define EPOLL_CTL_ADD 1
 #define EPOLL_CTL_DEL 2
@@ -68,7 +73,8 @@ static int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
     switch (op) {
     case EPOLL_CTL_ADD:
     case EPOLL_CTL_MOD:
-        assert((event->events & ~(EPOLLIN | EPOLLOUT)) == 0);
+        /* Allow commonly used flags; unsupported ones are ignored here */
+        assert((event->events & ~(EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLRDHUP | EPOLLET)) == 0);
         FD_CLR(fd, &eh->rset);
         FD_CLR(fd, &eh->wset);
         if ((event->events & EPOLLIN))
