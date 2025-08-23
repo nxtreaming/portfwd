@@ -28,6 +28,14 @@ typedef int bool;
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 
+/* Tunables for throughput */
+#ifndef TCP_PROXY_USERBUF_CAP
+#define TCP_PROXY_USERBUF_CAP   (64 * 1024)   /* per-direction userspace buffer */
+#endif
+#ifndef TCP_PROXY_SOCKBUF_CAP
+#define TCP_PROXY_SOCKBUF_CAP   (256 * 1024)  /* desired kernel socket buffer */
+#endif
+
 #define container_of(ptr, type, member) ({          \
     const typeof(((type *)0)->member) * __mptr = (ptr); \
     (type *)((char *)__mptr - offsetof(type, member)); })
@@ -157,6 +165,13 @@ static void set_nonblock(int sockfd)
         fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 }
 
+static void set_sock_buffers(int sockfd)
+{
+    int sz = TCP_PROXY_SOCKBUF_CAP;
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+}
+
 static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
 {
     struct addrinfo hints, *result = NULL;
@@ -233,7 +248,7 @@ enum ev_magic {
 };
 
 struct buffer_info {
-    char data[4096];
+    char data[TCP_PROXY_USERBUF_CAP];
     unsigned rpos;
     unsigned dlen;
 };
@@ -407,6 +422,7 @@ static int handle_accept_new_connection(int sockfd, struct proxy_conn **conn_p)
     }
     conn->cli_sock = cli_sock;
     set_nonblock(conn->cli_sock);
+    set_sock_buffers(conn->cli_sock);
 
     conn->cli_addr = cli_addr;
 
@@ -464,6 +480,7 @@ static int handle_accept_new_connection(int sockfd, struct proxy_conn **conn_p)
     }
     conn->svr_sock = svr_sock;
     set_nonblock(conn->svr_sock);
+    set_sock_buffers(conn->svr_sock);
 
     if (connect(conn->svr_sock, (struct sockaddr *)&conn->svr_addr,
             sizeof_sockaddr(&conn->svr_addr)) == 0) {
