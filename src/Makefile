@@ -1,5 +1,6 @@
 CC ?= $(CROSS_COMPILE)gcc
 PREFIX ?= /usr/local
+CFLAGS += -Wall -Wextra
 # CFLAGS += -g
 
 ifeq ($(shell uname), Linux)
