@@ -126,8 +126,8 @@ struct proxy_conn {
     unsigned short state;
 
     /* Remember the session addresses */
-    struct sockaddr_inx cli_addr;
-    struct sockaddr_inx svr_addr;
+    union sockaddr_inx cli_addr;
+    union sockaddr_inx svr_addr;
 
     /* Buffers for both direction */
     struct buffer_info request;
@@ -277,7 +277,7 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     }
 }
 
-static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, const struct sockaddr_inx *cli_addr, int epfd)
+static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, const union sockaddr_inx *cli_addr, int epfd)
 {
     struct proxy_conn *conn = NULL;
     char s_addr1[50] = "", s_addr2[50] = "";
@@ -299,7 +299,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     conn->svr_addr = cfg->dst_addr;
 #ifdef __linux__
     if (cfg->base_addr_mode) {
-        struct sockaddr_inx loc_addr, orig_dst;
+        union sockaddr_inx loc_addr, orig_dst;
         socklen_t loc_alen = sizeof(loc_addr), orig_alen = sizeof(orig_dst);
         int port_offset = 0;
         uint32_t base, *addr_pos = NULL; /* big-endian data */
@@ -382,7 +382,7 @@ static int handle_accept_new_connection(int sockfd, struct config *cfg, int epfd
         struct proxy_conn **conn_p)
 {
     int cli_sock;
-    struct sockaddr_inx cli_addr;
+    union sockaddr_inx cli_addr;
     socklen_t cli_alen = sizeof(cli_addr);
 
     cli_sock = accept(sockfd, (struct sockaddr *)&cli_addr, &cli_alen);
