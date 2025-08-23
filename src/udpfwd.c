@@ -149,7 +149,7 @@ static unsigned conn_tbl_len;
 
 /* Forward declarations */
 static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max, int epfd);
-static int proxy_conn_evict_one(int epfd);
+static bool proxy_conn_evict_one(int epfd);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -179,12 +179,12 @@ static unsigned int proxy_conn_hash(union sockaddr_inx *sa)
     unsigned int hash = 0;
 
     if (sa->sa.sa_family == AF_INET) {
-        hash = ntohl(sa->in.sin_addr.s_addr) + ntohs(sa->in.sin_port);
+        hash = ntohl(sa->sin.sin_addr.s_addr) + ntohs(sa->sin.sin_port);
     } else if (sa->sa.sa_family == AF_INET6) {
         int i;
         for (i = 0; i < 4; i++)
-            hash += ((uint32_t *)&sa->in6.sin6_addr)[i];
-        hash += ntohs(sa->in6.sin6_port);
+            hash += ((uint32_t *)&sa->sin6.sin6_addr)[i];
+        hash += ntohs(sa->sin6.sin6_port);
     }
 
     return hash;
@@ -446,9 +446,9 @@ int main(int argc, char *argv[])
             s_addr1, sizeof(s_addr1));
     inet_ntop(cfg.dst_addr.sa.sa_family, addr_of_sockaddr(&cfg.dst_addr),
             s_addr2, sizeof(s_addr2));
-    syslog(LOG_INFO, "UDP proxy [%s]:%d -> [%s]:%d",
-            s_addr1, ntohs(port_of_sockaddr(&cfg.src_addr)),
-            s_addr2, ntohs(port_of_sockaddr(&cfg.dst_addr)));
+    syslog(LOG_INFO, "Listening on [%s]:%d, proxying to [%s]:%d",
+            s_addr1, ntohs(*port_of_sockaddr(&cfg.src_addr)),
+            s_addr2, ntohs(*port_of_sockaddr(&cfg.dst_addr)));
 
     /* Create epoll table. */
     if ((epfd = epoll_create(2048)) < 0) {
@@ -546,7 +546,7 @@ int main(int argc, char *argv[])
                         continue;
                     }
                     for (j = 0; j < n; j++) {
-                        struct sockaddr_inx *sa = (struct sockaddr_inx *)c_msgs[j].msg_hdr.msg_name;
+                        union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[j].msg_hdr.msg_name;
                         ssize_t len = c_msgs[j].msg_len;
                         if (!(conn = proxy_conn_get_or_create(&cfg, sa, epfd)))
                             continue;
