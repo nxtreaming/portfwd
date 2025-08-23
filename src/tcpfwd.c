@@ -186,8 +186,13 @@ static void write_pidfile(const char *filepath)
 static void set_nonblock(int sockfd)
 {
     int flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) {
+        syslog(LOG_WARNING, "fcntl(F_GETFL): %s", strerror(errno));
+        return;
+    }
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        syslog(LOG_WARNING, "fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
+    }
 }
 
 static void set_sock_buffers(int sockfd)

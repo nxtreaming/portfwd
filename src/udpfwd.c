@@ -260,8 +260,13 @@ static void write_pidfile(const char *filepath)
 static void set_nonblock(int sockfd)
 {
     int flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags >= 0)
-        fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+    if (flags < 0) {
+        syslog(LOG_WARNING, "fcntl(F_GETFL): %s", strerror(errno));
+        return;
+    }
+    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        syslog(LOG_WARNING, "fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
+    }
 }
 
 static void set_sock_buffers(int sockfd)
@@ -702,7 +707,12 @@ int main(int argc, char *argv[])
                         if (!(conn = proxy_conn_get_or_create(sa, epfd)))
                             continue;
                         conn->last_active = time(NULL);
-                        (void)send(conn->svr_sock, c_bufs[j], len, 0);
+                        {
+                            ssize_t wr = send(conn->svr_sock, c_bufs[j], len, 0);
+                            if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                                syslog(LOG_WARNING, "send(server): %s", strerror(errno));
+                            }
+                        }
                     }
                     continue;
                 }
@@ -719,7 +729,12 @@ int main(int argc, char *argv[])
                     continue;
                 /* refresh activity */
                 conn->last_active = time(NULL);
-                (void)send(conn->svr_sock, buffer, r, 0);
+                {
+                    ssize_t wr = send(conn->svr_sock, buffer, r, 0);
+                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        syslog(LOG_WARNING, "send(server): %s", strerror(errno));
+                    }
+                }
             } else {
                 /* Data from server */
                 conn = (struct proxy_conn *)evp->data.ptr;
@@ -740,8 +755,13 @@ int main(int argc, char *argv[])
                     }
                     /* r >= 0: forward even zero-length datagrams */
                     conn->last_active = time(NULL);
-                    (void)sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
-                            sizeof_sockaddr(&conn->cli_addr));
+                    {
+                        ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
+                                sizeof_sockaddr(&conn->cli_addr));
+                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                            syslog(LOG_WARNING, "sendto(client): %s", strerror(errno));
+                        }
+                    }
                     if (r == 0)
                         break;
                 }
