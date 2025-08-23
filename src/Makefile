@@ -12,13 +12,14 @@ endif
 all: tcpfwd udpfwd
 
 tcpfwd: tcpfwd.o common.o
-	$(CC) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o tcpfwd tcpfwd.o common.o $(LDFLAGS)
 
 udpfwd: udpfwd.o common.o
-	$(CC) -o $@ $^ $(LDFLAGS)
+	$(CC) $(CFLAGS) -o udpfwd udpfwd.o common.o $(LDFLAGS)
 
-%.o: %.c $(HEADERS)
-	$(CC) -c $(CFLAGS) -o $@ $<
+tcpfwd.o: tcpfwd.c common.h no-epoll.h
+udpfwd.o: udpfwd.c common.h no-epoll.h
+common.o: common.c common.h no-epoll.h
 
 install: all
 	mkdir -p $(PREFIX)/bin

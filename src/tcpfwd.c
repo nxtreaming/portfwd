@@ -689,8 +689,8 @@ int main(int argc, char *argv[])
         fprintf(stderr, "*** Invalid src_addr: %s\n", argv[i]);
         return 1;
     }
-    if (get_sockaddr_inx_pair(argv[i+1], &cfg.dst_addr, false) != 0) {
-        fprintf(stderr, "*** Invalid dst_addr: %s\n", argv[i+1]);
+    if (get_sockaddr_inx_pair(argv[i + 1], &cfg.dst_addr, false) != 0) {
+        fprintf(stderr, "*** Invalid dst_addr: %s\n", argv[i + 1]);
         return 1;
     }
 
@@ -749,7 +749,7 @@ int main(int argc, char *argv[])
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &ev) < 0) {
         syslog(LOG_ERR, "epoll_ctl(ADD, listener): %s", strerror(errno));
         close(listen_sock);
-        epoll_close(epfd);
+        epoll_close_comp(epfd);
         return 1;
     }
 
@@ -760,7 +760,7 @@ int main(int argc, char *argv[])
     syslog(LOG_INFO, "TCP forwarding stopped.");
 
     close(listen_sock);
-    epoll_close(epfd);
+    epoll_close_comp(epfd);
     closelog();
 
     return rc;

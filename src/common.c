@@ -233,3 +233,12 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
     freeaddrinfo(result);
     return 0;
 }
+
+void epoll_close_comp(int epfd)
+{
+#ifdef __linux__
+    close(epfd);
+#else
+    epoll_close(epfd);
+#endif
+}

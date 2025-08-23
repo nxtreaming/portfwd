@@ -40,6 +40,7 @@ void *addr_of_sockaddr(const union sockaddr_inx *addr);
 unsigned short *port_of_sockaddr(const union sockaddr_inx *addr);
 size_t sizeof_sockaddr(const union sockaddr_inx *addr);
 bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b);
-int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa);
+int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp);
+void epoll_close_comp(int epfd);
 
 #endif /* __PORTFWD_COMMON_H__ */

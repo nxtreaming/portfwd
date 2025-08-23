@@ -16,6 +16,8 @@
 #include <netdb.h>
 #include <time.h>
 
+#include "common.h"
+
 #ifdef __linux__
     #include <sys/epoll.h>
     #include <sys/uio.h>
@@ -30,14 +32,6 @@ typedef int bool;
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-/* Termination flag set by signal handlers for graceful shutdown */
-static volatile sig_atomic_t g_terminate = 0;
-static void on_signal(int sig)
-{
-    (void)sig;
-    g_terminate = 1;
-}
-
 /* Tunables */
 #ifndef UDP_PROXY_SOCKBUF_CAP
 #define UDP_PROXY_SOCKBUF_CAP   (256 * 1024)
@@ -50,21 +44,6 @@ static void on_signal(int sig)
 #define UDP_PROXY_DGRAM_CAP 65536
 #endif
 #endif
-
-struct sockaddr_inx {
-    union {
-        struct sockaddr sa;
-        struct sockaddr_in in;
-        struct sockaddr_in6 in6;
-    };
-};
-
-#define port_of_sockaddr(s)  ((s)->sa.sa_family == AF_INET6 ? \
-        (s)->in6.sin6_port : (s)->in.sin_port)
-#define addr_of_sockaddr(s)  ((s)->sa.sa_family == AF_INET6 ? \
-        (void *)&(s)->in6.sin6_addr : (void *)&(s)->in.sin_addr)
-#define sizeof_sockaddr(s)  ((s)->sa.sa_family == AF_INET6 ? \
-        sizeof((s)->in6) : sizeof((s)->in))
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -168,7 +147,6 @@ struct config {
 #define CONN_TBL_HASH_SIZE  (1 << 8)
 static struct list_head conn_tbl_hbase[CONN_TBL_HASH_SIZE];
 static unsigned conn_tbl_len;
-static const char *g_pidfile;
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -178,198 +156,11 @@ static bool proxy_conn_evict_one(int epfd);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static int do_daemonize(void)
-{
-    int rc;
-
-    if ((rc = fork()) < 0) {
-        fprintf(stderr, "*** fork() error: %s.\n", strerror(errno));
-        return rc;
-    } else if (rc > 0) {
-        /* In parent process */
-        exit(0);
-    } else {
-        /* In child process */
-        int fd;
-        setsid();
-        fd = open("/dev/null", O_RDONLY);
-        dup2(fd, STDIN_FILENO);
-        dup2(fd, STDOUT_FILENO);
-        dup2(fd, STDERR_FILENO);
-        if (fd > 2)
-            close(fd);
-        chdir("/tmp");
-    }
-    return 0;
-}
-
-static bool g_pidfile_created = false;
-static void cleanup_pidfile(void)
-{
-    if (g_pidfile_created && g_pidfile) {
-        unlink(g_pidfile);
-        g_pidfile_created = false;
-    }
-}
-
-static void write_pidfile(const char *filepath)
-{
-    int fd;
-    char buf[32];
-    ssize_t wlen;
-    pid_t pid = getpid();
-
-    /* Try exclusive create to avoid races */
-    fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd < 0 && errno == EEXIST) {
-        /* Check if existing PID is stale */
-        int rfd = open(filepath, O_RDONLY);
-        if (rfd >= 0) {
-            char rbuf[64];
-            ssize_t r = read(rfd, rbuf, sizeof(rbuf) - 1);
-            close(rfd);
-            if (r > 0) {
-                char *endp = NULL;
-                long oldpid;
-                rbuf[r] = '\0';
-                errno = 0;
-                oldpid = strtol(rbuf, &endp, 10);
-                if (errno == 0 && endp != rbuf && oldpid > 0) {
-                    if (kill((pid_t)oldpid, 0) == 0) {
-                        fprintf(stderr, "*** pidfile %s exists, process %ld appears running.\n", filepath, oldpid);
-                        exit(1);
-                    }
-                }
-            }
-        }
-        /* Stale or unreadable: try to remove and recreate */
-        if (unlink(filepath) == 0)
-            fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
-    }
-
-    if (fd < 0) {
-        fprintf(stderr, "*** open(%s): %s\n", filepath, strerror(errno));
-        exit(1);
-    }
-
-    int len = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
-    if (len < 0 || len >= (int)sizeof(buf)) {
-        close(fd);
-        fprintf(stderr, "*** snprintf(pid) failed.\n");
-        exit(1);
-    }
-    wlen = write(fd, buf, (size_t)len);
-    if (wlen != len) {
-        int saved = errno;
-        close(fd);
-        fprintf(stderr, "*** write(%s): %s\n", filepath, strerror(saved));
-        exit(1);
-    }
-    (void)fsync(fd);
-    close(fd);
-
-    g_pidfile_created = true;
-    atexit(cleanup_pidfile);
-}
-
-static void set_nonblock(int sockfd)
-{
-    int flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags < 0) {
-        syslog(LOG_WARNING, "fcntl(F_GETFL): %s", strerror(errno));
-        return;
-    }
-    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        syslog(LOG_WARNING, "fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
-    }
-}
-
 static void set_sock_buffers(int sockfd)
 {
     int sz = UDP_PROXY_SOCKBUF_CAP;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
-}
-
-static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
-{
-    char host[51];
-    int port = 0;
-    const char *port_str = NULL;
-
-    memset(host, 0, sizeof(host));
-
-    if (pair[0] == '[') {
-        const char *end = strchr(pair + 1, ']');
-        if (!end || *(end + 1) != ':' || *(end + 2) == '\0')
-            return -EINVAL;
-        size_t len = end - (pair + 1);
-        if (len >= sizeof(host))
-            return -EINVAL;
-        memcpy(host, pair + 1, len);
-        host[len] = '\0';
-        port_str = end + 2;
-    } else {
-        port_str = strrchr(pair, ':');
-        if (port_str) {
-            size_t len = port_str - pair;
-            if (len >= sizeof(host))
-                return -EINVAL;
-            memcpy(host, pair, len);
-            host[len] = '\0';
-            port_str++;
-        } else {
-            port_str = pair;
-        }
-    }
-
-    if (host[0] == '\0') {
-        if (snprintf(host, sizeof(host), "0.0.0.0") >= (int)sizeof(host))
-            return -EINVAL;
-    }
-
-    char *endptr;
-    long p = strtol(port_str, &endptr, 10);
-    if (*endptr != '\0' || p <= 0 || p > 65535)
-        return -EINVAL;
-    port = (int)p;
-    if (port < 1 || port > 65535)
-        return -EINVAL;
-
-    struct addrinfo hints, *result = NULL;
-    char s_port[20];
-    if (snprintf(s_port, sizeof(s_port), "%d", port) >= (int)sizeof(s_port))
-        return -EINVAL;
-
-    memset(&hints, 0, sizeof(struct addrinfo));
-    hints.ai_family = AF_UNSPEC;  /* Allow IPv4 or IPv6 */
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_flags = AI_PASSIVE;  /* For wildcard IP address */
-    hints.ai_protocol = 0;        /* Any protocol */
-
-    int rc = getaddrinfo(host, s_port, &hints, &result);
-    if (rc != 0) {
-        int err = -EINVAL;
-        switch (rc) {
-        case EAI_AGAIN:       err = -EAGAIN; break;
-        case EAI_NONAME:
-#ifdef EAI_NODATA
-        case EAI_NODATA:
-#endif
-            err = -ENOENT; break;
-        case EAI_FAIL:        err = -EHOSTUNREACH; break;
-        case EAI_FAMILY:      err = -EAFNOSUPPORT; break;
-        case EAI_SOCKTYPE:    err = -ESOCKTNOSUPPORT; break;
-        default:              err = -EINVAL; break;
-        }
-        syslog(LOG_ERR, "getaddrinfo(%s,%s): %s", host, s_port, gai_strerror(rc));
-        return err;
-    }
-
-    /* Get the first resolution. */
-    memcpy(sa, result->ai_addr, result->ai_addrlen);
-    freeaddrinfo(result);
-    return 0;
 }
 
 static bool is_sockaddr_inx_equal(struct sockaddr_inx *sa1, struct sockaddr_inx *sa2)
@@ -538,7 +329,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
     free(conn);
 }
 
-static void proxy_conn_walk_continue(unsigned walk_max, int epfd)
+static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max, int epfd)
 {
     unsigned walked = 0;
     time_t now = time(NULL);
@@ -644,14 +435,14 @@ int main(int argc, char *argv[])
     }
 
     /* Resolve source address */
-    if (get_sockaddr_inx_pair(argv[optind], &cfg.src_addr) < 0) {
+    if (get_sockaddr_inx_pair(argv[optind], &cfg.src_addr, true) < 0) {
         fprintf(stderr, "*** Invalid source address '%s'.\n", argv[optind]);
         exit(1);
     }
     optind++;
 
     /* Resolve destination addresse */
-    if (get_sockaddr_inx_pair(argv[optind], &cfg.dst_addr) < 0) {
+    if (get_sockaddr_inx_pair(argv[optind], &cfg.dst_addr, true) < 0) {
         fprintf(stderr, "*** Invalid destination address '%s'.\n", argv[optind]);
         exit(1);
     }
@@ -692,25 +483,10 @@ int main(int argc, char *argv[])
 
     if (cfg.daemonize)
         do_daemonize();
-    if (cfg.pidfile) {
-        g_pidfile = cfg.pidfile;
-        atexit(cleanup_pidfile);
+    if (cfg.pidfile)
         write_pidfile(cfg.pidfile);
-    }
 
-    signal(SIGPIPE, SIG_IGN);
-    /* Install termination handlers to cleanup PID file via atexit */
-    {
-        struct sigaction sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_handler = on_signal;
-        sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        sigaction(SIGINT, &sa, NULL);
-        sigaction(SIGTERM, &sa, NULL);
-        sigaction(SIGHUP, &sa, NULL);
-        sigaction(SIGQUIT, &sa, NULL);
-    }
+    setup_signal_handlers();
 
     /* Initialize the connection table */
     for (i = 0; i < CONN_TBL_HASH_SIZE; i++)
@@ -863,9 +639,7 @@ int main(int argc, char *argv[])
     }
 
     close(lsn_sock);
-#ifndef __linux__
-    epoll_close(epfd);
-#endif
+    epoll_close_comp(epfd);
 
     return 0;
 }
