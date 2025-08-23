@@ -156,6 +156,9 @@ static struct sockaddr_inx g_src_addr;
 static struct sockaddr_inx g_dst_addr;
 static const char *g_pidfile;
 
+#ifndef UDP_PROXY_MAX_CONNS
+#define UDP_PROXY_MAX_CONNS   8192
+#endif
 #define CONN_TBL_HASH_SIZE  (1 << 8)
 static struct list_head conn_tbl_hbase[CONN_TBL_HASH_SIZE];
 static unsigned conn_tbl_len;
@@ -402,6 +405,21 @@ static struct proxy_conn *proxy_conn_get_or_create(
         }
     }
 
+    /* Enforce connection cap before creating a new one */
+    if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
+        /* First, aggressively recycle timeouts */
+        proxy_conn_walk_continue(conn_tbl_len, epfd);
+        if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
+            if (!proxy_conn_evict_one(epfd)) {
+                inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
+                          s_addr, sizeof(s_addr));
+                syslog(LOG_WARNING, "Conn table full (%u). Drop %s:%d",
+                       conn_tbl_len, s_addr, ntohs(port_of_sockaddr(cli_addr)));
+                goto err;
+            }
+        }
+    }
+
     /* ------------------------------------------ */
     /* Establish the server-side connection */
     if ((svr_sock = socket(g_dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
@@ -490,6 +508,34 @@ static void proxy_conn_walk_continue(unsigned walk_max, int epfd)
         }
         bucket_index = (bucket_index + 1) & (CONN_TBL_HASH_SIZE - 1);
     } while (walk_count < walk_max && bucket_index != __bucket_index);
+}
+
+/* Evict the least recently active connection (LRU-ish across all buckets). */
+static bool proxy_conn_evict_one(int epfd)
+{
+    struct proxy_conn *oldest = NULL, *pos;
+    unsigned bi;
+    time_t oldest_ts = 0;
+    for (bi = 0; bi < CONN_TBL_HASH_SIZE; bi++) {
+        list_for_each_entry(pos, &conn_tbl_hbase[bi], list) {
+            if (!oldest || pos->last_active < oldest_ts) {
+                oldest = pos;
+                oldest_ts = pos->last_active;
+            }
+        }
+    }
+    if (!oldest)
+        return false;
+
+    {
+        struct sockaddr_inx addr = oldest->cli_addr;
+        char s_addr[50] = "";
+        release_proxy_conn(oldest, epfd);
+        inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
+        syslog(LOG_WARNING, "Evicted LRU %s:%d [%u]",
+               s_addr, ntohs(port_of_sockaddr(&addr)), conn_tbl_len);
+    }
+    return true;
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */

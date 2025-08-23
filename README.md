@@ -55,6 +55,7 @@ The UDP forwarder (`udpfwd`) supports kernel/userspace buffer and batching tunab
 - UDP_PROXY_SOCKBUF_CAP: kernel SO_RCVBUF/SO_SNDBUF size (default 262144)
 - UDP_PROXY_BATCH_SZ: Linux-only `recvmmsg()` batch size (default 16)
 - UDP_PROXY_DGRAM_CAP: per-datagram buffer capacity (default 65536)
+- UDP_PROXY_MAX_CONNS: maximum tracked UDP connections (default 8192)
 
 Example:
 
@@ -66,6 +67,12 @@ Notes:
 
 - Batching auto-enables on Linux when resources allocate; otherwise falls back to single `recvfrom()`.
 - Server->client path drains reads until EAGAIN to reduce wakeups.
+
+## UDP connection tracking and eviction
+
+- `udpfwd` tracks client endpoints in a hash table with idle timeout (`-t <seconds>`, default shown in `-h`).
+- When the table reaches `UDP_PROXY_MAX_CONNS`, it first recycles timed-out entries, then evicts the least recently active (LRU) connection.
+- Increase the cap via `CFLAGS` or reduce `-t` to make recycling more aggressive.
 
 ## TCP performance tunables
 
