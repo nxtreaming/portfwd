@@ -30,6 +30,14 @@ typedef int bool;
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 
+/* Termination flag set by signal handlers for graceful shutdown */
+static volatile sig_atomic_t g_terminate = 0;
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_terminate = 1;
+}
+
 /* Tunables */
 #ifndef UDP_PROXY_SOCKBUF_CAP
 #define UDP_PROXY_SOCKBUF_CAP   (256 * 1024)
@@ -596,6 +604,18 @@ int main(int argc, char *argv[])
         write_pidfile(g_pidfile);
 
     signal(SIGPIPE, SIG_IGN);
+    /* Install termination handlers to cleanup PID file via atexit */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+        sigaction(SIGQUIT, &sa, NULL);
+    }
 
     /* Initialize the connection table */
     for (i = 0; i < CONN_TBL_HASH_SIZE; i++)
@@ -628,7 +648,7 @@ int main(int argc, char *argv[])
 
     /* epoll loop */
     ev.data.ptr = NULL;
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
     epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev);
 
     for (;;) {
@@ -651,6 +671,9 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
+        if (g_terminate)
+            break;
+
         for (i = 0; i < nfds; i++) {
             struct epoll_event *evp = &events[i];
             struct proxy_conn *conn;
@@ -658,6 +681,10 @@ int main(int argc, char *argv[])
 
             if (evp->data.ptr == NULL) {
                 /* Data from client */
+                if (evp->events & (EPOLLERR | EPOLLHUP)) {
+                    syslog(LOG_WARNING, "listener: EPOLLERR/HUP");
+                    continue;
+                }
                 struct sockaddr_inx cli_addr;
                 socklen_t cli_alen = sizeof(cli_addr);
 #ifdef __linux__
@@ -696,6 +723,11 @@ int main(int argc, char *argv[])
             } else {
                 /* Data from server */
                 conn = (struct proxy_conn *)evp->data.ptr;
+                if (evp->events & (EPOLLERR | EPOLLHUP)) {
+                    /* fatal on this flow: release session */
+                    release_proxy_conn(conn, epfd);
+                    continue;
+                }
                 for (;;) {
                     r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
                     if (r < 0) {

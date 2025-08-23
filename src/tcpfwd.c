@@ -63,6 +63,14 @@ struct sockaddr_inx {
         struct sockaddr_in in;
         struct sockaddr_in6 in6;
     };
+
+/* Termination flag for graceful shutdown and PID cleanup via atexit */
+static volatile sig_atomic_t g_terminate = 0;
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_terminate = 1;
+}
 };
 
 #define port_of_sockaddr(s)  ((s)->sa.sa_family == AF_INET6 ? \
@@ -380,10 +388,10 @@ static void init_new_conn_epoll_fds(struct proxy_conn *conn, int epfd)
 {
     struct epoll_event ev_cli, ev_svr;
 
-    ev_cli.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+    ev_cli.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
     ev_cli.data.ptr = &conn->magic_client;
 
-    ev_svr.events = EPOLLIN | EPOLLRDHUP | EPOLLET;
+    ev_svr.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
     ev_svr.data.ptr = &conn->magic_server;
 
     epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &ev_cli);
@@ -417,16 +425,16 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
             if (conn->response.rpos < conn->response.dlen)
                 ev_cli.events |= EPOLLOUT;
             /* Edge-triggered for data sockets */
-            ev_cli.events |= EPOLLRDHUP | EPOLLET;
-            ev_svr.events |= EPOLLRDHUP | EPOLLET;
+            ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+            ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
             break;
         case S_SERVER_CONNECTING:
             /* Wait for the server connection to establish. */
             if (conn->request.dlen < sizeof(conn->request.data))
                 ev_cli.events |= EPOLLIN; /* for detecting client close */
             ev_svr.events |= EPOLLOUT;
-            ev_cli.events |= EPOLLRDHUP | EPOLLET;
-            ev_svr.events |= EPOLLRDHUP | EPOLLET;
+            ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+            ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
             break;
     }
 
@@ -837,10 +845,22 @@ int main(int argc, char *argv[])
         write_pidfile(g_pidfile);
 
     signal(SIGPIPE, SIG_IGN);
+    /* Install termination handlers to allow graceful exit and PID cleanup */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_signal;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = 0;
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+        sigaction(SIGQUIT, &sa, NULL);
+    }
 
     /* epoll loop */
     ev.data.ptr = &ev_magic_listener;
-    ev.events = EPOLLIN;
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
     epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev);
 
     for (;;) {
@@ -856,6 +876,9 @@ int main(int argc, char *argv[])
             exit(1);
         }
 
+        if (g_terminate)
+            break;
+
         for (i = 0; i < nfds; i++) {
             struct epoll_event *evp = &events[i];
             int *evptr = (int *)evp->data.ptr, efd = -1;
@@ -867,6 +890,10 @@ int main(int argc, char *argv[])
                 continue;
 
             if (*evptr == EV_MAGIC_LISTENER) {
+                if (evp->events & (EPOLLERR | EPOLLHUP)) {
+                    syslog(LOG_WARNING, "listener: EPOLLERR/HUP");
+                    continue;
+                }
                 /* A new connection */
                 conn = NULL;
                 io_state = handle_accept_new_connection(lsn_sock, &conn);
