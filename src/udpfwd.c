@@ -404,13 +404,16 @@ static void show_help(int argc, char *argv[])
 {
     printf("Userspace UDP proxy.\n");
     printf("Usage:\n");
-    printf("  %s <local_ip:local_port> <dest_ip:dest_port> [-d] [-o]\n", argv[0]);
+    printf("  %s <local_ip:local_port> <dest_ip:dest_port> [options]\n", argv[0]);
+    printf("Examples:\n");
+    printf("  %s 0.0.0.0:10000 10.0.0.1:20000\n", argv[0]);
+    printf("  %s [::]:10000 [2001:db8::1]:20000\n", argv[0]);
     printf("Options:\n");
-    printf("  -t <seconds>    proxy session timeout (default: %u)\n", proxy_conn_timeo);
-    printf("  -d              run in background\n");
-    printf("  -o              accept IPv6 connections only for IPv6 listener\n");
-    printf("  -r              set SO_REUSEADDR before binding local port\n");
-    printf("  -p <pidfile>    write PID to file\n");
+    printf("  -t <seconds>     proxy session timeout (default: %u)\n", proxy_conn_timeo);
+    printf("  -d               run in background\n");
+    printf("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)\n");
+    printf("  -r               set SO_REUSEADDR before binding local port\n");
+    printf("  -p <pidfile>     write PID to file\n");
 }
 
 int main(int argc, char *argv[])
