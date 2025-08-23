@@ -113,7 +113,12 @@ static int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
                 size_t ncap = eh->cap * 2;
                 struct pollfd *npfds = (struct pollfd *)realloc(eh->pfds, ncap * sizeof(*npfds));
                 struct epoll_event *nevs = (struct epoll_event *)realloc(eh->evs, ncap * sizeof(*nevs));
-                if (!npfds || !nevs) { free(npfds); free(nevs); return -ENOMEM; }
+                if (!npfds || !nevs) {
+                    /* realloc failure: free any successful allocation and preserve original */
+                    if (npfds != eh->pfds) free(npfds);
+                    if (nevs != eh->evs) free(nevs);
+                    return -ENOMEM;
+                }
                 eh->pfds = npfds; eh->evs = nevs; eh->cap = ncap;
             }
             eh->pfds[eh->len].fd = fd;
