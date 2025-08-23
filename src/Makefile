@@ -18,7 +18,7 @@ udpfwd: udpfwd.o
 	$(CC) -o $@ $^ $(LDFLAGS)
 
 %.o: %.c $(HEADERS)
-	$(CC) -c -Wall $(CFLAGS) -o $@ $<
+	$(CC) -c $(CFLAGS) -o $@ $<
 
 install: all
 	mkdir -p $(PREFIX)/bin
