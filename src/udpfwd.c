@@ -453,7 +453,10 @@ static struct proxy_conn *proxy_conn_get_or_create(
 
     ev.data.ptr = conn;
     ev.events = EPOLLIN;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
+        syslog(LOG_ERR, "epoll_ctl(ADD, svr_sock): %s", strerror(errno));
+        goto err;
+    }
     /* ------------------------------------------ */
 
     list_add_tail(&conn->list, chain);
@@ -481,7 +484,9 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
 {
     list_del(&conn->list);
     conn_tbl_len--;
-    epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL);
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF) {
+        syslog(LOG_DEBUG, "epoll_ctl(DEL, svr_sock): %s", strerror(errno));
+    }
     close(conn->svr_sock);
     free(conn);
 }
@@ -706,7 +711,10 @@ int main(int argc, char *argv[])
     /* epoll loop */
     ev.data.ptr = NULL;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev) < 0) {
+        syslog(LOG_ERR, "epoll_ctl(ADD, listener): %s", strerror(errno));
+        exit(1);
+    }
 
     for (;;) {
         int nfds;

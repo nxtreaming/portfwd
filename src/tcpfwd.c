@@ -376,11 +376,15 @@ static void release_proxy_conn(struct proxy_conn *conn,
 
     if (epfd >= 0) {
         if (conn->cli_sock >= 0) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL);
+            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL) < 0 && errno != EBADF) {
+                syslog(LOG_DEBUG, "epoll_ctl(DEL, cli): %s", strerror(errno));
+            }
             close(conn->cli_sock);
         }
         if (conn->svr_sock >= 0) {
-            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL);
+            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF) {
+                syslog(LOG_DEBUG, "epoll_ctl(DEL, svr): %s", strerror(errno));
+            }
             close(conn->svr_sock);
         }
     }
@@ -398,8 +402,16 @@ static void init_new_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     ev_svr.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
     ev_svr.data.ptr = &conn->magic_server;
 
-    epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &ev_cli);
-    epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev_svr);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &ev_cli) < 0) {
+        syslog(LOG_ERR, "epoll_ctl(ADD, cli): %s", strerror(errno));
+        conn->state = S_CLOSING;
+        return;
+    }
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev_svr) < 0) {
+        syslog(LOG_ERR, "epoll_ctl(ADD, svr): %s", strerror(errno));
+        conn->state = S_CLOSING;
+        return;
+    }
 }
 
 /**
@@ -443,8 +455,16 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     }
 
     /* Reset epoll status */
-    epoll_ctl(epfd, EPOLL_CTL_MOD, conn->cli_sock, &ev_cli);
-    epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &ev_svr);
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->cli_sock, &ev_cli) < 0) {
+        syslog(LOG_WARNING, "epoll_ctl(MOD, cli): %s", strerror(errno));
+        conn->state = S_CLOSING;
+        return;
+    }
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &ev_svr) < 0) {
+        syslog(LOG_WARNING, "epoll_ctl(MOD, svr): %s", strerror(errno));
+        conn->state = S_CLOSING;
+        return;
+    }
 }
 
 static int handle_accept_new_connection(int sockfd, struct proxy_conn **conn_p)
@@ -865,7 +885,10 @@ int main(int argc, char *argv[])
     /* epoll loop */
     ev.data.ptr = &ev_magic_listener;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-    epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev);
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev) < 0) {
+        syslog(LOG_ERR, "epoll_ctl(ADD, listener): %s", strerror(errno));
+        exit(1);
+    }
 
     for (;;) {
         int nfds, i;
