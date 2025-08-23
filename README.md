@@ -33,3 +33,56 @@ User-space TCP/UDP port forwarding services
 
     udpfwd [::]:1701 localhost:1701         # add IPv6 support for a local L2TP service
     tcpfwd 0.0.0.0:80 [2001:db8:3::2]:80    # enable IPv4 access for an IPv6-only web service
+
+## Signals, PID files, and graceful shutdown
+
+Both `tcpfwd` and `udpfwd` support optional PID files via `-p <pidfile>`. The PID file is created exclusively, checks for stale PIDs, and is automatically removed on clean exit. The following signals trigger graceful shutdown and PID cleanup:
+
+- SIGINT, SIGTERM, SIGHUP, SIGQUIT
+
+On receipt, the main loop exits cleanly; registered `atexit` handlers remove the PID file.
+
+## Epoll behavior and error handling
+
+- Data sockets use edge-triggered epoll (EPOLLET) for high performance.
+- Robust events are registered and handled uniformly: `EPOLLRDHUP | EPOLLHUP | EPOLLERR`.
+- Listener sockets are level-triggered and also watch `EPOLLERR | EPOLLHUP` to avoid spurious accepts.
+
+## UDP performance tunables (build-time)
+
+The UDP forwarder (`udpfwd`) supports kernel/userspace buffer and batching tunables. Set via CFLAGS at build time:
+
+- UDP_PROXY_SOCKBUF_CAP: kernel SO_RCVBUF/SO_SNDBUF size (default 262144)
+- UDP_PROXY_BATCH_SZ: Linux-only `recvmmsg()` batch size (default 16)
+- UDP_PROXY_DGRAM_CAP: per-datagram buffer capacity (default 65536)
+
+Example:
+
+```sh
+make -C src CFLAGS='-DUDP_PROXY_SOCKBUF_CAP=524288 -DUDP_PROXY_BATCH_SZ=32 -DUDP_PROXY_DGRAM_CAP=131072'
+```
+
+Notes:
+
+- Batching auto-enables on Linux when resources allocate; otherwise falls back to single `recvfrom()`.
+- Server->client path drains reads until EAGAIN to reduce wakeups.
+
+## TCP performance tunables
+
+`tcpfwd` increases throughput via larger userspace buffers and kernel socket buffers, plus backpressure gating and TCP keepalive.
+
+- TCP_PROXY_USERBUF_CAP: per-direction userspace buffer (default 65536)
+- TCP_PROXY_SOCKBUF_CAP: kernel SO_RCVBUF/SO_SNDBUF (default 262144)
+- TCP_PROXY_BACKPRESSURE_WM: read gating watermark (default 3/4 of user buffer)
+- TCP keepalive defaults (Linux):
+  - TCP_PROXY_KEEPALIVE_IDLE (60s)
+  - TCP_PROXY_KEEPALIVE_INTVL (10s)
+  - TCP_PROXY_KEEPALIVE_CNT (6)
+
+## Build
+
+```sh
+make -C src
+```
+
+Override tunables with `CFLAGS` as shown in the examples above.
