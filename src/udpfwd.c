@@ -405,7 +405,7 @@ int main(int argc, char *argv[])
 {
     int opt, b_true = 1, lsn_sock, epfd, i;
     bool is_daemon = false, is_v6only = false, is_reuseaddr = false;
-    struct epoll_event ev, events[100];
+    struct epoll_event ev, events[1024];
     char buffer[1024 * 64], s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
 

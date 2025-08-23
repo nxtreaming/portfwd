@@ -565,7 +565,7 @@ int main(int argc, char *argv[])
 {
     int opt, b_true = 1, lsn_sock, epfd;
     bool is_daemon = false, is_v6only = false;
-    struct epoll_event ev, events[100];
+    struct epoll_event ev, events[1024];
     int ev_magic_listener = EV_MAGIC_LISTENER;
     char s_addr1[50] = "", s_addr2[50] = "";
 
