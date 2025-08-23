@@ -143,7 +143,7 @@ static unsigned proxy_conn_timeo = 60;
 static int do_daemonize(void)
 {
     int rc;
-    
+
     if ((rc = fork()) < 0) {
         fprintf(stderr, "*** fork() error: %s.\n", strerror(errno));
         return rc;

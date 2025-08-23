@@ -59,7 +59,7 @@ static const char *g_pidfile;
 static int do_daemonize(void)
 {
     int rc;
-    
+
     if ((rc = fork()) < 0) {
         fprintf(stderr, "*** fork() error: %s.\n", strerror(errno));
         return rc;
@@ -271,7 +271,7 @@ static void init_new_conn_epoll_fds(struct proxy_conn *conn, int epfd)
 static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
 {
     struct epoll_event ev_cli, ev_svr;
-    
+
     ev_cli.events = 0;
     ev_cli.data.ptr = &conn->magic_client;
 
