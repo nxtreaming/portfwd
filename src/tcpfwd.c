@@ -651,6 +651,8 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     int noefd, rc;
     char s_addr[50] = "";
 
+    (void)epfd; /* unused */
+
     if (efd == conn->cli_sock) {
         rxb = &conn->request;
         txb = &conn->response;
@@ -765,6 +767,7 @@ err:
 
 static void show_help(int argc, char *argv[])
 {
+    (void)argc; /* unused */
     printf("Userspace TCP proxy.\n");
     printf("Usage:\n");
     printf("  %s <local_ip:local_port> <dest_ip:dest_port> [options]\n", argv[0]);

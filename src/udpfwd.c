@@ -550,6 +550,7 @@ static bool proxy_conn_evict_one(int epfd)
 
 static void show_help(int argc, char *argv[])
 {
+    (void)argc; /* unused */
     printf("Userspace UDP proxy.\n");
     printf("Usage:\n");
     printf("  %s <local_ip:local_port> <dest_ip:dest_port> [options]\n", argv[0]);
