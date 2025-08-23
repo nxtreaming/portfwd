@@ -17,6 +17,7 @@
 
 #ifdef __linux__
     #include <sys/epoll.h>
+    #include <sys/uio.h>
 #else
     #define ERESTART 700
     #include "no-epoll.h"
@@ -27,6 +28,19 @@ typedef int bool;
 #define false 0
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+/* Tunables */
+#ifndef UDP_PROXY_SOCKBUF_CAP
+#define UDP_PROXY_SOCKBUF_CAP   (256 * 1024)
+#endif
+#ifdef __linux__
+#ifndef UDP_PROXY_BATCH_SZ
+#define UDP_PROXY_BATCH_SZ 16
+#endif
+#ifndef UDP_PROXY_DGRAM_CAP
+#define UDP_PROXY_DGRAM_CAP 65536
+#endif
+#endif
 
 struct sockaddr_inx {
     union {
@@ -241,6 +255,13 @@ static void set_nonblock(int sockfd)
         fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 }
 
+static void set_sock_buffers(int sockfd)
+{
+    int sz = UDP_PROXY_SOCKBUF_CAP;
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+}
+
 static int get_sockaddr_inx_pair(const char *pair, struct sockaddr_inx *sa)
 {
     struct addrinfo hints, *result = NULL;
@@ -381,6 +402,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
         goto err;
     }
     set_nonblock(svr_sock);
+    set_sock_buffers(svr_sock);
 
     /* Allocate session data for the connection */
     if ((conn = malloc(sizeof(*conn))) == NULL) {
@@ -481,6 +503,13 @@ int main(int argc, char *argv[])
     struct epoll_event ev, events[1024];
     char buffer[1024 * 64], s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
+#ifdef __linux__
+    /* Batching resources (allocated at runtime) */
+    struct mmsghdr *c_msgs = NULL;          /* client -> server */
+    struct iovec   *c_iov = NULL;
+    struct sockaddr_storage *c_addrs = NULL;
+    char          (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL;
+#endif
 
     while ((opt = getopt(argc, argv, "t:dhorp:")) != -1) {
         switch (opt) {
@@ -544,6 +573,7 @@ int main(int argc, char *argv[])
         exit(1);
     }
     set_nonblock(lsn_sock);
+    set_sock_buffers(lsn_sock);
 
     inet_ntop(g_src_addr.sa.sa_family, addr_of_sockaddr(&g_src_addr),
             s_addr1, sizeof(s_addr1));
@@ -572,6 +602,28 @@ int main(int argc, char *argv[])
     conn_tbl_len = 0;
 
     last_check = time(NULL);
+
+    /* Optional Linux batching init */
+#ifdef __linux__
+    c_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_msgs));
+    c_iov = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_iov));
+    c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_addrs));
+    c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_bufs));
+    if (!c_msgs || !c_iov || !c_addrs || !c_bufs) {
+        free(c_msgs); free(c_iov); free(c_addrs); free(c_bufs);
+        c_msgs = NULL; c_iov = NULL; c_addrs = NULL; c_bufs = NULL;
+    } else {
+        for (i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+            memset(&c_addrs[i], 0, sizeof(c_addrs[i]));
+            c_iov[i].iov_base = c_bufs[i];
+            c_iov[i].iov_len = UDP_PROXY_DGRAM_CAP;
+            c_msgs[i].msg_hdr.msg_iov = &c_iov[i];
+            c_msgs[i].msg_hdr.msg_iovlen = 1;
+            c_msgs[i].msg_hdr.msg_name = &c_addrs[i];
+            c_msgs[i].msg_hdr.msg_namelen = sizeof(c_addrs[i]);
+        }
+    }
+#endif
 
     /* epoll loop */
     ev.data.ptr = NULL;
@@ -607,6 +659,26 @@ int main(int argc, char *argv[])
                 /* Data from client */
                 struct sockaddr_inx cli_addr;
                 socklen_t cli_alen = sizeof(cli_addr);
+#ifdef __linux__
+                if (c_msgs) {
+                    int j, n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
+                    if (n < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                            continue;
+                        syslog(LOG_WARNING, "recvmmsg(): %s", strerror(errno));
+                        continue;
+                    }
+                    for (j = 0; j < n; j++) {
+                        struct sockaddr_inx *sa = (struct sockaddr_inx *)c_msgs[j].msg_hdr.msg_name;
+                        ssize_t len = c_msgs[j].msg_len;
+                        if (!(conn = proxy_conn_get_or_create(sa, epfd)))
+                            continue;
+                        conn->last_active = time(NULL);
+                        (void)send(conn->svr_sock, c_bufs[j], len, 0);
+                    }
+                    continue;
+                }
+#endif
                 r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0,
                         (struct sockaddr *)&cli_addr, &cli_alen);
                 if (r < 0) {
@@ -623,19 +695,23 @@ int main(int argc, char *argv[])
             } else {
                 /* Data from server */
                 conn = (struct proxy_conn *)evp->data.ptr;
-                r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
-                if (r < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                        continue; /* transient, try later */
-                    syslog(LOG_WARNING, "recv(server): %s", strerror(errno));
-                    /* fatal error on server socket: close session */
-                    release_proxy_conn(conn, epfd);
-                    continue;
+                for (;;) {
+                    r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
+                    if (r < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                            break; /* drained */
+                        syslog(LOG_WARNING, "recv(server): %s", strerror(errno));
+                        /* fatal error on server socket: close session */
+                        release_proxy_conn(conn, epfd);
+                        break;
+                    }
+                    /* r >= 0: forward even zero-length datagrams */
+                    conn->last_active = time(NULL);
+                    (void)sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
+                            sizeof_sockaddr(&conn->cli_addr));
+                    if (r == 0)
+                        break;
                 }
-                /* r >= 0: forward even zero-length datagrams */
-                conn->last_active = time(NULL);
-                (void)sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
-                        sizeof_sockaddr(&conn->cli_addr));
             }
         }
     }
