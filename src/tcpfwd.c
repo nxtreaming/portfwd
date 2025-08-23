@@ -334,7 +334,8 @@ static int handle_accept_new_connection(int sockfd, struct proxy_conn **conn_p)
 		struct sockaddr_inx loc_addr, orig_dst;
 		socklen_t loc_alen = sizeof(loc_addr), orig_alen = sizeof(orig_dst);
 		int port_offset = 0;
-		uint32_t *addr_pos = NULL; /* big-endian data */
+		uint32_t base, *addr_pos = NULL; /* big-endian data */
+		int64_t sum;
 
 		memset(&loc_addr, 0x0, sizeof(loc_addr));
 		memset(&orig_dst, 0x0, sizeof(orig_dst));
@@ -354,7 +355,14 @@ static int handle_accept_new_connection(int sockfd, struct proxy_conn **conn_p)
 		}
 		port_offset = (int)(ntohs(port_of_sockaddr(&orig_dst)) - ntohs(port_of_sockaddr(&loc_addr)));
 
-		*addr_pos = htonl(ntohl(*addr_pos) + port_offset);
+		base = ntohl(*addr_pos);
+		sum = (int64_t)base + (int64_t)(int32_t)port_offset;
+		if (sum < 0 || sum > UINT32_MAX) {
+			syslog(LOG_ERR, "base address adjustment overflows: base=%u, off=%d", base, port_offset);
+			goto err;
+		}
+
+		*addr_pos = htonl((uint32_t)sum);
 	}
 #endif
 
