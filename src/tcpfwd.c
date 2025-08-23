@@ -1,4 +1,12 @@
 #include "common.h"
+#include <arpa/inet.h>
+#include <fcntl.h>
+
+#ifdef __linux__
+#include <netinet/tcp.h> /* for TCP_KEEPIDLE, etc. */
+#include <linux/netfilter_ipv4.h> /* for SO_ORIGINAL_DST */
+#endif
+
 #include <syslog.h>
 #include <stddef.h>
 
