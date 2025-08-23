@@ -477,8 +477,16 @@ int main(int argc, char *argv[])
     c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_addrs));
     c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_bufs));
     if (!c_msgs || !c_iov || !c_addrs || !c_bufs) {
-        free(c_msgs); free(c_iov); free(c_addrs); free(c_bufs);
-        c_msgs = NULL; c_iov = NULL; c_addrs = NULL; c_bufs = NULL;
+        free(c_msgs);
+        free(c_iov);
+        free(c_addrs);
+        free(c_bufs);
+        c_msgs = NULL;
+        c_iov = NULL;
+        c_addrs = NULL;
+        c_bufs = NULL;
+
+        return -1;
     } else {
         for (i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
             memset(&c_addrs[i], 0, sizeof(c_addrs[i]));
