@@ -534,20 +534,33 @@ int main(int argc, char *argv[])
 				/* Data from client */
 				struct sockaddr_inx cli_addr;
 				socklen_t cli_alen = sizeof(cli_addr);
-				if ((r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0,
-						(struct sockaddr *)&cli_addr, &cli_alen)) <= 0)
-					continue;
+				r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0,
+						(struct sockaddr *)&cli_addr, &cli_alen);
+				if (r < 0) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+						continue; /* transient, try later */
+					syslog(LOG_WARNING, "recvfrom(): %s", strerror(errno));
+					continue; /* drop this datagram and move on */
+				}
 				if (!(conn = proxy_conn_get_or_create(&cli_addr, epfd)))
 					continue;
+				/* refresh activity */
+				conn->last_active = time(NULL);
 				(void)send(conn->svr_sock, buffer, r, 0);
 			} else {
 				/* Data from server */
 				conn = (struct proxy_conn *)evp->data.ptr;
-				if ((r = recv(conn->svr_sock, buffer, sizeof(buffer), 0)) <= 0) {
-					/* Close the session. */
+				r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
+				if (r < 0) {
+					if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+						continue; /* transient, try later */
+					syslog(LOG_WARNING, "recv(server): %s", strerror(errno));
+					/* fatal error on server socket: close session */
 					release_proxy_conn(conn, epfd);
 					continue;
 				}
+				/* r >= 0: forward even zero-length datagrams */
+				conn->last_active = time(NULL);
 				(void)sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
 						sizeof_sockaddr(&conn->cli_addr));
 			}
@@ -556,4 +569,3 @@ int main(int argc, char *argv[])
 
 	return 0;
 }
-

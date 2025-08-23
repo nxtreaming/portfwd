@@ -416,114 +416,149 @@ err:
 
 static int handle_server_connecting(struct proxy_conn *conn, int efd)
 {
-	char s_addr[50] = "";
+    char s_addr[50] = "";
 
-	if (efd == conn->svr_sock) {
-		/* The connection has established or failed. */
-		int err = 0;
-		socklen_t errlen = sizeof(err);
+    if (efd == conn->svr_sock) {
+        /* The connection has established or failed. */
+        int err = 0;
+        socklen_t errlen = sizeof(err);
 
-		if (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err) {
-			inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
-					s_addr, sizeof(s_addr));
-			syslog(LOG_WARNING, "Connection to [%s]:%d failed: %s",
-					s_addr, ntohs(port_of_sockaddr(&conn->svr_addr)),
-					strerror(err ? err : errno));
-			conn->state = S_CLOSING;
-			return 0;
-		}
+        if (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err) {
+            inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
+                    s_addr, sizeof(s_addr));
+            syslog(LOG_WARNING, "Connection to [%s]:%d failed: %s",
+                    s_addr, ntohs(port_of_sockaddr(&conn->svr_addr)),
+                    strerror(err ? err : errno));
+            conn->state = S_CLOSING;
+            return 0;
+        }
 
-		/* Connected, preparing for data forwarding. */
-		conn->state = S_SERVER_CONNECTED;
-		return 0;
-	} else {
-		/* Received data early before server connection is OK */
-		struct buffer_info *rxb = &conn->request;
-		int rc;
+        /* Connected, preparing for data forwarding. */
+        conn->state = S_SERVER_CONNECTED;
+        return 0;
+    } else {
+        /* Received data early before server connection is OK */
+        struct buffer_info *rxb = &conn->request;
+        int rc;
 
-		if ((rc = recv(efd , rxb->data + rxb->dlen,
-				sizeof(rxb->data) - rxb->dlen, 0)) <= 0) {
-			inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-					s_addr, sizeof(s_addr));
-			syslog(LOG_INFO, "Connection [%s]:%d closed during server handshake",
-					s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
-			conn->state = S_CLOSING;
-			return 0;
-		}
-		rxb->dlen += rc;
+        rc = recv(efd , rxb->data + rxb->dlen,
+                sizeof(rxb->data) - rxb->dlen, 0);
+        if (rc == 0) {
+            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                    s_addr, sizeof(s_addr));
+            syslog(LOG_INFO, "Connection [%s]:%d closed during server handshake",
+                    s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+            conn->state = S_CLOSING;
+            return 0;
+        } else if (rc < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return -EAGAIN;
+            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                    s_addr, sizeof(s_addr));
+            syslog(LOG_INFO, "Connection [%s]:%d error during server handshake: %s",
+                    s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)), strerror(errno));
+            conn->state = S_CLOSING;
+            return 0;
+        }
+        rxb->dlen += rc;
 
-		return -EAGAIN;
-	}
+        return -EAGAIN;
+    }
 }
 
 static int handle_server_connected(struct proxy_conn *conn, int efd)
 {
-	conn->state = S_FORWARDING;
-	return -EAGAIN;
+    (void)efd; /* unused */
+    conn->state = S_FORWARDING;
+    return -EAGAIN;
 }
 
 static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
-		struct epoll_event *ev)
+        struct epoll_event *ev)
 {
-	struct buffer_info *rxb, *txb;
-	int noefd, rc;
-	char s_addr[50] = "";
+    struct buffer_info *rxb, *txb;
+    int noefd, rc;
+    char s_addr[50] = "";
 
-	if (efd == conn->cli_sock) {
-		rxb = &conn->request;
-		txb = &conn->response;
-		noefd = conn->svr_sock;
-	} else {
-		rxb = &conn->response;
-		txb = &conn->request;
-		noefd = conn->cli_sock;
-	}
+    if (efd == conn->cli_sock) {
+        rxb = &conn->request;
+        txb = &conn->response;
+        noefd = conn->svr_sock;
+    } else {
+        rxb = &conn->response;
+        txb = &conn->request;
+        noefd = conn->cli_sock;
+    }
 
-	if (ev->events & EPOLLIN) {
-		if ((rc = recv(efd , rxb->data + rxb->dlen,
-				sizeof(rxb->data) - rxb->dlen, 0)) <= 0)
-			goto err;
-		rxb->dlen += rc;
-		/* Try if we can send it out */
-		if ((rc = send(noefd, rxb->data + rxb->rpos, rxb->dlen - rxb->rpos, 0)) > 0) {
-			rxb->rpos += rc;
-			/* Buffer consumed, empty it */
-			if (rxb->rpos >= rxb->dlen)
-				rxb->rpos = rxb->dlen = 0;
-		}
-	}
+    if (ev->events & EPOLLIN) {
+        rc = recv(efd , rxb->data + rxb->dlen,
+                sizeof(rxb->data) - rxb->dlen, 0);
+        if (rc == 0)
+            goto peer_close;
+        if (rc < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* No data ready now */
+            } else {
+                goto err;
+            }
+        } else {
+            rxb->dlen += rc;
+            /* Try if we can send it out */
+            if ((rc = send(noefd, rxb->data + rxb->rpos, rxb->dlen - rxb->rpos, 0)) > 0) {
+                rxb->rpos += rc;
+                /* Buffer consumed, empty it */
+                if (rxb->rpos >= rxb->dlen)
+                    rxb->rpos = rxb->dlen = 0;
+            } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                /* can't write now, wait for EPOLLOUT */
+            }
+        }
+    }
 
-	if (ev->events & EPOLLOUT) {
-		if ((rc = send(efd, txb->data + txb->rpos, txb->dlen - txb->rpos, 0)) <= 0)
-			goto err;
-		txb->rpos += rc;
-		/* Buffer consumed, empty it */
-		if (txb->rpos >= txb->dlen)
-			txb->rpos = txb->dlen = 0;
-	}
+    if (ev->events & EPOLLOUT) {
+        rc = send(efd, txb->data + txb->rpos, txb->dlen - txb->rpos, 0);
+        if (rc < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* not writable now */
+            } else {
+                goto err;
+            }
+        } else if (rc == 0) {
+            /* treat as no progress; wait for next event */
+        } else {
+            txb->rpos += rc;
+            /* Buffer consumed, empty it */
+            if (txb->rpos >= txb->dlen)
+                txb->rpos = txb->dlen = 0;
+        }
+    }
 
-	/* I/O not ready, handle in next event. */
-	return -EAGAIN;
+    /* I/O not ready, handle in next event. */
+    return -EAGAIN;
+
+peer_close:
+    inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
+    syslog(LOG_INFO, "Connection [%s]:%d closed by peer", s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+    conn->state = S_CLOSING;
+    return 0;
 
 err:
-	inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
-	syslog(LOG_INFO, "Connection [%s]:%d closed", s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
-	conn->state = S_CLOSING;
-	return 0;
+    inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
+    syslog(LOG_INFO, "Connection [%s]:%d closed", s_addr, ntohs(port_of_sockaddr(&conn->cli_addr)));
+    conn->state = S_CLOSING;
+    return 0;
 }
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static void show_help(int argc, char *argv[])
 {
-	printf("Userspace TCP proxy.\n");
-	printf("Usage:\n");
-	printf("  %s <local_ip:local_port> <dest_ip:dest_port> [-d] [-o] [-b]\n", argv[0]);
-	printf("Options:\n");
-	printf("  -d              run in background\n");
-	printf("  -o              accept IPv6 connections only for IPv6 listener\n");
-	printf("  -b              base address to port mapping mode\n");
-	printf("  -p <pidfile>    write PID to file\n");
+    printf("Userspace TCP proxy.\n");
+    printf("Usage:\n");
+    printf("  %s <local_ip:local_port> <dest_ip:dest_port> [-d] [-o] [-b]\n", argv[0]);
+    printf("Options:\n");
+    printf("  -d              run in background\n");
+    printf("  -o              accept IPv6 connections only for IPv6 listener\n");
+    printf("  -b              base address to port mapping mode\n");
+    printf("  -p <pidfile>    write PID to file\n");
 }
 
 int main(int argc, char *argv[])
