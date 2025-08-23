@@ -378,7 +378,7 @@ err:
     return NULL;
 }
 
-static int handle_accept_new_connection(int sockfd, struct config *cfg, int epfd,
+static int handle_accept_new_connection(int sockfd, struct config *cfg,
         struct proxy_conn **conn_p)
 {
     int cli_sock;
@@ -607,10 +607,11 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
 
             if (ev->data.ptr == NULL) { /* Listener socket */
                 conn = NULL;
-                io_state = handle_accept_new_connection(listen_sock, cfg, epfd, &conn);
-                if (!conn)
-                    continue;
-                init_new_conn_epoll_fds(conn, epfd);
+                if (handle_accept_new_connection(listen_sock, cfg, &conn) < 0) {
+                    if (!conn)
+                        continue;
+                    init_new_conn_epoll_fds(conn, epfd);
+                }
             } else { /* Client or server socket */
                 int *magic = (int *)ev->data.ptr;
                 int efd = -1;

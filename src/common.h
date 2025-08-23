@@ -38,7 +38,7 @@ int do_daemonize(void);
 void setup_signal_handlers(void);
 void set_nonblock(int fd);
 void *addr_of_sockaddr(const union sockaddr_inx *addr);
-unsigned short *port_of_sockaddr(const union sockaddr_inx *addr);
+const unsigned short *port_of_sockaddr(const union sockaddr_inx *addr);
 size_t sizeof_sockaddr(const union sockaddr_inx *addr);
 bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b);
 int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp);

@@ -139,7 +139,7 @@ void *addr_of_sockaddr(const union sockaddr_inx *addr)
     return (void *)&addr->sin.sin_addr;
 }
 
-unsigned short *port_of_sockaddr(const union sockaddr_inx *addr)
+const unsigned short *port_of_sockaddr(const union sockaddr_inx *addr)
 {
     if (addr->sa.sa_family == AF_INET)
         return &addr->sin.sin_port;
