@@ -165,15 +165,73 @@ static int do_daemonize(void)
     return 0;
 }
 
+static bool g_pidfile_created = false;
+static void cleanup_pidfile(void)
+{
+    if (g_pidfile_created && g_pidfile) {
+        unlink(g_pidfile);
+        g_pidfile_created = false;
+    }
+}
+
 static void write_pidfile(const char *filepath)
 {
-    FILE *fp;
-    if (!(fp = fopen(filepath, "w"))) {
-        fprintf(stderr, "*** fopen(%s): %s\n", filepath, strerror(errno));
+    int fd;
+    char buf[32];
+    ssize_t wlen;
+    pid_t pid = getpid();
+
+    /* Try exclusive create to avoid races */
+    fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0 && errno == EEXIST) {
+        /* Check if existing PID is stale */
+        int rfd = open(filepath, O_RDONLY);
+        if (rfd >= 0) {
+            char rbuf[64];
+            ssize_t r = read(rfd, rbuf, sizeof(rbuf) - 1);
+            close(rfd);
+            if (r > 0) {
+                char *endp = NULL;
+                long oldpid;
+                rbuf[r] = '\0';
+                errno = 0;
+                oldpid = strtol(rbuf, &endp, 10);
+                if (errno == 0 && endp != rbuf && oldpid > 0) {
+                    if (kill((pid_t)oldpid, 0) == 0) {
+                        fprintf(stderr, "*** pidfile %s exists, process %ld appears running.\n", filepath, oldpid);
+                        exit(1);
+                    }
+                }
+            }
+        }
+        /* Stale or unreadable: try to remove and recreate */
+        if (unlink(filepath) == 0)
+            fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    }
+
+    if (fd < 0) {
+        fprintf(stderr, "*** open(%s): %s\n", filepath, strerror(errno));
         exit(1);
     }
-    fprintf(fp, "%d\n", (int)getpid());
-    fclose(fp);
+
+    int len = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
+    if (len < 0 || len >= (int)sizeof(buf)) {
+        close(fd);
+        fprintf(stderr, "*** snprintf(pid) failed.\n");
+        exit(1);
+    }
+    wlen = write(fd, buf, (size_t)len);
+    if (wlen != len) {
+        int saved = errno;
+        close(fd);
+        fprintf(stderr, "*** write(%s): %s\n", filepath, strerror(saved));
+        exit(1);
+    }
+    (void)fsync(fd);
+    close(fd);
+
+    g_pidfile_created = true;
+    atexit(cleanup_pidfile);
 }
 
 static void set_nonblock(int sockfd)
