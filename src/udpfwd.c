@@ -487,6 +487,8 @@ static struct proxy_conn *proxy_conn_get_or_create(
 err:
     if (svr_sock >= 0)
         close(svr_sock);
+    if (conn)
+        free(conn);
     return NULL;
 }
 
