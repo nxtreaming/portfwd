@@ -166,6 +166,12 @@ static unsigned proxy_conn_timeo = 60;
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
+/* Forward declarations */
+static void proxy_conn_walk_continue(unsigned walk_max, int epfd);
+static bool proxy_conn_evict_one(int epfd);
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 static int do_daemonize(void)
 {
     int rc;
