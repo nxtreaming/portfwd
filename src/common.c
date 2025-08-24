@@ -240,14 +240,10 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 
     memcpy(sa, result->ai_addr, result->ai_addrlen);
     freeaddrinfo(result);
-    return 0;
 }
 
 void epoll_close_comp(int epfd)
 {
-#ifdef __linux__
+if (epfd >= 0)
     close(epfd);
-#else
-    epoll_close(epfd);
-#endif
 }

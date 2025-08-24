@@ -45,7 +45,19 @@ size_t sizeof_sockaddr(const union sockaddr_inx *addr);
 bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b);
 int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp);
 void epoll_close_comp(int epfd);
-int ep_add_or_mod(int epfd, int sock, struct epoll_event *ev);
+static inline int ep_add_or_mod(int epfd, int sock, struct epoll_event *ev)
+{
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, sock, ev) < 0) {
+        if (errno == ENOENT) {
+            /* If the fd is not in epoll set, add it. */
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, sock, ev) < 0)
+                return -1;
+        } else {
+            return -1;
+        }
+    }
+    return 0;
+}
 
 /* Standardized logging macros */
 #define LOG_MSG(level, fmt, ...) do { \
