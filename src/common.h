@@ -13,6 +13,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <syslog.h>
 
 #ifdef __linux__
 #include <sys/epoll.h>

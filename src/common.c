@@ -90,7 +90,7 @@ int do_daemonize(void)
         dup2(fd, STDERR_FILENO);
         if (fd > 2)
             close(fd);
-        chdir("/tmp");
+        chdir("/");
         g_daemonized = true;
     }
     return 0;
@@ -112,13 +112,27 @@ void setup_signal_handlers(void)
 
 void set_nonblock(int sockfd)
 {
-    int flags = fcntl(sockfd, F_GETFL, 0);
+    int flags;
+
+    /* Set O_NONBLOCK */
+    flags = fcntl(sockfd, F_GETFL, 0);
     if (flags < 0) {
         P_LOG_WARN("fcntl(F_GETFL): %s", strerror(errno));
+        /* continue and try to set CLOEXEC anyway */
+    } else {
+        if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            P_LOG_WARN("fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
+        }
+    }
+
+    /* Set FD_CLOEXEC */
+    flags = fcntl(sockfd, F_GETFD, 0);
+    if (flags < 0) {
+        P_LOG_WARN("fcntl(F_GETFD): %s", strerror(errno));
         return;
     }
-    if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        P_LOG_WARN("fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
+    if (fcntl(sockfd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+        P_LOG_WARN("fcntl(F_SETFD,FD_CLOEXEC): %s", strerror(errno));
     }
 }
 
@@ -161,62 +175,57 @@ bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx
 
 int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 {
-    char host[256], s_port[32];
-    const char *port_str;
-    long port;
+    char s_addr[256];
+    char *host = NULL, *port = NULL;
+    struct addrinfo hints, *result = NULL;
+    int rc;
 
-    memset(host, 0, sizeof(host));
+    strncpy(s_addr, pair, sizeof(s_addr) - 1);
+    s_addr[sizeof(s_addr) - 1] = '\0';
 
-    if (pair[0] == '[') { /* [ip6]:port */
-        const char *end = strchr(pair + 1, ']');
-        if (!end || *(end + 1) != ':' || *(end + 2) == '\0')
-            return -EINVAL;
-        size_t len = end - (pair + 1);
-        if (len >= sizeof(host) - 1)
-            return -EINVAL;
-        memcpy(host, pair + 1, len);
-        host[len] = '\0';
-        port_str = end + 2;
-    } else { /* ip4:port or just ip4 */
-        port_str = strrchr(pair, ':');
-        if (port_str) {
-            size_t len = port_str - pair;
-            if (len >= sizeof(host) - 1)
-                return -EINVAL;
-            memcpy(host, pair, len);
-            host[len] = '\0';
-            port_str++;
-        } else {
-            port_str = pair;
-            if (snprintf(host, sizeof(host), "0.0.0.0") >= (int)sizeof(host))
-                return -EINVAL;
+    if (s_addr[0] == '[') {
+        /* IPv6 address literal */
+        host = s_addr + 1;
+        port = strchr(host, ']');
+        if (!port) {
+            return -EINVAL; /* Unmatched '[' */
+        }
+        *port = '\0'; /* Terminate host */
+        port++; /* Move to char after ']' */
+        if (*port != ':' && *port != '\0') {
+            return -EINVAL; /* Must be ':' or end of string */
+        }
+        if (*port == ':') {
+            port++;
+        }
+    } else {
+        /* IPv4, hostname, or bare port */
+        port = strrchr(s_addr, ':');
+        if (port) {
+            host = s_addr;
+            *port = '\0';
+            port++;
+            if (host == port -1) { /* Bare port, e.g. ":8080" */
+                host = NULL;
+            }
         }
     }
 
-    if (host[0] == '\0') {
-        if (snprintf(host, sizeof(host), "0.0.0.0") >= (int)sizeof(host))
-            return -EINVAL;
+    if (!port) {
+        port = s_addr;
     }
 
-    char *endptr;
-    errno = 0;
-    port = strtol(port_str, &endptr, 10);
-    if (errno != 0 || *endptr != '\0' || port < 0 || port > 65535) {
-        return -EINVAL;
-    }
-    if (snprintf(s_port, sizeof(s_port), "%ld", port) >= (int)sizeof(s_port))
-        return -EINVAL;
-
-    struct addrinfo hints, *result = NULL;
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = is_udp ? SOCK_DGRAM : SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE;
     hints.ai_protocol = 0;
+    if (!host) {
+        hints.ai_flags = AI_PASSIVE;
+    }
 
-    int rc = getaddrinfo(host, s_port, &hints, &result);
+    rc = getaddrinfo(host, port, &hints, &result);
     if (rc != 0) {
-        P_LOG_ERR("getaddrinfo(%s:%s): %s", host, s_port, gai_strerror(rc));
+        P_LOG_ERR("getaddrinfo(%s:%s): %s", host ? host : "<any>", port, gai_strerror(rc));
         return -EHOSTUNREACH;
     }
 

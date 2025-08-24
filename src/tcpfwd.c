@@ -84,6 +84,14 @@ static void set_keepalive(int sockfd)
 #endif
 }
 
+static void set_tcp_nodelay(int sockfd)
+{
+    int on = 1;
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
+        P_LOG_WARN("setsockopt(TCP_NODELAY): %s", strerror(errno));
+    }
+}
+
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Status indicators of proxy sessions */
@@ -277,6 +285,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     set_nonblock(conn->cli_sock);
     set_sock_buffers(conn->cli_sock);
     set_keepalive(conn->cli_sock);
+    set_tcp_nodelay(conn->cli_sock);
 
     conn->cli_addr = *cli_addr;
 
@@ -335,6 +344,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     set_nonblock(conn->svr_sock);
     set_sock_buffers(conn->svr_sock);
     set_keepalive(conn->svr_sock);
+    set_tcp_nodelay(conn->svr_sock);
 
     if (connect(conn->svr_sock, (struct sockaddr *)&conn->svr_addr,
             sizeof_sockaddr(&conn->svr_addr)) == 0) {
@@ -548,7 +558,7 @@ err:
 
 static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
 {
-    struct epoll_event events[128];
+    struct epoll_event events[512];
 
     while (!g_terminate) {
         int nfds = epoll_wait(epfd, events, countof(events), 1000);
