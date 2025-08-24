@@ -246,34 +246,34 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     ev_svr.data.ptr = &conn->magic_server;
 
     switch(conn->state) {
-        case S_SERVER_CONNECTING:
-            /* Wait for the server connection to establish. */
-            if (conn->request.dlen < sizeof(conn->request.data))
-                ev_cli.events |= EPOLLIN; /* for detecting client close */
+    case S_SERVER_CONNECTING:
+        /* Wait for the server connection to establish. */
+        if (conn->request.dlen < sizeof(conn->request.data))
+            ev_cli.events |= EPOLLIN; /* for detecting client close */
+        ev_svr.events |= EPOLLOUT;
+        ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+        ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+        break;
+    case S_FORWARDING:
+        /* Connection established, data forwarding in progress. */
+        if (!conn->cli_in_eof && conn->request.dlen < sizeof(conn->request.data))
+            ev_cli.events |= EPOLLIN;
+        if (!conn->svr_in_eof && conn->response.dlen < sizeof(conn->response.data))
+            ev_svr.events |= EPOLLIN;
+        if (conn->request.rpos < conn->request.dlen)
             ev_svr.events |= EPOLLOUT;
-            ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-            ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-            break;
-        case S_FORWARDING:
-            /* Connection established, data forwarding in progress. */
-            if (!conn->cli_in_eof && conn->request.dlen < sizeof(conn->request.data))
-                ev_cli.events |= EPOLLIN;
-            if (!conn->svr_in_eof && conn->response.dlen < sizeof(conn->response.data))
-                ev_svr.events |= EPOLLIN;
-            if (conn->request.rpos < conn->request.dlen)
-                ev_svr.events |= EPOLLOUT;
-            if (conn->response.rpos < conn->response.dlen)
-                ev_cli.events |= EPOLLOUT;
-            /* Edge-triggered for data sockets */
-            ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-            ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-            break;
-        case S_INITIAL:
-        case S_CONNECTING:
-        case S_SERVER_CONNECTED:
-        case S_CLOSING:
-            /* These states are transitional and don't require specific epoll handling here */
-            break;
+        if (conn->response.rpos < conn->response.dlen)
+            ev_cli.events |= EPOLLOUT;
+        /* Edge-triggered for data sockets */
+        ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+        ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+        break;
+    case S_INITIAL:
+    case S_CONNECTING:
+    case S_SERVER_CONNECTED:
+    case S_CLOSING:
+        /* These states are transitional and don't require specific epoll handling here */
+        break;
     }
 
     /* Reset epoll status */
@@ -737,7 +737,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
             }
 
             if (conn) {
-                                if (conn->state == S_CLOSING)
+                if (conn->state == S_CLOSING)
                     release_proxy_conn(conn, events, &nfds, epfd);
                 else if (io_state == -EAGAIN)
                     set_conn_epoll_fds(conn, epfd);

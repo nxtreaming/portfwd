@@ -48,6 +48,10 @@
 #define FNV_PRIME_32 16777619
 #define FNV_OFFSET_BASIS_32 2166136261U
 
+#ifndef UDP_PROXY_MAX_CONNS
+#define UDP_PROXY_MAX_CONNS   8192
+#endif
+
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 struct config {
@@ -61,9 +65,6 @@ struct config {
     int reuseaddr;
 };
 
-#ifndef UDP_PROXY_MAX_CONNS
-#define UDP_PROXY_MAX_CONNS   8192
-#endif
 static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
 static unsigned conn_tbl_len;
