@@ -168,7 +168,8 @@ bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx
     if (a->sa.sa_family == AF_INET) {
         return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr;
     } else if (a->sa.sa_family == AF_INET6) {
-        return memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr, sizeof(struct in6_addr)) == 0;
+        return a->sin6.sin6_scope_id == b->sin6.sin6_scope_id &&
+               memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr, sizeof(struct in6_addr)) == 0;
     }
     return false;
 }
