@@ -146,13 +146,53 @@ static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
 static unsigned conn_tbl_len;
 
+struct conn_pool {
+    struct proxy_conn *connections;
+    struct proxy_conn *freelist;
+    int capacity;
+    int used_count;
+};
+
+static struct conn_pool g_conn_pool;
+
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Forward declarations */
 static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max, int epfd);
 static bool proxy_conn_evict_one(int epfd);
+static struct proxy_conn *alloc_proxy_conn(void);
+static void release_proxy_conn_to_pool(struct proxy_conn *conn);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+static int init_conn_pool(void)
+{
+    g_conn_pool.capacity = UDP_PROXY_MAX_CONNS;
+    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) * g_conn_pool.capacity);
+    if (!g_conn_pool.connections) {
+        P_LOG_ERR("Failed to allocate connection pool");
+        return -1;
+    }
+
+    g_conn_pool.freelist = NULL;
+    for (int i = 0; i < g_conn_pool.capacity; i++) {
+        struct proxy_conn *conn = &g_conn_pool.connections[i];
+        conn->next = g_conn_pool.freelist;
+        g_conn_pool.freelist = conn;
+    }
+    g_conn_pool.used_count = 0;
+    P_LOG_INFO("Connection pool initialized with %d connections", g_conn_pool.capacity);
+    return 0;
+}
+
+static void destroy_conn_pool(void)
+{
+    if (g_conn_pool.connections) {
+        free(g_conn_pool.connections);
+        g_conn_pool.connections = NULL;
+        P_LOG_INFO("Connection pool destroyed.");
+    }
+}
 
 static void set_sock_buffers(int sockfd)
 {
@@ -173,6 +213,9 @@ struct proxy_conn {
     union sockaddr_inx cli_addr;  /* <-- key */
     int svr_sock;
     struct list_head lru;          /* LRU linkage: oldest at head, newest at tail */
+
+    /* For memory pool */
+    struct proxy_conn *next;
 };
 
 #define FNV_PRIME_32 16777619
@@ -266,7 +309,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
     set_sock_buffers(svr_sock);
 
     /* Allocate session data for the connection */
-    if ((conn = malloc(sizeof(*conn))) == NULL) {
+    if ((conn = alloc_proxy_conn()) == NULL) {
         P_LOG_ERR("malloc(conn): %s", strerror(errno));
         goto err;
     }
@@ -299,7 +342,7 @@ err:
     if (svr_sock >= 0)
         close(svr_sock);
     if (conn)
-        free(conn);
+        release_proxy_conn_to_pool(conn);
     return NULL;
 }
 
@@ -317,7 +360,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
         P_LOG_WARN("epoll_ctl(DEL, svr_sock): %s", strerror(errno));
     }
     close(conn->svr_sock);
-    free(conn);
+    release_proxy_conn_to_pool(conn);
 }
 
 static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max, int epfd)
@@ -338,6 +381,26 @@ static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max
         }
         walked++;
     }
+}
+
+static struct proxy_conn *alloc_proxy_conn(void)
+{
+    if (!g_conn_pool.freelist) {
+        P_LOG_WARN("Connection pool exhausted!");
+        return NULL;
+    }
+    struct proxy_conn *conn = g_conn_pool.freelist;
+    g_conn_pool.freelist = conn->next;
+    g_conn_pool.used_count++;
+    memset(conn, 0, sizeof(*conn));
+    return conn;
+}
+
+static void release_proxy_conn_to_pool(struct proxy_conn *conn)
+{
+    conn->next = g_conn_pool.freelist;
+    g_conn_pool.freelist = conn;
+    g_conn_pool.used_count--;
 }
 
 /* Evict the least recently active connection (LRU-ish across all buckets). */
@@ -451,6 +514,11 @@ int main(int argc, char *argv[])
     optind++;
 
     openlog("udpfwd", LOG_PID | LOG_NDELAY, LOG_DAEMON);
+
+    if (init_conn_pool() != 0) {
+        rc = 1;
+        goto cleanup;
+    }
 
     lsn_sock = socket(cfg.src_addr.sa.sa_family, SOCK_DGRAM, 0);
     if (lsn_sock < 0) {
@@ -663,6 +731,7 @@ cleanup:
     if (epfd >= 0)
         epoll_close_comp(epfd);
     free(conn_tbl_hbase);
+    destroy_conn_pool();
 #ifdef __linux__
     free(c_msgs);
     free(c_iov);
