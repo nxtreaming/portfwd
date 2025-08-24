@@ -166,6 +166,15 @@ static inline struct proxy_conn *alloc_proxy_conn(void)
  * Close both sockets of the connection and remove it
  *  from the current ready list.
  */
+static int ep_add_or_mod(int epfd, int fd, struct epoll_event *ev)
+{
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, ev) == 0)
+        return 0;
+    if (errno == ENOENT)
+        return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, ev);
+    return -1;
+}
+
 static void release_proxy_conn(struct proxy_conn *conn,
         struct epoll_event *pending_evs, int pending_fds, int epfd)
 {
@@ -241,13 +250,13 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     }
 
     /* Reset epoll status */
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->cli_sock, &ev_cli) < 0) {
-        P_LOG_WARN("epoll_ctl(MOD, cli): %s", strerror(errno));
+    if (ep_add_or_mod(epfd, conn->cli_sock, &ev_cli) < 0) {
+        P_LOG_WARN("epoll_ctl(MOD/ADD, cli): %s", strerror(errno));
         conn->state = S_CLOSING;
         return;
     }
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &ev_svr) < 0) {
-        P_LOG_WARN("epoll_ctl(MOD, svr): %s", strerror(errno));
+    if (ep_add_or_mod(epfd, conn->svr_sock, &ev_svr) < 0) {
+        P_LOG_WARN("epoll_ctl(MOD/ADD, svr): %s", strerror(errno));
         conn->state = S_CLOSING;
         return;
     }
