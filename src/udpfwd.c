@@ -560,7 +560,7 @@ int main(int argc, char *argv[])
     int opt, b_true = 1, lsn_sock = -1, epfd = -1, i, rc = 0;
     struct config cfg;
         struct epoll_event ev, events[MAX_EVENTS];
-    char buffer[UDP_PROXY_DGRAM_CAP], s_addr1[50] = "", s_addr2[50] = "";
+    char s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
 
     memset(&cfg, 0, sizeof(cfg));
@@ -741,7 +741,6 @@ int main(int argc, char *argv[])
         for (i = 0; i < nfds; i++) {
             struct epoll_event *evp = &events[i];
             struct proxy_conn *conn;
-            int r;
 
             if (evp->data.ptr == NULL) {
                 /* Data from client */
