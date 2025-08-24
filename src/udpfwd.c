@@ -457,6 +457,10 @@ int main(int argc, char *argv[])
     struct iovec   *c_iov = NULL;
     struct sockaddr_storage *c_addrs = NULL;
     char          (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL;
+
+    /* For sendmmsg() */
+    struct mmsghdr *s_msgs = NULL;
+    struct iovec   *s_iovs = NULL;
 #endif
 
     while ((opt = getopt(argc, argv, "t:dhorp:H:")) != -1) {
@@ -583,21 +587,28 @@ int main(int argc, char *argv[])
     c_iov = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_iov));
     c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_addrs));
     c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_bufs));
-    if (!c_msgs || !c_iov || !c_addrs || !c_bufs) {
+    s_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*s_msgs));
+    s_iovs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*s_iovs));
+
+    if (!c_msgs || !c_iov || !c_addrs || !c_bufs || !s_msgs || !s_iovs) {
         P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
         free(c_msgs);   c_msgs = NULL;
         free(c_iov);    c_iov = NULL;
         free(c_addrs);  c_addrs = NULL;
         free(c_bufs);   c_bufs = NULL;
+        free(s_msgs);   s_msgs = NULL;
+        free(s_iovs);   s_iovs = NULL;
     } else {
         for (i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
-            memset(&c_addrs[i], 0, sizeof(c_addrs[i]));
             c_iov[i].iov_base = c_bufs[i];
             c_iov[i].iov_len = UDP_PROXY_DGRAM_CAP;
             c_msgs[i].msg_hdr.msg_iov = &c_iov[i];
             c_msgs[i].msg_hdr.msg_iovlen = 1;
             c_msgs[i].msg_hdr.msg_name = &c_addrs[i];
             c_msgs[i].msg_hdr.msg_namelen = sizeof(c_addrs[i]);
+
+            s_msgs[i].msg_hdr.msg_iov = &s_iovs[i];
+            s_msgs[i].msg_hdr.msg_iovlen = 1;
         }
     }
 #endif
@@ -649,25 +660,56 @@ int main(int argc, char *argv[])
                 union sockaddr_inx cli_addr;
                 socklen_t cli_alen = sizeof(cli_addr);
 #ifdef __linux__
-                if (c_msgs) {
-                    int j, n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
-                    if (n < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                            continue;
-                        P_LOG_WARN("recvmmsg(): %s", strerror(errno));
+                if (c_msgs && s_msgs) {
+                    int n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
+                    if (n <= 0) {
+                        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                            P_LOG_WARN("recvmmsg(): %s", strerror(errno));
                         continue;
                     }
-                    for (j = 0; j < n; j++) {
-                        union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[j].msg_hdr.msg_name;
-                        ssize_t len = c_msgs[j].msg_len;
+
+                    struct send_batch {
+                        int sock;
+                        int msg_indices[UDP_PROXY_BATCH_SZ];
+                        int count;
+                    } batches[UDP_PROXY_BATCH_SZ];
+                    int num_batches = 0;
+
+                    for (int i = 0; i < n; i++) {
+                        union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
                         if (!(conn = proxy_conn_get_or_create(&cfg, sa, epfd)))
                             continue;
                         touch_proxy_conn(conn);
-                        {
-                            ssize_t wr = send(conn->svr_sock, c_bufs[j], len, 0);
-                            if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                                P_LOG_WARN("send(server): %s", strerror(errno));
+
+                        int batch_idx = -1;
+                        for (int k = 0; k < num_batches; k++) {
+                            if (batches[k].sock == conn->svr_sock) {
+                                batch_idx = k;
+                                break;
                             }
+                        }
+                        if (batch_idx == -1) {
+                            batch_idx = num_batches++;
+                            batches[batch_idx].sock = conn->svr_sock;
+                            batches[batch_idx].count = 0;
+                        }
+                        batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+                    }
+
+                    for (int i = 0; i < num_batches; i++) {
+                        struct send_batch *b = &batches[i];
+                        for (int k = 0; k < b->count; k++) {
+                            int msg_idx = b->msg_indices[k];
+                            s_iovs[k].iov_base = c_bufs[msg_idx];
+                            s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
+                            /* s_msgs already configured in init loop */
+                        }
+
+                        int sent = sendmmsg(b->sock, s_msgs, b->count, 0);
+                        if (sent < 0) {
+                            P_LOG_WARN("sendmmsg(server): %s", strerror(errno));
+                        } else if (sent != b->count) {
+                            P_LOG_WARN("sendmmsg(server): partial send, sent %d of %d", sent, b->count);
                         }
                     }
                     continue;
@@ -737,6 +779,8 @@ cleanup:
     free(c_iov);
     free(c_addrs);
     free(c_bufs);
+    free(s_msgs);
+    free(s_iovs);
 #endif
     closelog();
 
