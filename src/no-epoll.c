@@ -166,10 +166,13 @@ int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
     for (size_t i = 0; i < eh->len && out < maxevents; i++) {
         if (eh->pfds[i].revents) {
             uint32_t evs = 0;
-            if (eh->pfds[i].revents & (POLLIN | POLLHUP)) evs |= EPOLLIN;
-            if (eh->pfds[i].revents & POLLOUT) evs |= EPOLLOUT;
-            if (eh->pfds[i].revents & POLLERR) evs |= EPOLLERR;
-            if (eh->pfds[i].revents & POLLHUP) evs |= EPOLLHUP;
+            if (eh->pfds[i].revents & POLLIN)   evs |= EPOLLIN;
+            if (eh->pfds[i].revents & POLLOUT)  evs |= EPOLLOUT;
+            if (eh->pfds[i].revents & POLLERR)  evs |= EPOLLERR;
+#ifdef POLLRDHUP
+            if (eh->pfds[i].revents & POLLRDHUP) evs |= EPOLLRDHUP;
+#endif
+            if (eh->pfds[i].revents & POLLHUP)   evs |= EPOLLHUP;
             events[out] = eh->evs[i];
             events[out].events = evs;
             out++;
