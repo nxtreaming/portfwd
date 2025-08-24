@@ -146,6 +146,12 @@ struct proxy_conn {
     bool svr_in_eof;            /* received EOF from server (server->client) */
     bool cli2svr_shutdown;      /* propagated FIN to server (shutdown server write) */
     bool svr2cli_shutdown;      /* propagated FIN to client (shutdown client write) */
+
+#ifdef __linux__
+    /* For splice() zero-copy */
+    int splice_pipe[2];
+    bool use_splice;
+#endif
 };
 
 static inline struct proxy_conn *alloc_proxy_conn(void)
@@ -166,6 +172,17 @@ static inline struct proxy_conn *alloc_proxy_conn(void)
     conn->svr_in_eof = false;
     conn->cli2svr_shutdown = false;
     conn->svr2cli_shutdown = false;
+
+#ifdef __linux__
+    conn->splice_pipe[0] = -1;
+    conn->splice_pipe[1] = -1;
+    conn->use_splice = false;
+    if (pipe2(conn->splice_pipe, O_NONBLOCK) == 0) {
+        conn->use_splice = true;
+    } else {
+        P_LOG_WARN("pipe2() failed: %s. Falling back to userspace copy.", strerror(errno));
+    }
+#endif
 
     return conn;
 }
@@ -208,6 +225,12 @@ static void release_proxy_conn(struct proxy_conn *conn,
             epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL);
     }
 
+#ifdef __linux__
+    if (conn->use_splice) {
+        close(conn->splice_pipe[0]);
+        close(conn->splice_pipe[1]);
+    }
+#endif
     if (conn->cli_sock >= 0)
         close(conn->cli_sock);
     if (conn->svr_sock >= 0)
@@ -456,97 +479,147 @@ static int handle_server_connected(struct proxy_conn *conn, int efd)
     return -EAGAIN;
 }
 
+#ifdef __linux__
+static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event *ev)
+{
+    int src_fd, dst_fd;
+    int *pipe_fds;
+    ssize_t n_in, n_out;
+
+    pipe_fds = conn->splice_pipe;
+
+    if (ev->data.ptr == &conn->magic_client) { /* client -> server */
+        src_fd = conn->cli_sock;
+        dst_fd = conn->svr_sock;
+    } else { /* server -> client */
+        src_fd = conn->svr_sock;
+        dst_fd = conn->cli_sock;
+    }
+
+    while (1) {
+        n_in = splice(src_fd, NULL, pipe_fds[1], NULL, 65536, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        if (n_in == 0) {
+            if (src_fd == conn->cli_sock) conn->cli_in_eof = true;
+            else conn->svr_in_eof = true;
+            break;
+        }
+        if (n_in < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) break; 
+            P_LOG_ERR("splice(in) from fd %d failed: %s", src_fd, strerror(errno));
+            conn->state = S_CLOSING;
+            return 0;
+        }
+
+        n_out = splice(pipe_fds[0], NULL, dst_fd, NULL, n_in, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        if (n_out < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                P_LOG_WARN("splice(out) to fd %d would block. Data remains in pipe.", dst_fd);
+                break;
+            }
+            P_LOG_ERR("splice(out) to fd %d failed: %s", dst_fd, strerror(errno));
+            conn->state = S_CLOSING;
+            return 0;
+        }
+    }
+
+    return -EAGAIN;
+}
+#endif
+
 static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         struct epoll_event *ev)
 {
-    struct buffer_info *rxb, *txb;
-    int noefd, rc;
     char s_addr[50] = "";
-
     (void)epfd; /* unused */
 
-    if (efd == conn->cli_sock) {
-        rxb = &conn->request;
-        txb = &conn->response;
-        noefd = conn->svr_sock;
-    } else {
-        rxb = &conn->response;
-        txb = &conn->request;
-        noefd = conn->cli_sock;
+#ifdef __linux__
+    if (conn->use_splice) {
+        int io_state = handle_forwarding_splice(conn, ev);
+
+        if (conn->cli_in_eof && !conn->cli2svr_shutdown) {
+            shutdown(conn->svr_sock, SHUT_WR);
+            conn->cli2svr_shutdown = true;
+        }
+        if (conn->svr_in_eof && !conn->svr2cli_shutdown) {
+            shutdown(conn->cli_sock, SHUT_WR);
+            conn->svr2cli_shutdown = true;
+        }
+
+        if (conn->cli_in_eof && conn->svr_in_eof) {
+            conn->state = S_CLOSING;
+            return 0;
+        }
+        return io_state;
+    }
+#endif
+
+    /* Userspace copy fallback for non-Linux or if pipe() failed */
+    struct buffer_info *src_buf, *dst_buf;
+    int src_sock, dst_sock, rc;
+
+    if (ev->data.ptr == &conn->magic_client) { /* client -> server */
+        src_sock = conn->cli_sock;
+        dst_sock = conn->svr_sock;
+        src_buf = &conn->request;
+        dst_buf = &conn->response;
+    } else { /* server -> client */
+        src_sock = conn->svr_sock;
+        dst_sock = conn->cli_sock;
+        src_buf = &conn->response;
+        dst_buf = &conn->request;
     }
 
-    /* Fast-path: detect remote hangups/errors early */
-    if (ev->events & (EPOLLRDHUP | EPOLLHUP)) {
-        if (efd == conn->cli_sock)
-            conn->cli_in_eof = true;
-        else
-            conn->svr_in_eof = true;
-    }
-    if (ev->events & EPOLLERR) {
+    if (ev->events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
         goto err;
     }
 
-    if ((ev->events & EPOLLIN)) {
-        /* Backpressure: if opposite TX backlog is large, skip reading now */
-        if ((txb->dlen - txb->rpos) >= TCP_PROXY_BACKPRESSURE_WM)
-            goto skip_read;
-        for (;;) {
-            rc = recv(efd , rxb->data + rxb->dlen,
-                    sizeof(rxb->data) - rxb->dlen, 0);
-            if (rc == 0) {
-                /* Peer performed a half-close (FIN). Mark EOF for this direction. */
-                if (efd == conn->cli_sock)
-                    conn->cli_in_eof = true;
-                else
-                    conn->svr_in_eof = true;
-                break;
-            } else if (rc < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    /* fully drained for now */
+    if (ev->events & EPOLLIN) {
+        if ((dst_buf->dlen - dst_buf->rpos) < TCP_PROXY_BACKPRESSURE_WM) {
+            for (;;) {
+                rc = recv(src_sock, src_buf->data + src_buf->dlen, sizeof(src_buf->data) - src_buf->dlen, 0);
+                if (rc == 0) {
+                    if (src_sock == conn->cli_sock) conn->cli_in_eof = true;
+                    else conn->svr_in_eof = true;
                     break;
                 }
-                goto err;
-            }
-            rxb->dlen += rc;
-            if (rxb->dlen >= sizeof(rxb->data))
-                break; /* buffer full */
-        }
-        /* After reading, try to flush to peer as much as possible */
-        while (rxb->rpos < rxb->dlen) {
-            rc = send(noefd, rxb->data + rxb->rpos, rxb->dlen - rxb->rpos, 0);
-            if (rc > 0) {
-                rxb->rpos += rc;
-            } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                break; /* can't write now */
-            } else if (rc == 0) {
-                break; /* no progress */
-            } else {
-                goto err;
+                if (rc < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                    goto err;
+                }
+                src_buf->dlen += rc;
+                if (src_buf->dlen >= sizeof(src_buf->data)) break;
             }
         }
-        if (rxb->rpos >= rxb->dlen)
-            rxb->rpos = rxb->dlen = 0;
     }
-skip_read:
+
+    if (src_buf->dlen > src_buf->rpos) {
+        rc = send(dst_sock, src_buf->data + src_buf->rpos, src_buf->dlen - src_buf->rpos, 0);
+        if (rc > 0) {
+            src_buf->rpos += rc;
+        }
+        else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            goto err;
+        }
+        if (src_buf->rpos >= src_buf->dlen) {
+            src_buf->rpos = src_buf->dlen = 0;
+        }
+    }
 
     if (ev->events & EPOLLOUT) {
-        while (txb->rpos < txb->dlen) {
-            rc = send(efd, txb->data + txb->rpos, txb->dlen - txb->rpos, 0);
+        if (dst_buf->dlen > dst_buf->rpos) {
+            rc = send(src_sock, dst_buf->data + dst_buf->rpos, dst_buf->dlen - dst_buf->rpos, 0);
             if (rc > 0) {
-                txb->rpos += rc;
-            } else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                break;
-            } else if (rc == 0) {
-                break;
-            } else {
+                dst_buf->rpos += rc;
+            }
+            else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 goto err;
             }
+            if (dst_buf->rpos >= dst_buf->dlen) {
+                dst_buf->rpos = dst_buf->dlen = 0;
+            }
         }
-        if (txb->rpos >= txb->dlen)
-            txb->rpos = txb->dlen = 0;
     }
 
-    /* If a half-close happened earlier and its corresponding buffer drained, propagate FIN */
     if (conn->cli_in_eof && !conn->cli2svr_shutdown && conn->request.rpos >= conn->request.dlen) {
         shutdown(conn->svr_sock, SHUT_WR);
         conn->cli2svr_shutdown = true;
@@ -556,18 +629,13 @@ skip_read:
         conn->svr2cli_shutdown = true;
     }
 
-    /* If both sides have sent EOF and buffers are drained, we can close */
     if (conn->cli_in_eof && conn->svr_in_eof &&
         conn->request.rpos >= conn->request.dlen &&
         conn->response.rpos >= conn->response.dlen) {
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
-        P_LOG_INFO("Connection [%s]:%d closed (both directions finished)",
-               s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
         conn->state = S_CLOSING;
         return 0;
     }
 
-    /* I/O not ready or waiting for further events (including FIN propagation). */
     return -EAGAIN;
 
 err:
