@@ -42,6 +42,33 @@ Both `tcpfwd` and `udpfwd` support optional PID files via `-p <pidfile>`. The PI
 
 On receipt, the main loop exits cleanly; registered `atexit` handlers remove the PID file.
 
+## Management Script
+
+A startup script `portfwd-control.sh` is provided in the `src/` directory to manage the daemon. This script handles PID file management, including cleaning up stale PID files to ensure the service can restart reliably after a crash.
+
+### Usage
+
+First, configure the `ARGS` variable inside the script to match your desired forwarding rule.
+
+```sh
+cd src/
+
+# Make the script executable
+chmod +x portfwd-control.sh
+
+# Start the daemon
+./portfwd-control.sh start
+
+# Check the status
+./portfwd-control.sh status
+
+# Stop the daemon
+./portfwd-control.sh stop
+
+# Restart the daemon
+./portfwd-control.sh restart
+```
+
 ## Epoll behavior and error handling
 
 - Data sockets use edge-triggered epoll (EPOLLET) for high performance.
