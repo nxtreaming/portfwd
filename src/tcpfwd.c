@@ -293,6 +293,27 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     conn->svr_addr = cfg->dst_addr;
 #ifdef __linux__
     if (cfg->base_addr_mode) {
+        /*
+         * WARNING: This mode implements a highly specific address translation
+         * scheme for transparent proxying (e.g., using TPROXY in iptables).
+         * It relies on getsockopt(SO_ORIGINAL_DST) to find the original
+         * destination address before redirection.
+         *
+         * It then performs direct integer arithmetic on the destination IP address
+         * based on the difference between the original destination port and the
+         * listener port.
+         *
+         * This is NOT a general-purpose load balancing or NAT mechanism.
+         *
+         * It is designed for scenarios where a contiguous block of IP addresses
+         * is mapped 1:1 to a contiguous block of ports. For example, if the
+         * base destination is 192.168.1.0 and a connection to port 8100 is
+         * redirected to the listener on port 8080, the port offset of 20 will
+         * be added to the base IP, resulting in a destination of 192.168.1.20.
+         *
+         * Use this feature with extreme caution and only if you have a network
+         * environment specifically configured for this behavior.
+         */
         union sockaddr_inx loc_addr, orig_dst;
         socklen_t loc_alen = sizeof(loc_addr), orig_alen = sizeof(orig_dst);
         int port_offset = 0;
