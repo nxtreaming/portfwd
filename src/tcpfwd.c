@@ -20,8 +20,8 @@
 #include "proxy_conn.h"
 
 #ifdef __linux__
-#include <netinet/tcp.h> /* for TCP_KEEPIDLE, etc. */
-#include <linux/netfilter_ipv4.h> /* for SO_ORIGINAL_DST */
+#include <netinet/tcp.h>
+#include <linux/netfilter_ipv4.h>
 #endif
 
 #include <syslog.h>
@@ -31,10 +31,10 @@
 
 /* Tunables for throughput */
 #ifndef TCP_PROXY_USERBUF_CAP
-#define TCP_PROXY_USERBUF_CAP   (64 * 1024)   /* per-direction userspace buffer */
+#define TCP_PROXY_USERBUF_CAP   (64 * 1024)
 #endif
 #ifndef TCP_PROXY_SOCKBUF_CAP
-#define TCP_PROXY_SOCKBUF_CAP   (256 * 1024)  /* desired kernel socket buffer */
+#define TCP_PROXY_SOCKBUF_CAP   (256 * 1024)
 #endif
 
 /* Backpressure watermark: when opposite TX backlog exceeds this, limit further reads */
@@ -60,7 +60,6 @@
 #define EV_MAGIC_CLIENT   0xfeedface
 #define EV_MAGIC_SERVER   0xbaadcafe
 
-
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 struct config {
@@ -72,6 +71,15 @@ struct config {
     bool reuse_addr;
     bool v6only;
 };
+
+struct conn_pool {
+    struct proxy_conn *connections;
+    struct proxy_conn *freelist;
+    int capacity;
+    int used_count;
+};
+
+static struct conn_pool g_conn_pool;
 
 static void set_sock_buffers(int sockfd)
 {
@@ -103,15 +111,6 @@ static void set_tcp_nodelay(int sockfd)
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
-struct conn_pool {
-    struct proxy_conn *connections;
-    struct proxy_conn *freelist;
-    int capacity;
-    int used_count;
-};
-
-static struct conn_pool g_conn_pool;
 
 static int init_conn_pool(void)
 {

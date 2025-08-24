@@ -30,6 +30,10 @@ struct pseudo_epoll_handle {
 static struct pseudo_epoll_handle **pseudo_epolls = NULL;
 static size_t pseudo_epolls_cap = 0;
 
+static int ht_insert(struct ht *ht, int fd, size_t index);
+static int ht_remove(struct ht *ht, int fd);
+static struct ht_entry *ht_find(struct ht *ht, int fd);
+
 static void ht_destroy(struct ht *ht) {
     if (!ht) return;
     for (size_t i = 0; i < ht->capacity; i++) {
@@ -136,11 +140,6 @@ int epoll_close(int epfd)
     return 0;
 }
 
-/* Forward declarations for ht functions */
-static int ht_insert(struct ht *ht, int fd, size_t index);
-static int ht_remove(struct ht *ht, int fd);
-static struct ht_entry *ht_find(struct ht *ht, int fd);
-
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 {
     if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
@@ -151,72 +150,69 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
     struct ht_entry *entry = ht_find(eh->fd_map, fd);
 
     switch (op) {
-    case EPOLL_CTL_ADD:
-    case EPOLL_CTL_MOD: {
-        if (!event) { errno = EINVAL; return -1; }
+        case EPOLL_CTL_ADD:
+        case EPOLL_CTL_MOD: {
+            if (!event) { errno = EINVAL; return -1; }
 
-        short pev = 0;
-        if (event->events & EPOLLIN) pev |= POLLIN;
-        if (event->events & EPOLLOUT) pev |= POLLOUT;
+            short pev = 0;
+            if (event->events & EPOLLIN) pev |= POLLIN;
+            if (event->events & EPOLLOUT) pev |= POLLOUT;
 
-        if (op == EPOLL_CTL_ADD && entry) { errno = EEXIST; return -1; }
-        if (op == EPOLL_CTL_MOD && !entry) { errno = ENOENT; return -1; }
+            if (op == EPOLL_CTL_ADD && entry) { errno = EEXIST; return -1; }
+            if (op == EPOLL_CTL_MOD && !entry) { errno = ENOENT; return -1; }
 
-        if (!entry) { /* ADD */
-            if (eh->len == eh->cap) {
-                size_t ncap = eh->cap * 2;
-                struct pollfd *npfds = (struct pollfd *)realloc(eh->pfds, ncap * sizeof(*npfds));
-                struct epoll_event *nevs = (struct epoll_event *)realloc(eh->evs, ncap * sizeof(*nevs));
-                if (!npfds || !nevs) {
-                    if (npfds != eh->pfds) free(npfds);
-                    if (nevs != eh->evs) free(nevs);
-                    errno = ENOMEM; return -1;
+            if (!entry) { /* ADD */
+                if (eh->len == eh->cap) {
+                    size_t ncap = eh->cap * 2;
+                    struct pollfd *npfds = (struct pollfd *)realloc(eh->pfds, ncap * sizeof(*npfds));
+                    struct epoll_event *nevs = (struct epoll_event *)realloc(eh->evs, ncap * sizeof(*nevs));
+                    if (!npfds || !nevs) {
+                        if (npfds != eh->pfds) free(npfds);
+                        if (nevs != eh->evs) free(nevs);
+                        errno = ENOMEM; return -1;
+                    }
+                    eh->pfds = npfds; eh->evs = nevs; eh->cap = ncap;
                 }
-                eh->pfds = npfds; eh->evs = nevs; eh->cap = ncap;
+                size_t new_idx = eh->len;
+                eh->pfds[new_idx].fd = fd;
+                eh->pfds[new_idx].events = pev;
+                eh->pfds[new_idx].revents = 0;
+                eh->evs[new_idx] = *event;
+                if (ht_insert(eh->fd_map, fd, new_idx) != 0) { return -1; }
+                eh->len++;
+            } else { /* MOD */
+                eh->pfds[entry->index].events = pev;
+                eh->evs[entry->index] = *event;
             }
-            size_t new_idx = eh->len;
-            eh->pfds[new_idx].fd = fd;
-            eh->pfds[new_idx].events = pev;
-            eh->pfds[new_idx].revents = 0;
-            eh->evs[new_idx] = *event;
-            if (ht_insert(eh->fd_map, fd, new_idx) != 0) { return -1; }
-            eh->len++;
-        } else { /* MOD */
-            eh->pfds[entry->index].events = pev;
-            eh->evs[entry->index] = *event;
+            break;
         }
-        break;
-    }
-    case EPOLL_CTL_DEL: {
-        if (!entry) return 0; /* not found, success */
-        size_t idx_to_del = entry->index;
-        ht_remove(eh->fd_map, fd);
+        case EPOLL_CTL_DEL: {
+            if (!entry) return 0; /* not found, success */
+            size_t idx_to_del = entry->index;
+            ht_remove(eh->fd_map, fd);
 
-        size_t last_idx = eh->len - 1;
-        if (idx_to_del != last_idx) {
-            /* Move last element to the deleted slot */
-            eh->pfds[idx_to_del] = eh->pfds[last_idx];
-            eh->evs[idx_to_del] = eh->evs[last_idx];
-            /* Update hash map for the moved element */
-            int moved_fd = eh->pfds[idx_to_del].fd;
-            ht_remove(eh->fd_map, moved_fd);
-            ht_insert(eh->fd_map, moved_fd, idx_to_del);
+            size_t last_idx = eh->len - 1;
+            if (idx_to_del != last_idx) {
+                /* Move last element to the deleted slot */
+                eh->pfds[idx_to_del] = eh->pfds[last_idx];
+                eh->evs[idx_to_del] = eh->evs[last_idx];
+                /* Update hash map for the moved element */
+                int moved_fd = eh->pfds[idx_to_del].fd;
+                ht_remove(eh->fd_map, moved_fd);
+                ht_insert(eh->fd_map, moved_fd, idx_to_del);
+            }
+            eh->len--;
+            break;
         }
-        eh->len--;
-        break;
+        default: {
+            errno = EINVAL;
+            return -1;
+        }
     }
-    default: {
-        errno = EINVAL;
-        return -1;
-    }}
 
     return 0;
 }
 
-/* Simple string hash function */
-static unsigned long hash_fd(int fd) {
-    return (unsigned long)fd;
-}
 
 static int ht_resize(struct ht *ht) {
     size_t old_capacity = ht->capacity;
@@ -250,7 +246,7 @@ static int ht_insert(struct ht *ht, int fd, size_t index) {
         if (ht_resize(ht) != 0) return -1;
     }
 
-    unsigned long hash = hash_fd(fd);
+    unsigned long hash = (unsigned long)fd;
     size_t bucket_index = hash % ht->capacity;
     struct ht_entry *new_entry = (struct ht_entry *)malloc(sizeof(struct ht_entry));
     if (!new_entry) { errno = ENOMEM; return -1; }
@@ -264,7 +260,7 @@ static int ht_insert(struct ht *ht, int fd, size_t index) {
 }
 
 static struct ht_entry *ht_find(struct ht *ht, int fd) {
-    unsigned long hash = hash_fd(fd);
+    unsigned long hash = (unsigned long)fd;
     size_t bucket_index = hash % ht->capacity;
     struct ht_entry *entry = ht->buckets[bucket_index];
     while (entry) {
@@ -277,7 +273,7 @@ static struct ht_entry *ht_find(struct ht *ht, int fd) {
 }
 
 static int ht_remove(struct ht *ht, int fd) {
-    unsigned long hash = hash_fd(fd);
+    unsigned long hash = (unsigned long)fd;
     size_t bucket_index = hash % ht->capacity;
     struct ht_entry *entry = ht->buckets[bucket_index];
     struct ht_entry *prev = NULL;

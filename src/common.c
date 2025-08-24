@@ -258,6 +258,6 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 
 void epoll_close_comp(int epfd)
 {
-if (epfd >= 0)
-    close(epfd);
+    if (epfd >= 0)
+        close(epfd);
 }

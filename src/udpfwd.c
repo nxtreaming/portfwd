@@ -45,8 +45,10 @@
 #endif
 #endif
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+#define FNV_PRIME_32 16777619
+#define FNV_OFFSET_BASIS_32 2166136261U
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 struct config {
     union sockaddr_inx src_addr;
@@ -74,6 +76,9 @@ struct conn_pool {
 };
 
 static struct conn_pool g_conn_pool;
+
+/* Global LRU list for O(1) oldest selection */
+static LIST_HEAD(g_lru_list);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -123,10 +128,6 @@ static void set_sock_buffers(int sockfd)
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-
-#define FNV_PRIME_32 16777619
-#define FNV_OFFSET_BASIS_32 2166136261U
-
 static uint32_t fnv1a_32_hash(const void *data, size_t len)
 {
     uint32_t hash = FNV_OFFSET_BASIS_32;
@@ -155,9 +156,6 @@ static unsigned int proxy_conn_hash(const union sockaddr_inx *sa)
 {
     return hash_addr(sa) % g_conn_tbl_hash_size;
 }
-
-/* Global LRU list for O(1) oldest selection */
-static LIST_HEAD(g_lru_list);
 
 static inline void touch_proxy_conn(struct proxy_conn *conn)
 {

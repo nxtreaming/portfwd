@@ -3,8 +3,6 @@
 
 #include "list.h"
 
-/* Common structure for a proxy connection */
-
 /* Shared buffer structure */
 struct buffer_info {
     char *data;
