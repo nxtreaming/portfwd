@@ -105,6 +105,13 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
     case EPOLL_CTL_ADD:
     case EPOLL_CTL_MOD: {
         if (!event) { errno = EINVAL; return -1; }
+
+        /*
+         * WARNING: EPOLLET (edge-triggered) is not supported by this poll-based
+         * emulation. All events are handled in a level-triggered fashion.
+         * A program relying on true edge-triggered semantics may not work
+         * correctly (e.g., it might busy-loop and consume 100% CPU).
+         */
         short pev = 0;
         if (event->events & EPOLLIN) pev |= POLLIN;
         if (event->events & EPOLLOUT) pev |= POLLOUT;
