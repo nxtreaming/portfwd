@@ -1,8 +1,10 @@
+#define _GNU_SOURCE
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <stdbool.h>
+#include <time.h>
 #include <errno.h>
 #include <signal.h>
 #include <sys/types.h>
@@ -10,6 +12,8 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <syslog.h>
+#include <stddef.h>
 
 #include "common.h"
 
@@ -755,8 +759,8 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
             }
 
             if (conn) {
-                if (conn->state == S_CLOSING)
-                    release_proxy_conn(conn, events, nfds, epfd);
+                                if (conn->state == S_CLOSING)
+                    release_proxy_conn(conn, events, &nfds, epfd);
                 else if (io_state == -EAGAIN)
                     set_conn_epoll_fds(conn, epfd);
             }

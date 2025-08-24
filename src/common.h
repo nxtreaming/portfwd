@@ -45,6 +45,7 @@ size_t sizeof_sockaddr(const union sockaddr_inx *addr);
 bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b);
 int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp);
 void epoll_close_comp(int epfd);
+int ep_add_or_mod(int epfd, int sock, struct epoll_event *ev);
 
 /* Standardized logging macros */
 #define LOG_MSG(level, fmt, ...) do { \
