@@ -188,17 +188,20 @@ static uint32_t fnv1a_32_hash(const void *data, size_t len)
     return hash;
 }
 
-static uint32_t hash_addr(union sockaddr_inx *addr)
+static uint32_t hash_addr(const union sockaddr_inx *a)
 {
-    if (addr->sa.sa_family == AF_INET) {
-        return fnv1a_32_hash(&addr->sin, sizeof(struct sockaddr_in));
-    } else if (addr->sa.sa_family == AF_INET6) {
-        return fnv1a_32_hash(&addr->sin6, sizeof(struct sockaddr_in6));
+    if (a->sa.sa_family == AF_INET) {
+        struct { uint32_t addr; uint16_t port; } k = { a->sin.sin_addr.s_addr, a->sin.sin_port };
+        return fnv1a_32_hash(&k, sizeof(k));
+    } else if (a->sa.sa_family == AF_INET6) {
+        struct { struct in6_addr addr; uint16_t port; uint32_t scope; } k =
+            { a->sin6.sin6_addr, a->sin6.sin6_port, a->sin6.sin6_scope_id };
+        return fnv1a_32_hash(&k, sizeof(k));
     }
     return 0;
 }
 
-static unsigned int proxy_conn_hash(union sockaddr_inx *sa)
+static unsigned int proxy_conn_hash(const union sockaddr_inx *sa)
 {
     return hash_addr(sa) & (CONN_TBL_HASH_SIZE - 1);
 }
@@ -215,7 +218,7 @@ static inline void touch_proxy_conn(struct proxy_conn *conn)
 }
 
 static struct proxy_conn *proxy_conn_get_or_create(
-        const struct config *cfg, union sockaddr_inx *cli_addr, int epfd)
+        const struct config *cfg, const union sockaddr_inx *cli_addr, int epfd)
 {
     struct list_head *chain = &conn_tbl_hbase[
         proxy_conn_hash(cli_addr) & (CONN_TBL_HASH_SIZE - 1)];
