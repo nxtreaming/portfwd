@@ -5,33 +5,50 @@
 
 /* Common structure for a proxy connection */
 
+/* Shared buffer structure */
+struct buffer_info {
+    char *data;
+    size_t dlen; /* Data length */
+    size_t rpos; /* Read position */
+    size_t capacity;
+};
+
 enum proxy_state {
     S_INITIAL = 0,
-    S_CONNECTING, /* TCP only */
+    S_CONNECTING,
+    S_SERVER_CONNECTING,
+    S_SERVER_CONNECTED,
     S_FORWARDING,
     S_CLOSING,
 };
 
 struct proxy_conn {
-    /* For TCP */
+    /* Common fields */
+    enum proxy_state state;
+    struct list_head list; /* For linking into different lists */
+    struct proxy_conn *next; /* For freelist in conn_pool */
+
+    /* TCP specific fields */
     int cli_sock;
     int svr_sock;
-    int pipe_fds[2];
+    union sockaddr_inx svr_addr;
+    struct buffer_info request;  /* client -> server */
+    struct buffer_info response; /* server -> client */
+
+    int magic_client;
+    int magic_server;
+
     bool use_splice;
+    int splice_pipe[2];
     bool cli_in_eof;
     bool svr_in_eof;
     bool cli2svr_shutdown;
     bool svr2cli_shutdown;
 
-    /* For UDP */
+    /* UDP specific fields */
     union sockaddr_inx cli_addr;
     int svr_fd;
     time_t last_active;
-    struct proxy_conn *next_in_pool;
-
-    /* Common fields */
-    enum proxy_state state;
-    struct list_head list; /* For linking into different lists */
 };
 
 #endif /* __PORTFWD_PROXY_CONN_H__ */

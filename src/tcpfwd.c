@@ -54,13 +54,12 @@
 #endif
 
 /* Memory pool for connection objects */
-#ifndef TCP_PROXY_CONN_POOL_SIZE
 #define TCP_PROXY_CONN_POOL_SIZE 4096
-#endif
 
-#define container_of(ptr, type, member) ({          \
-    const typeof(((type *)0)->member) * __mptr = (ptr); \
-    (type *)((char *)__mptr - offsetof(type, member)); })
+#define EV_MAGIC_LISTENER 0xdeadbeef
+#define EV_MAGIC_CLIENT   0xfeedface
+#define EV_MAGIC_SERVER   0xbaadcafe
+
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -105,36 +104,11 @@ static void set_tcp_nodelay(int sockfd)
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static struct conn_pool {
-    /* Remember the session addresses */
-    union sockaddr_inx cli_addr;
-    union sockaddr_inx svr_addr;
-
-    /* Buffers for both direction */
-    struct buffer_info request;
-    struct buffer_info response;
-
-    /* Half-close tracking */
-    bool cli_in_eof;            /* received EOF from client (client->server) */
-    bool svr_in_eof;            /* received EOF from server (server->client) */
-    bool cli2svr_shutdown;      /* propagated FIN to server (shutdown server write) */
-    bool svr2cli_shutdown;      /* propagated FIN to client (shutdown client write) */
-
-#ifdef __linux__
-    /* For splice() zero-copy */
-    int splice_pipe[2];
-    bool use_splice;
-#endif
-
-    /* For memory pool */
-    struct proxy_conn *next;
-};
-
 struct conn_pool {
     struct proxy_conn *connections;
     struct proxy_conn *freelist;
     int capacity;
-    int used_count;
+    int size;
 };
 
 static struct conn_pool g_conn_pool;
