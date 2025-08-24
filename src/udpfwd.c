@@ -1,4 +1,7 @@
 #define _GNU_SOURCE 1
+#include "common.h"
+#include "list.h"
+#include "proxy_conn.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -575,7 +578,7 @@ int main(int argc, char *argv[])
         rc = 1;
         goto cleanup;
     }
-    for (i = 0; i < g_conn_tbl_hash_size; i++)
+        for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++)
         INIT_LIST_HEAD(&conn_tbl_hbase[i]);
     conn_tbl_len = 0;
 

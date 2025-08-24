@@ -18,8 +18,8 @@ tcpfwd: tcpfwd.o common.o $(NO_EPOLL_O)
 udpfwd: udpfwd.o common.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd udpfwd.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
-tcpfwd.o: tcpfwd.c common.h
-udpfwd.o: udpfwd.c common.h
+tcpfwd.o: tcpfwd.c common.h proxy_conn.h
+udpfwd.o: udpfwd.c common.h proxy_conn.h
 common.o: common.c common.h
 no-epoll.o: no-epoll.c no-epoll.h
 

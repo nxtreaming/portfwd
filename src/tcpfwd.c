@@ -16,6 +16,8 @@
 #include <stddef.h>
 
 #include "common.h"
+#include "list.h"
+#include "proxy_conn.h"
 
 #ifdef __linux__
 #include <netinet/tcp.h> /* for TCP_KEEPIDLE, etc. */
@@ -103,45 +105,7 @@ static void set_tcp_nodelay(int sockfd)
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-/* Status indicators of proxy sessions */
-enum conn_state {
-    S_INVALID,
-    S_SERVER_CONNECTING,
-    S_SERVER_CONNECTED,
-    S_FORWARDING,
-    S_CLOSING,
-};
-
-enum ev_magic {
-    EV_MAGIC_LISTENER = 0x1010,
-    EV_MAGIC_CLIENT   = 0x2020,
-    EV_MAGIC_SERVER   = 0x3030,
-};
-
-struct buffer_info {
-    char data[TCP_PROXY_USERBUF_CAP];
-    unsigned rpos;
-    unsigned dlen;
-};
-
-/**
- * Connection tracking information to indicate
- *  a proxy session.
- */
-struct proxy_conn {
-    int cli_sock;
-    int svr_sock;
-
-    /**
-     * The two fields are used when an epoll event occurs,
-     * to know on which socket fd it is triggered client
-     * or server.
-     * ev.data.ptr = &ct.magic_client;
-     */
-    int magic_client;
-    int magic_server;
-    unsigned short state;
-
+static struct conn_pool {
     /* Remember the session addresses */
     union sockaddr_inx cli_addr;
     union sockaddr_inx svr_addr;
