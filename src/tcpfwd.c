@@ -185,19 +185,16 @@ static void release_proxy_conn(struct proxy_conn *conn,
     }
 
     if (epfd >= 0) {
-        if (conn->cli_sock >= 0) {
-            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL) < 0 && errno != EBADF) {
-                syslog(LOG_DEBUG, "epoll_ctl(DEL, cli): %s", strerror(errno));
-            }
-            close(conn->cli_sock);
-        }
-        if (conn->svr_sock >= 0) {
-            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF) {
-                syslog(LOG_DEBUG, "epoll_ctl(DEL, svr): %s", strerror(errno));
-            }
-            close(conn->svr_sock);
-        }
+        if (conn->cli_sock >= 0)
+            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL);
+        if (conn->svr_sock >= 0)
+            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL);
     }
+
+    if (conn->cli_sock >= 0)
+        close(conn->cli_sock);
+    if (conn->svr_sock >= 0)
+        close(conn->svr_sock);
 
     free(conn);
 }
@@ -401,7 +398,7 @@ static int handle_accept_new_connection(int sockfd, struct config *cfg,
 
 err:
     *conn_p = NULL;
-    return 0;
+    return -1;
 }
 
 static int handle_server_connecting(struct proxy_conn *conn, int efd)
@@ -607,11 +604,12 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
 
             if (ev->data.ptr == NULL) { /* Listener socket */
                 conn = NULL;
-                if (handle_accept_new_connection(listen_sock, cfg, &conn) < 0) {
-                    if (!conn)
-                        continue;
-                    init_new_conn_epoll_fds(conn, epfd);
-                }
+                if (handle_accept_new_connection(listen_sock, cfg, &conn) == 0) {
+                    if (conn) {
+                        init_new_conn_epoll_fds(conn, epfd);
+                    }
+                } 
+                continue;
             } else { /* Client or server socket */
                 int *magic = (int *)ev->data.ptr;
                 int efd = -1;

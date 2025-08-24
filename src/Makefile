@@ -3,23 +3,25 @@ PREFIX ?= /usr/local
 CFLAGS += -Wall -Wextra
 # CFLAGS += -g
 
+NO_EPOLL_O = 
 ifeq ($(shell uname), Linux)
 #LDFLAGS += -levent
 else
-HEADERS += no-epoll.h
+NO_EPOLL_O = no-epoll.o
 endif
 
 all: tcpfwd udpfwd
 
-tcpfwd: tcpfwd.o common.o
-	$(CC) $(CFLAGS) -o tcpfwd tcpfwd.o common.o $(LDFLAGS)
+tcpfwd: tcpfwd.o common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o tcpfwd tcpfwd.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
-udpfwd: udpfwd.o common.o
-	$(CC) $(CFLAGS) -o udpfwd udpfwd.o common.o $(LDFLAGS)
+udpfwd: udpfwd.o common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o udpfwd udpfwd.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
-tcpfwd.o: tcpfwd.c common.h no-epoll.h
-udpfwd.o: udpfwd.c common.h no-epoll.h
-common.o: common.c common.h no-epoll.h
+tcpfwd.o: tcpfwd.c common.h
+udpfwd.o: udpfwd.c common.h
+common.o: common.c common.h
+no-epoll.o: no-epoll.c no-epoll.h
 
 install: all
 	mkdir -p $(PREFIX)/bin

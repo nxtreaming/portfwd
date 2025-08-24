@@ -206,7 +206,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
 {
     struct list_head *chain = &conn_tbl_hbase[
         proxy_conn_hash(cli_addr) & (CONN_TBL_HASH_SIZE - 1)];
-    struct proxy_conn *conn;
+    struct proxy_conn *conn = NULL;
     int svr_sock = -1;
     struct epoll_event ev;
     char s_addr[50] = "";
@@ -458,8 +458,10 @@ int main(int argc, char *argv[])
 
     if (cfg.daemonize)
         do_daemonize();
-    if (cfg.pidfile)
+    if (cfg.pidfile) {
+        g_pidfile = cfg.pidfile;
         write_pidfile(cfg.pidfile);
+    }
 
     setup_signal_handlers();
 
@@ -477,16 +479,13 @@ int main(int argc, char *argv[])
     c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_addrs));
     c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_bufs));
     if (!c_msgs || !c_iov || !c_addrs || !c_bufs) {
+        syslog(LOG_WARNING, "Failed to allocate UDP batching buffers; proceeding without batching.");
         free(c_msgs);
         free(c_iov);
         free(c_addrs);
         free(c_bufs);
         c_msgs = NULL;
-        c_iov = NULL;
-        c_addrs = NULL;
-        c_bufs = NULL;
-
-        return -1;
+        /* c_iov, c_addrs, c_bufs are not used if c_msgs is NULL */
     } else {
         for (i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
             memset(&c_addrs[i], 0, sizeof(c_addrs[i]));
