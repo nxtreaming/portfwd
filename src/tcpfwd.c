@@ -199,27 +199,6 @@ static void release_proxy_conn(struct proxy_conn *conn,
     free(conn);
 }
 
-static void init_new_conn_epoll_fds(struct proxy_conn *conn, int epfd)
-{
-    struct epoll_event ev_cli, ev_svr;
-
-    ev_cli.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-    ev_cli.data.ptr = &conn->magic_client;
-
-    ev_svr.events = EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-    ev_svr.data.ptr = &conn->magic_server;
-
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &ev_cli) < 0) {
-        syslog(LOG_ERR, "epoll_ctl(ADD, cli): %s", strerror(errno));
-        conn->state = S_CLOSING;
-        return;
-    }
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev_svr) < 0) {
-        syslog(LOG_ERR, "epoll_ctl(ADD, svr): %s", strerror(errno));
-        conn->state = S_CLOSING;
-        return;
-    }
-}
 
 /**
  * Add or activate the epoll fds according to the status of
@@ -590,7 +569,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                         break;
                     }
 
-                    struct proxy_conn *conn = create_proxy_conn(&cfg, cli_sock, &cli_addr);
+                    struct proxy_conn *conn = create_proxy_conn(cfg, cli_sock, &cli_addr);
                     if (conn) {
                         set_conn_epoll_fds(conn, epfd);
                     } else {
