@@ -133,6 +133,7 @@ struct config {
     union sockaddr_inx dst_addr;
     const char *pidfile;
     unsigned proxy_conn_timeo;
+    unsigned conn_tbl_hash_size;
     int daemonize;
     int v6only;
     int reuseaddr;
@@ -141,8 +142,8 @@ struct config {
 #ifndef UDP_PROXY_MAX_CONNS
 #define UDP_PROXY_MAX_CONNS   8192
 #endif
-#define CONN_TBL_HASH_SIZE  (1 << 8)
-static struct list_head conn_tbl_hbase[CONN_TBL_HASH_SIZE];
+static struct list_head *conn_tbl_hbase;
+static unsigned g_conn_tbl_hash_size;
 static unsigned conn_tbl_len;
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -203,7 +204,7 @@ static uint32_t hash_addr(const union sockaddr_inx *a)
 
 static unsigned int proxy_conn_hash(const union sockaddr_inx *sa)
 {
-    return hash_addr(sa) & (CONN_TBL_HASH_SIZE - 1);
+    return hash_addr(sa) % g_conn_tbl_hash_size;
 }
 
 /* Global LRU list for O(1) oldest selection */
@@ -220,8 +221,7 @@ static inline void touch_proxy_conn(struct proxy_conn *conn)
 static struct proxy_conn *proxy_conn_get_or_create(
         const struct config *cfg, const union sockaddr_inx *cli_addr, int epfd)
 {
-    struct list_head *chain = &conn_tbl_hbase[
-        proxy_conn_hash(cli_addr) & (CONN_TBL_HASH_SIZE - 1)];
+    struct list_head *chain = &conn_tbl_hbase[proxy_conn_hash(cli_addr)];
     struct proxy_conn *conn = NULL;
     int svr_sock = -1;
     struct epoll_event ev;
@@ -373,6 +373,7 @@ static void show_help(int argc, char *argv[])
     P_LOG_INFO("  -d               run in background");
     P_LOG_INFO("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)");
     P_LOG_INFO("  -r               set SO_REUSEADDR before binding local port");
+    P_LOG_INFO("  -H <size>        hash table size (default: 4093)");
     P_LOG_INFO("  -p <pidfile>     write PID to file");
 }
 
@@ -386,6 +387,7 @@ int main(int argc, char *argv[])
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.proxy_conn_timeo = 60; /* default */
+    cfg.conn_tbl_hash_size = 4093; /* default */
 #ifdef __linux__
     /* Batching resources (allocated at runtime) */
     struct mmsghdr *c_msgs = NULL;          /* client -> server */
@@ -394,7 +396,7 @@ int main(int argc, char *argv[])
     char          (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL;
 #endif
 
-    while ((opt = getopt(argc, argv, "t:dhorp:")) != -1) {
+    while ((opt = getopt(argc, argv, "t:dhorp:H:")) != -1) {
         switch (opt) {
         case 't':
             cfg.proxy_conn_timeo = strtoul(optarg, NULL, 10);
@@ -414,6 +416,11 @@ int main(int argc, char *argv[])
             break;
         case 'p':
             cfg.pidfile = optarg;
+            break;
+        case 'H':
+            cfg.conn_tbl_hash_size = strtoul(optarg, NULL, 10);
+            if (cfg.conn_tbl_hash_size == 0)
+                cfg.conn_tbl_hash_size = 4093;
             break;
         case '?':
             rc = 1;
@@ -489,7 +496,14 @@ int main(int argc, char *argv[])
     setup_signal_handlers();
 
     /* Initialize the connection table */
-    for (i = 0; i < CONN_TBL_HASH_SIZE; i++)
+    g_conn_tbl_hash_size = cfg.conn_tbl_hash_size;
+    conn_tbl_hbase = malloc(sizeof(struct list_head) * g_conn_tbl_hash_size);
+    if (!conn_tbl_hbase) {
+        P_LOG_ERR("Failed to allocate connection hash table");
+        rc = 1;
+        goto cleanup;
+    }
+    for (i = 0; i < g_conn_tbl_hash_size; i++)
         INIT_LIST_HEAD(&conn_tbl_hbase[i]);
     conn_tbl_len = 0;
 
@@ -648,6 +662,7 @@ cleanup:
         close(lsn_sock);
     if (epfd >= 0)
         epoll_close_comp(epfd);
+    free(conn_tbl_hbase);
 #ifdef __linux__
     free(c_msgs);
     free(c_iov);
