@@ -567,7 +567,9 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         struct epoll_event *ev)
 {
     char s_addr[50] = "";
-    (void)epfd; /* unused */
+
+    (void)efd;
+    (void)epfd;
 
 #ifdef __linux__
     if (conn->use_splice) {
