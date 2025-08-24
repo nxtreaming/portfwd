@@ -375,32 +375,6 @@ err:
     return NULL;
 }
 
-static int handle_accept_new_connection(int sockfd, struct config *cfg,
-        struct proxy_conn **conn_p)
-{
-    int cli_sock;
-    union sockaddr_inx cli_addr;
-    socklen_t cli_alen = sizeof(cli_addr);
-
-    cli_sock = accept(sockfd, (struct sockaddr *)&cli_addr, &cli_alen);
-    if (cli_sock < 0) {
-        /* FIXME: error indicated, need to exit? */
-        syslog(LOG_ERR, "*** accept(): %s", strerror(errno));
-        goto err;
-    }
-
-    *conn_p = create_proxy_conn(cfg, cli_sock, &cli_addr);
-    if (!*conn_p) {
-        goto err;
-    }
-
-    return 0;
-
-err:
-    *conn_p = NULL;
-    return -1;
-}
-
 static int handle_server_connecting(struct proxy_conn *conn, int efd)
 {
     char s_addr[50] = "";
@@ -586,7 +560,7 @@ err:
 
 static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
 {
-    struct epoll_event events[32];
+    struct epoll_event events[128];
 
     while (!g_terminate) {
         int nfds = epoll_wait(epfd, events, countof(events), 1000);
@@ -603,12 +577,26 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
             int io_state = 0;
 
             if (ev->data.ptr == NULL) { /* Listener socket */
-                conn = NULL;
-                if (handle_accept_new_connection(listen_sock, cfg, &conn) == 0) {
-                    if (conn) {
-                        init_new_conn_epoll_fds(conn, epfd);
+                for (;;) {
+                    union sockaddr_inx cli_addr;
+                    socklen_t cli_alen = sizeof(cli_addr);
+                    int cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+                    if (cli_sock < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            /* Processed all incoming connections. */
+                            break;
+                        }
+                        syslog(LOG_ERR, "*** accept(): %s", strerror(errno));
+                        break;
                     }
-                } 
+
+                    struct proxy_conn *conn = create_proxy_conn(&cfg, cli_sock, &cli_addr);
+                    if (conn) {
+                        set_conn_epoll_fds(conn, epfd);
+                    } else {
+                        close(cli_sock);
+                    }
+                }
                 continue;
             } else { /* Client or server socket */
                 int *magic = (int *)ev->data.ptr;

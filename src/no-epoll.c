@@ -41,13 +41,13 @@ int epoll_create(int size)
     for (i = 0; i < pseudo_epolls_cap; i++) {
         if (pseudo_epolls[i] == NULL) {
             struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
-            if (!eh) return -ENOMEM;
+            if (!eh) { errno = ENOMEM; return -1; }
             eh->cap = 16;
             eh->pfds = (struct pollfd *)calloc(eh->cap, sizeof(struct pollfd));
             eh->evs = (struct epoll_event *)calloc(eh->cap, sizeof(struct epoll_event));
             if (!eh->pfds || !eh->evs) {
                 free(eh->pfds); free(eh->evs); free(eh);
-                return -ENOMEM;
+                errno = ENOMEM; return -1;
             }
             pseudo_epolls[i] = eh;
             return (int)i;
@@ -57,25 +57,27 @@ int epoll_create(int size)
     size_t old_cap = pseudo_epolls_cap;
     size_t new_cap = old_cap ? (old_cap + 8) : 8;
     void *np = realloc(pseudo_epolls, new_cap * sizeof(*pseudo_epolls));
-    if (!np) return -ENOMEM;
+    if (!np) { errno = ENOMEM; return -1; }
     pseudo_epolls = (struct pseudo_epoll_handle **)np;
     for (i = old_cap; i < new_cap; i++) pseudo_epolls[i] = NULL;
     pseudo_epolls_cap = new_cap;
     /* Allocate first new slot */
     struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
-    if (!eh) return -ENOMEM;
+    if (!eh) { errno = ENOMEM; return -1; }
     eh->cap = 16;
     eh->pfds = (struct pollfd *)calloc(eh->cap, sizeof(struct pollfd));
     eh->evs = (struct epoll_event *)calloc(eh->cap, sizeof(struct epoll_event));
-    if (!eh->pfds || !eh->evs) { free(eh->pfds); free(eh->evs); free(eh); return -ENOMEM; }
+    if (!eh->pfds || !eh->evs) { free(eh->pfds); free(eh->evs); free(eh); errno = ENOMEM; return -1; }
     pseudo_epolls[old_cap] = eh;
     return (int)old_cap;
 }
 
 int epoll_close(int epfd)
 {
-    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd])
-        return -EINVAL;
+    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
+        errno = EINVAL;
+        return -1;
+    }
 
     struct pseudo_epoll_handle *eh = pseudo_epolls[epfd];
     free(eh->pfds);
@@ -87,8 +89,10 @@ int epoll_close(int epfd)
 
 int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
 {
-    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd])
-        return -EINVAL;
+    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
+        errno = EINVAL;
+        return -1;
+    }
     struct pseudo_epoll_handle *eh = pseudo_epolls[epfd];
 
     /* find existing index */
@@ -100,7 +104,7 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
     switch (op) {
     case EPOLL_CTL_ADD:
     case EPOLL_CTL_MOD: {
-        if (!event) return -EINVAL;
+        if (!event) { errno = EINVAL; return -1; }
         short pev = 0;
         if (event->events & EPOLLIN) pev |= POLLIN;
         if (event->events & EPOLLOUT) pev |= POLLOUT;
@@ -114,7 +118,7 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
                 if (!npfds || !nevs) {
                     if (npfds != eh->pfds) free(npfds);
                     if (nevs != eh->evs) free(nevs);
-                    return -ENOMEM;
+                    errno = ENOMEM; return -1;
                 }
                 eh->pfds = npfds; eh->evs = nevs; eh->cap = ncap;
             }
@@ -139,17 +143,20 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
         eh->len--;
         break;
     }
-    default:
-        return -EINVAL;
-    }
+    default: {
+        errno = EINVAL;
+        return -1;
+    }}
 
     return 0;
 }
 
 int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
 {
-    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd])
-        return -EINVAL;
+    if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
+        errno = EINVAL;
+        return -1;
+    }
     struct pseudo_epoll_handle *eh = pseudo_epolls[epfd];
 
     int nfds = poll(eh->pfds, (nfds_t)eh->len, timeout);

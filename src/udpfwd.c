@@ -174,20 +174,33 @@ struct proxy_conn {
     struct list_head lru;          /* LRU linkage: oldest at head, newest at tail */
 };
 
+#define FNV_PRIME_32 16777619
+#define FNV_OFFSET_BASIS_32 2166136261U
+
+static uint32_t fnv1a_32_hash(const void *data, size_t len)
+{
+    uint32_t hash = FNV_OFFSET_BASIS_32;
+    const unsigned char *p = (const unsigned char *)data;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (uint32_t)p[i];
+        hash *= FNV_PRIME_32;
+    }
+    return hash;
+}
+
+static uint32_t hash_addr(union sockaddr_inx *addr)
+{
+    if (addr->sa.sa_family == AF_INET) {
+        return fnv1a_32_hash(&addr->sin, sizeof(struct sockaddr_in));
+    } else if (addr->sa.sa_family == AF_INET6) {
+        return fnv1a_32_hash(&addr->sin6, sizeof(struct sockaddr_in6));
+    }
+    return 0;
+}
+
 static unsigned int proxy_conn_hash(union sockaddr_inx *sa)
 {
-    unsigned int hash = 0;
-
-    if (sa->sa.sa_family == AF_INET) {
-        hash = ntohl(sa->sin.sin_addr.s_addr) + ntohs(sa->sin.sin_port);
-    } else if (sa->sa.sa_family == AF_INET6) {
-        int i;
-        for (i = 0; i < 4; i++)
-            hash += ((uint32_t *)&sa->sin6.sin6_addr)[i];
-        hash += ntohs(sa->sin6.sin6_port);
-    }
-
-    return hash;
+    return hash_addr(sa) & (CONN_TBL_HASH_SIZE - 1);
 }
 
 /* Global LRU list for O(1) oldest selection */
