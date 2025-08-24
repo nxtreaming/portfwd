@@ -246,18 +246,18 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     switch(conn->state) {
     case S_SERVER_CONNECTING:
         /* Wait for the server connection to establish. */
-        if (conn->request.dlen < sizeof(conn->request.data))
+        if (conn->request.dlen < conn->request.capacity)
             ev_cli.events |= EPOLLIN; /* for detecting client close */
         ev_svr.events |= EPOLLOUT;
         break;
     case S_FORWARDING:
-        if (conn->cli_buf.len < conn->cli_buf.cap)
+        if (conn->request.dlen < conn->request.capacity)
             ev_cli.events |= EPOLLIN;
-        if (conn->svr_buf.len > 0)
+        if (conn->response.dlen > 0)
             ev_cli.events |= EPOLLOUT;
-        if (conn->svr_buf.len < conn->svr_buf.cap)
+        if (conn->response.dlen < conn->response.capacity)
             ev_svr.events |= EPOLLIN;
-        if (conn->cli_buf.len > 0)
+        if (conn->request.dlen > 0)
             ev_svr.events |= EPOLLOUT;
         break;
     default:
@@ -553,34 +553,34 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     }
 
     if (ev->events & EPOLLIN) {
-        int can_read = (ev->data.ptr == &conn->magic_client) ? 
-                       (conn->svr_buf.dlen - conn->svr_buf.rpos < TCP_PROXY_BACKPRESSURE_WM) :
-                       (conn->cli_buf.dlen - conn->cli_buf.rpos < TCP_PROXY_BACKPRESSURE_WM);
+        int can_read = (ev->data.ptr == &conn->magic_client) ?
+                       (conn->response.dlen - conn->response.rpos < TCP_PROXY_BACKPRESSURE_WM) :
+                       (conn->request.dlen - conn->request.rpos < TCP_PROXY_BACKPRESSURE_WM);
 
         if (can_read) {
-            struct buffer *read_buf = (ev->data.ptr == &conn->magic_client) ? &conn->cli_buf : &conn->svr_buf;
+            struct buffer_info *read_buf = (ev->data.ptr == &conn->magic_client) ? &conn->request : &conn->response;
             int read_sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
             ssize_t rc;
 
             for (;;) {
-                rc = recv(read_sock, read_buf->data + read_buf->dlen, read_buf->cap - read_buf->dlen, 0);
+                rc = recv(read_sock, read_buf->data + read_buf->dlen, read_buf->capacity - read_buf->dlen, 0);
                 if (rc == 0) {
                     if (read_sock == conn->cli_sock) conn->cli_in_eof = true;
                     else conn->svr_in_eof = true;
-                    break; 
+                    break;
                 }
                 if (rc < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     goto err;
                 }
                 read_buf->dlen += rc;
-                if (read_buf->dlen >= read_buf->cap) break;
+                if (read_buf->dlen >= read_buf->capacity) break;
             }
         }
     }
 
     if (ev->events & EPOLLOUT) {
-        struct buffer *write_buf = (ev->data.ptr == &conn->magic_client) ? &conn->svr_buf : &conn->cli_buf;
+        struct buffer_info *write_buf = (ev->data.ptr == &conn->magic_client) ? &conn->response : &conn->request;
         int write_sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
         ssize_t rc;
 
@@ -728,7 +728,6 @@ static void show_help(const char *prog)
 
 int main(int argc, char *argv[])
 {
-    int i;
     int rc = 1;
     struct config cfg;
     int listen_sock = -1, epfd = -1;
