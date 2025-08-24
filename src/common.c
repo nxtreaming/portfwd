@@ -1,6 +1,7 @@
 #include "common.h"
 #include <syslog.h>
 #include <assert.h>
+#include <sys/file.h>
 
 const char *g_pidfile = NULL;
 static int g_pidfile_fd = -1;
