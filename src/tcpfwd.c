@@ -221,6 +221,20 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
         }
     }
 
+    /* Free user buffers to avoid leaks, since alloc_proxy_conn() zeroes pointers */
+    if (conn->request.data) {
+        free(conn->request.data);
+        conn->request.data = NULL;
+        conn->request.capacity = 0;
+        conn->request.dlen = conn->request.rpos = 0;
+    }
+    if (conn->response.data) {
+        free(conn->response.data);
+        conn->response.data = NULL;
+        conn->response.capacity = 0;
+        conn->response.dlen = conn->response.rpos = 0;
+    }
+
     conn->next = g_conn_pool.freelist;
     g_conn_pool.freelist = conn;
     g_conn_pool.used_count--;
@@ -243,25 +257,32 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     ev_svr.events = 0;
     ev_svr.data.ptr = &conn->magic_server;
 
-    switch(conn->state) {
-    case S_SERVER_CONNECTING:
-        /* Wait for the server connection to establish. */
-        if (conn->request.dlen < conn->request.capacity)
-            ev_cli.events |= EPOLLIN; /* for detecting client close */
-        ev_svr.events |= EPOLLOUT;
-        break;
-    case S_FORWARDING:
-        if (conn->request.dlen < conn->request.capacity)
-            ev_cli.events |= EPOLLIN;
-        if (conn->response.dlen > 0)
-            ev_cli.events |= EPOLLOUT;
-        if (conn->response.dlen < conn->response.capacity)
-            ev_svr.events |= EPOLLIN;
-        if (conn->request.dlen > 0)
+    if (conn->use_splice) {
+        /* With splice, we don't maintain user buffers; rely on kernel pipe.
+         * Enable both IN and OUT on both ends to guarantee progress. */
+        ev_cli.events |= EPOLLIN | EPOLLOUT;
+        ev_svr.events |= EPOLLIN | EPOLLOUT;
+    } else {
+        switch(conn->state) {
+        case S_SERVER_CONNECTING:
+            /* Wait for the server connection to establish. */
+            if (conn->request.dlen < conn->request.capacity)
+                ev_cli.events |= EPOLLIN; /* for detecting client close */
             ev_svr.events |= EPOLLOUT;
-        break;
-    default:
-        break;
+            break;
+        case S_FORWARDING:
+            if (conn->request.dlen < conn->request.capacity)
+                ev_cli.events |= EPOLLIN;
+            if (conn->response.dlen > 0)
+                ev_cli.events |= EPOLLOUT;
+            if (conn->response.dlen < conn->response.capacity)
+                ev_svr.events |= EPOLLIN;
+            if (conn->request.dlen > 0)
+                ev_svr.events |= EPOLLOUT;
+            break;
+        default:
+            break;
+        }
     }
 
     ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
@@ -368,14 +389,50 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     set_keepalive(conn->svr_sock);
     set_tcp_nodelay(conn->svr_sock);
 
+    /* Allocate per-connection user buffers */
+    conn->request.data = (char *)malloc(TCP_PROXY_USERBUF_CAP);
+    conn->response.data = (char *)malloc(TCP_PROXY_USERBUF_CAP);
+    if (!conn->request.data || !conn->response.data) {
+        P_LOG_ERR("malloc(user buffers) failed");
+        goto err;
+    }
+    conn->request.capacity = TCP_PROXY_USERBUF_CAP;
+    conn->request.dlen = 0;
+    conn->request.rpos = 0;
+    conn->response.capacity = TCP_PROXY_USERBUF_CAP;
+    conn->response.dlen = 0;
+    conn->response.rpos = 0;
+
     if (connect(conn->svr_sock, (struct sockaddr *)&conn->svr_addr,
             sizeof_sockaddr(&conn->svr_addr)) == 0) {
         /* Connected, prepare for data forwarding. */
         conn->state = S_SERVER_CONNECTED;
+        /* Set up splice (Linux) */
+#ifdef __linux__
+        if (!conn->use_splice) {
+            int pfds[2];
+            if (pipe2(pfds, O_NONBLOCK | O_CLOEXEC) == 0) {
+                conn->splice_pipe[0] = pfds[0];
+                conn->splice_pipe[1] = pfds[1];
+                conn->use_splice = true;
+            }
+        }
+#endif
         return conn;
     } else if (errno == EINPROGRESS) {
         /* OK, poll for the connection to complete or fail */
         conn->state = S_SERVER_CONNECTING;
+        /* Prepare splice early (Linux) */
+#ifdef __linux__
+        if (!conn->use_splice) {
+            int pfds[2];
+            if (pipe2(pfds, O_NONBLOCK | O_CLOEXEC) == 0) {
+                conn->splice_pipe[0] = pfds[0];
+                conn->splice_pipe[1] = pfds[1];
+                conn->use_splice = true;
+            }
+        }
+#endif
         return conn;
     } else {
         /* Error occurs, drop the session. */
@@ -421,7 +478,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
 
         for (;;) {
             rc = recv(efd , rxb->data + rxb->dlen,
-                    sizeof(rxb->data) - rxb->dlen, 0);
+                    rxb->capacity - rxb->dlen, 0);
             if (rc == 0) {
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                         s_addr, sizeof(s_addr));
@@ -440,7 +497,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
                 return 0;
             }
             rxb->dlen += rc;
-            if (rxb->dlen >= sizeof(rxb->data))
+            if (rxb->dlen >= rxb->capacity)
                 break; /* buffer full */
         }
         return -EAGAIN;
@@ -627,7 +684,16 @@ static void handle_new_connection(int listen_sock, int epfd, struct config *cfg)
     for (;;) {
         union sockaddr_inx cli_addr;
         socklen_t cli_alen = sizeof(cli_addr);
-        int cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+        int cli_sock;
+#ifdef __linux__
+        cli_sock = accept4(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        if (cli_sock < 0 && (errno == ENOSYS || errno == EINVAL)) {
+            /* Fallback if accept4 not supported */
+            cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+        }
+#else
+        cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+#endif
         if (cli_sock < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* Processed all incoming connections. */
