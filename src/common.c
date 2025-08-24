@@ -3,8 +3,9 @@
 #include <assert.h>
 
 const char *g_pidfile = NULL;
-static bool g_pidfile_created = false;
+static int g_pidfile_fd = -1;
 volatile sig_atomic_t g_terminate = 0;
+bool g_daemonized = false;
 
 void on_signal(int sig)
 {
@@ -14,70 +15,58 @@ void on_signal(int sig)
 
 void cleanup_pidfile(void)
 {
-    if (g_pidfile_created && g_pidfile) {
+    if (g_pidfile_fd >= 0) {
+        close(g_pidfile_fd);
+        g_pidfile_fd = -1;
+    }
+    if (g_pidfile) {
         unlink(g_pidfile);
-        g_pidfile_created = false;
     }
 }
 
 void write_pidfile(const char *filepath)
 {
-    int fd;
     char buf[32];
     ssize_t wlen;
     pid_t pid = getpid();
 
-    /* Try exclusive create to avoid races */
-    fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (fd < 0 && errno == EEXIST) {
-        /* Check if existing PID is stale */
-        int rfd = open(filepath, O_RDONLY);
-        if (rfd >= 0) {
-            char rbuf[64];
-            ssize_t r = read(rfd, rbuf, sizeof(rbuf) - 1);
-            close(rfd);
-            if (r > 0) {
-                char *endp = NULL;
-                long oldpid;
-                rbuf[r] = '\0';
-                errno = 0;
-                oldpid = strtol(rbuf, &endp, 10);
-                if (errno == 0 && endp != rbuf && oldpid > 0) {
-                    if (kill((pid_t)oldpid, 0) == 0) {
-                        fprintf(stderr, "*** pidfile %s exists, process %ld appears running.\n", filepath, oldpid);
-                        exit(1);
-                    }
-                }
-            }
-        }
-        /* Stale or unreadable: try to remove and recreate */
-        if (unlink(filepath) == 0)
-            fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    g_pidfile_fd = open(filepath, O_WRONLY | O_CREAT, 0644);
+    if (g_pidfile_fd < 0) {
+        LOG_ERR("open(%s): %s", filepath, strerror(errno));
+        exit(1);
     }
 
-    if (fd < 0) {
-        fprintf(stderr, "*** open(%s): %s\n", filepath, strerror(errno));
+    if (flock(g_pidfile_fd, LOCK_EX | LOCK_NB) < 0) {
+        if (errno == EWOULDBLOCK) {
+            LOG_ERR("pidfile %s exists and is locked, another instance running?", filepath);
+        } else {
+            LOG_ERR("flock(%s): %s", filepath, strerror(errno));
+        }
+        close(g_pidfile_fd);
+        exit(1);
+    }
+
+    if (ftruncate(g_pidfile_fd, 0) < 0) {
+        LOG_ERR("ftruncate(%s): %s", filepath, strerror(errno));
+        close(g_pidfile_fd);
         exit(1);
     }
 
     int len = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
     if (len < 0 || len >= (int)sizeof(buf)) {
-        close(fd);
-        fprintf(stderr, "*** snprintf(pid) failed.\n");
+        LOG_ERR("snprintf(pid) failed.");
+        close(g_pidfile_fd);
         exit(1);
     }
-    wlen = write(fd, buf, (size_t)len);
+    wlen = write(g_pidfile_fd, buf, (size_t)len);
     if (wlen != len) {
         int saved = errno;
-        close(fd);
-        fprintf(stderr, "*** write(%s): %s\n", filepath, strerror(saved));
+        LOG_ERR("write(%s): %s", filepath, strerror(saved));
+        close(g_pidfile_fd);
         exit(1);
     }
-    (void)fsync(fd);
-    close(fd);
 
     atexit(cleanup_pidfile);
-    g_pidfile_created = true;
 }
 
 int do_daemonize(void)
@@ -85,7 +74,7 @@ int do_daemonize(void)
     int rc;
 
     if ((rc = fork()) < 0) {
-        fprintf(stderr, "*** fork() error: %s.\n", strerror(errno));
+        LOG_ERR("fork() error: %s.", strerror(errno));
         return rc;
     } else if (rc > 0) {
         /* In parent process */
@@ -101,6 +90,7 @@ int do_daemonize(void)
         if (fd > 2)
             close(fd);
         chdir("/tmp");
+        g_daemonized = true;
     }
     return 0;
 }
@@ -123,11 +113,11 @@ void set_nonblock(int sockfd)
 {
     int flags = fcntl(sockfd, F_GETFL, 0);
     if (flags < 0) {
-        syslog(LOG_WARNING, "fcntl(F_GETFL): %s", strerror(errno));
+        LOG_WARN("fcntl(F_GETFL): %s", strerror(errno));
         return;
     }
     if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        syslog(LOG_WARNING, "fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
+        LOG_WARN("fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
     }
 }
 
@@ -181,7 +171,7 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
         if (!end || *(end + 1) != ':' || *(end + 2) == '\0')
             return -EINVAL;
         size_t len = end - (pair + 1);
-        if (len >= sizeof(host))
+        if (len >= sizeof(host) - 1)
             return -EINVAL;
         memcpy(host, pair + 1, len);
         host[len] = '\0';
@@ -190,7 +180,7 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
         port_str = strrchr(pair, ':');
         if (port_str) {
             size_t len = port_str - pair;
-            if (len >= sizeof(host))
+            if (len >= sizeof(host) - 1)
                 return -EINVAL;
             memcpy(host, pair, len);
             host[len] = '\0';
@@ -225,7 +215,7 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 
     int rc = getaddrinfo(host, s_port, &hints, &result);
     if (rc != 0) {
-        syslog(LOG_ERR, "getaddrinfo(%s:%s): %s", host, s_port, gai_strerror(rc));
+        LOG_ERR("getaddrinfo(%s:%s): %s", host, s_port, gai_strerror(rc));
         return -EHOSTUNREACH;
     }
 

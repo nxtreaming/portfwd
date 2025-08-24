@@ -239,7 +239,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
             if (!proxy_conn_evict_one(epfd)) {
                 inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
                           s_addr, sizeof(s_addr));
-                syslog(LOG_WARNING, "Conn table full (%u). Drop %s:%d",
+                LOG_WARN("Conn table full (%u). Drop %s:%d",
                        conn_tbl_len, s_addr, ntohs(*port_of_sockaddr(cli_addr)));
                 goto err;
             }
@@ -249,14 +249,14 @@ static struct proxy_conn *proxy_conn_get_or_create(
     /* ------------------------------------------ */
     /* Establish the server-side connection */
     if ((svr_sock = socket(cfg->dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
-        syslog(LOG_ERR, "*** socket(svr_sock): %s", strerror(errno));
+        LOG_ERR("socket(svr_sock): %s", strerror(errno));
         goto err;
     }
     /* Connect to real server. */
     if (connect(svr_sock, (struct sockaddr *)&cfg->dst_addr,
             sizeof_sockaddr(&cfg->dst_addr)) != 0) {
         /* Error occurs, drop the session. */
-        syslog(LOG_WARNING, "Connection failed: %s", strerror(errno));
+        LOG_WARN("Connection failed: %s", strerror(errno));
         goto err;
     }
     set_nonblock(svr_sock);
@@ -264,7 +264,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
 
     /* Allocate session data for the connection */
     if ((conn = malloc(sizeof(*conn))) == NULL) {
-        syslog(LOG_ERR, "*** malloc(conn): %s", strerror(errno));
+        LOG_ERR("malloc(conn): %s", strerror(errno));
         goto err;
     }
     memset(conn, 0x0, sizeof(*conn));
@@ -275,7 +275,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
     ev.data.ptr = conn;
     ev.events = EPOLLIN;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
-        syslog(LOG_ERR, "epoll_ctl(ADD, svr_sock): %s", strerror(errno));
+        LOG_ERR("epoll_ctl(ADD, svr_sock): %s", strerror(errno));
         goto err;
     }
     /* ------------------------------------------ */
@@ -286,7 +286,7 @@ static struct proxy_conn *proxy_conn_get_or_create(
 
     inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
             s_addr, sizeof(s_addr));
-    syslog(LOG_INFO, "New UDP session for [%s]:%d, total %u",
+    LOG_INFO("New UDP session for [%s]:%d, total %u",
            s_addr, ntohs(*port_of_sockaddr(cli_addr)), conn_tbl_len);
 
     conn->last_active = time(NULL);
@@ -311,7 +311,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
     /* remove from LRU as well */
     list_del(&conn->lru);
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF) {
-        syslog(LOG_DEBUG, "epoll_ctl(DEL, svr_sock): %s", strerror(errno));
+        LOG_WARN("epoll_ctl(DEL, svr_sock): %s", strerror(errno));
     }
     close(conn->svr_sock);
     free(conn);
@@ -330,7 +330,7 @@ static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max
             char s_addr[50] = "";
             release_proxy_conn(oldest, epfd);
             inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
-            syslog(LOG_INFO, "Recycled %s:%d [%u]",
+            LOG_INFO("Recycled %s:%d [%u]",
                    s_addr, ntohs(*port_of_sockaddr(&addr)), conn_tbl_len);
         }
         walked++;
@@ -348,7 +348,7 @@ static bool proxy_conn_evict_one(int epfd)
         char s_addr[50] = "";
         release_proxy_conn(oldest, epfd);
         inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
-        syslog(LOG_WARNING, "Evicted LRU %s:%d [%u]",
+        LOG_WARN("Evicted LRU %s:%d [%u]",
                s_addr, ntohs(*port_of_sockaddr(&addr)), conn_tbl_len);
     }
     return true;
@@ -359,23 +359,23 @@ static bool proxy_conn_evict_one(int epfd)
 static void show_help(int argc, char *argv[])
 {
     (void)argc; /* unused */
-    printf("Userspace UDP proxy.\n");
-    printf("Usage:\n");
-    printf("  %s <local_ip:local_port> <dest_ip:dest_port> [options]\n", argv[0]);
-    printf("Examples:\n");
-    printf("  %s 0.0.0.0:10000 10.0.0.1:20000\n", argv[0]);
-    printf("  %s [::]:10000 [2001:db8::1]:20000\n", argv[0]);
-    printf("Options:\n");
-    printf("  -t <seconds>     proxy session timeout (default: %u)\n", 60);
-    printf("  -d               run in background\n");
-    printf("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)\n");
-    printf("  -r               set SO_REUSEADDR before binding local port\n");
-    printf("  -p <pidfile>     write PID to file\n");
+    LOG_INFO("Userspace UDP proxy.");
+    LOG_INFO("Usage:");
+    LOG_INFO("  %s <local_ip:local_port> <dest_ip:dest_port> [options]", argv[0]);
+    LOG_INFO("Examples:");
+    LOG_INFO("  %s 0.0.0.0:10000 10.0.0.1:20000", argv[0]);
+    LOG_INFO("  %s [::]:10000 [2001:db8::1]:20000", argv[0]);
+    LOG_INFO("Options:");
+    LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)", 60);
+    LOG_INFO("  -d               run in background");
+    LOG_INFO("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)");
+    LOG_INFO("  -r               set SO_REUSEADDR before binding local port");
+    LOG_INFO("  -p <pidfile>     write PID to file");
 }
 
 int main(int argc, char *argv[])
 {
-    int opt, b_true = 1, lsn_sock, epfd, i;
+    int opt, b_true = 1, lsn_sock = -1, epfd = -1, i, rc = 0;
     struct config cfg;
     struct epoll_event ev, events[1024];
     char buffer[1024 * 64], s_addr1[50] = "", s_addr2[50] = "";
@@ -401,8 +401,8 @@ int main(int argc, char *argv[])
             break;
         case 'h':
             show_help(argc, argv);
-            exit(0);
-            break;
+            rc = 0;
+            goto cleanup;
         case 'o':
             cfg.v6only = true;
             break;
@@ -413,35 +413,40 @@ int main(int argc, char *argv[])
             cfg.pidfile = optarg;
             break;
         case '?':
-            exit(1);
+            rc = 1;
+            goto cleanup;
         }
     }
 
     if (optind > argc - 2) {
         show_help(argc, argv);
-        exit(1);
+        rc = 1;
+        goto cleanup;
     }
 
     /* Resolve source address */
     if (get_sockaddr_inx_pair(argv[optind], &cfg.src_addr, true) < 0) {
-        fprintf(stderr, "*** Invalid source address '%s'.\n", argv[optind]);
-        exit(1);
+        LOG_ERR("Invalid source address '%s'.", argv[optind]);
+        rc = 1;
+        goto cleanup;
     }
     optind++;
 
     /* Resolve destination addresse */
     if (get_sockaddr_inx_pair(argv[optind], &cfg.dst_addr, true) < 0) {
-        fprintf(stderr, "*** Invalid destination address '%s'.\n", argv[optind]);
-        exit(1);
+        LOG_ERR("Invalid destination address '%s'.", argv[optind]);
+        rc = 1;
+        goto cleanup;
     }
     optind++;
 
-    openlog("udpfwd", LOG_PERROR|LOG_NDELAY, LOG_USER);
+    openlog("udpfwd", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
     lsn_sock = socket(cfg.src_addr.sa.sa_family, SOCK_DGRAM, 0);
     if (lsn_sock < 0) {
-        fprintf(stderr, "*** socket(): %s.\n", strerror(errno));
-        exit(1);
+        LOG_ERR("socket(): %s.", strerror(errno));
+        rc = 1;
+        goto cleanup;
     }
     if (cfg.reuseaddr)
         setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true, sizeof(b_true));
@@ -449,8 +454,9 @@ int main(int argc, char *argv[])
         setsockopt(lsn_sock, IPPROTO_IPV6, IPV6_V6ONLY, &b_true, sizeof(b_true));
     if (bind(lsn_sock, (struct sockaddr *)&cfg.src_addr,
             sizeof_sockaddr(&cfg.src_addr)) < 0) {
-        fprintf(stderr, "*** bind(): %s.\n", strerror(errno));
-        exit(1);
+        LOG_ERR("bind(): %s.", strerror(errno));
+        rc = 1;
+        goto cleanup;
     }
     set_nonblock(lsn_sock);
     set_sock_buffers(lsn_sock);
@@ -459,14 +465,15 @@ int main(int argc, char *argv[])
             s_addr1, sizeof(s_addr1));
     inet_ntop(cfg.dst_addr.sa.sa_family, addr_of_sockaddr(&cfg.dst_addr),
             s_addr2, sizeof(s_addr2));
-    syslog(LOG_INFO, "Listening on [%s]:%d, proxying to [%s]:%d",
+    LOG_INFO("Listening on [%s]:%d, proxying to [%s]:%d",
             s_addr1, ntohs(*port_of_sockaddr(&cfg.src_addr)),
             s_addr2, ntohs(*port_of_sockaddr(&cfg.dst_addr)));
 
     /* Create epoll table. */
     if ((epfd = epoll_create(2048)) < 0) {
-        syslog(LOG_ERR, "epoll_create(): %s", strerror(errno));
-        exit(1);
+        LOG_ERR("epoll_create(): %s", strerror(errno));
+        rc = 1;
+        goto cleanup;
     }
 
     if (cfg.daemonize)
@@ -492,7 +499,7 @@ int main(int argc, char *argv[])
     c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_addrs));
     c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_bufs));
     if (!c_msgs || !c_iov || !c_addrs || !c_bufs) {
-        syslog(LOG_WARNING, "Failed to allocate UDP batching buffers; proceeding without batching.");
+        LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
         free(c_msgs);
         free(c_iov);
         free(c_addrs);
@@ -516,8 +523,9 @@ int main(int argc, char *argv[])
     ev.data.ptr = NULL;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev) < 0) {
-        syslog(LOG_ERR, "epoll_ctl(ADD, listener): %s", strerror(errno));
-        exit(1);
+        LOG_ERR("epoll_ctl(ADD, listener): %s", strerror(errno));
+        rc = 1;
+        goto cleanup;
     }
 
     for (;;) {
@@ -536,8 +544,9 @@ int main(int argc, char *argv[])
         if (nfds < 0) {
             if (errno == EINTR || errno == ERESTART)
                 continue;
-            syslog(LOG_ERR, "*** epoll_wait(): %s", strerror(errno));
-            exit(1);
+            LOG_ERR("epoll_wait(): %s", strerror(errno));
+            rc = 1;
+            goto cleanup;
         }
 
         if (g_terminate)
@@ -551,7 +560,7 @@ int main(int argc, char *argv[])
             if (evp->data.ptr == NULL) {
                 /* Data from client */
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
-                    syslog(LOG_WARNING, "listener: EPOLLERR/HUP");
+                    LOG_WARN("listener: EPOLLERR/HUP");
                     continue;
                 }
                 union sockaddr_inx cli_addr;
@@ -562,7 +571,7 @@ int main(int argc, char *argv[])
                     if (n < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                             continue;
-                        syslog(LOG_WARNING, "recvmmsg(): %s", strerror(errno));
+                        LOG_WARN("recvmmsg(): %s", strerror(errno));
                         continue;
                     }
                     for (j = 0; j < n; j++) {
@@ -574,7 +583,7 @@ int main(int argc, char *argv[])
                         {
                             ssize_t wr = send(conn->svr_sock, c_bufs[j], len, 0);
                             if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                                syslog(LOG_WARNING, "send(server): %s", strerror(errno));
+                                LOG_WARN("send(server): %s", strerror(errno));
                             }
                         }
                     }
@@ -586,7 +595,7 @@ int main(int argc, char *argv[])
                 if (r < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                         continue; /* transient, try later */
-                    syslog(LOG_WARNING, "recvfrom(): %s", strerror(errno));
+                    LOG_WARN("recvfrom(): %s", strerror(errno));
                     continue; /* drop this datagram and move on */
                 }
                 if (!(conn = proxy_conn_get_or_create(&cfg, &cli_addr, epfd)))
@@ -596,7 +605,7 @@ int main(int argc, char *argv[])
                 {
                     ssize_t wr = send(conn->svr_sock, buffer, r, 0);
                     if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                        syslog(LOG_WARNING, "send(server): %s", strerror(errno));
+                        LOG_WARN("send(server): %s", strerror(errno));
                     }
                 }
             } else {
@@ -612,7 +621,7 @@ int main(int argc, char *argv[])
                     if (r < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
                             break; /* drained */
-                        syslog(LOG_WARNING, "recv(server): %s", strerror(errno));
+                        LOG_WARN("recv(server): %s", strerror(errno));
                         /* fatal error on server socket: close session */
                         release_proxy_conn(conn, epfd);
                         break;
@@ -623,7 +632,7 @@ int main(int argc, char *argv[])
                         ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
                                 sizeof_sockaddr(&conn->cli_addr));
                         if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                            syslog(LOG_WARNING, "sendto(client): %s", strerror(errno));
+                            LOG_WARN("sendto(client): %s", strerror(errno));
                         }
                     }
                     if (r == 0)
@@ -633,8 +642,18 @@ int main(int argc, char *argv[])
         }
     }
 
-    close(lsn_sock);
-    epoll_close_comp(epfd);
+cleanup:
+    if (lsn_sock >= 0)
+        close(lsn_sock);
+    if (epfd >= 0)
+        epoll_close_comp(epfd);
+#ifdef __linux__
+    free(c_msgs);
+    free(c_iov);
+    free(c_addrs);
+    free(c_bufs);
+#endif
+    closelog();
 
-    return 0;
+    return rc;
 }

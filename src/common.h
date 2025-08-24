@@ -29,6 +29,7 @@ union sockaddr_inx {
 
 extern const char *g_pidfile;
 extern volatile sig_atomic_t g_terminate;
+extern bool g_daemonized;
 
 void on_signal(int sig);
 void cleanup_pidfile(void);
@@ -43,5 +44,17 @@ size_t sizeof_sockaddr(const union sockaddr_inx *addr);
 bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b);
 int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp);
 void epoll_close_comp(int epfd);
+
+/* Standardized logging macros */
+#define LOG_MSG(level, fmt, ...) do { \
+    if (g_daemonized) \
+        syslog(level, fmt, ##__VA_ARGS__); \
+    else \
+        fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
+} while(0)
+
+#define LOG_ERR(fmt, ...)   LOG_MSG(LOG_ERR, "ERROR: " fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  LOG_MSG(LOG_WARNING, "WARN: " fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  LOG_MSG(LOG_INFO, fmt, ##__VA_ARGS__)
 
 #endif /* __PORTFWD_COMMON_H__ */
