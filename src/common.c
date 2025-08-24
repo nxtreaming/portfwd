@@ -31,10 +31,17 @@ void write_pidfile(const char *filepath)
     ssize_t wlen;
     pid_t pid = getpid();
 
+    g_pidfile = filepath;
+
     g_pidfile_fd = open(filepath, O_WRONLY | O_CREAT, 0644);
     if (g_pidfile_fd < 0) {
         P_LOG_ERR("open(%s): %s", filepath, strerror(errno));
         exit(1);
+    }
+
+    int flags = fcntl(g_pidfile_fd, F_GETFD, 0);
+    if (flags != -1) {
+        fcntl(g_pidfile_fd, F_SETFD, flags | FD_CLOEXEC);
     }
 
     if (flock(g_pidfile_fd, LOCK_EX | LOCK_NB) < 0) {
