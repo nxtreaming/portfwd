@@ -108,7 +108,7 @@ struct conn_pool {
     struct proxy_conn *connections;
     struct proxy_conn *freelist;
     int capacity;
-    int size;
+    int used_count;
 };
 
 static struct conn_pool g_conn_pool;
@@ -231,6 +231,14 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     ev_svr.data.ptr = &conn->magic_server;
 
     switch(conn->state) {
+        case S_SERVER_CONNECTING:
+            /* Wait for the server connection to establish. */
+            if (conn->request.dlen < sizeof(conn->request.data))
+                ev_cli.events |= EPOLLIN; /* for detecting client close */
+            ev_svr.events |= EPOLLOUT;
+            ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+            ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+            break;
         case S_FORWARDING:
             /* Connection established, data forwarding in progress. */
             if (!conn->cli_in_eof && conn->request.dlen < sizeof(conn->request.data))
@@ -245,13 +253,11 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
             ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
             ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
             break;
-        case S_SERVER_CONNECTING:
-            /* Wait for the server connection to establish. */
-            if (conn->request.dlen < sizeof(conn->request.data))
-                ev_cli.events |= EPOLLIN; /* for detecting client close */
-            ev_svr.events |= EPOLLOUT;
-            ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-            ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+        case S_INITIAL:
+        case S_CONNECTING:
+        case S_SERVER_CONNECTED:
+        case S_CLOSING:
+            /* These states are transitional and don't require specific epoll handling here */
             break;
     }
 
@@ -645,7 +651,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                 continue;
             }
 
-            if (*(int *)ev->data.ptr == EV_MAGIC_LISTENER) { /* Listener socket */
+            if (*(int *)ev->data.ptr == (int)EV_MAGIC_LISTENER) { /* Listener socket */
                 for (;;) {
                     union sockaddr_inx cli_addr;
                     socklen_t cli_alen = sizeof(cli_addr);
@@ -670,10 +676,10 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
             } else { /* Client or server socket */
                 int *magic = (int *)ev->data.ptr;
                 int efd = -1;
-                if (*magic == EV_MAGIC_CLIENT) {
+                if (*magic == (int)EV_MAGIC_CLIENT) {
                     conn = container_of(magic, struct proxy_conn, magic_client);
                     efd = conn->cli_sock;
-                } else if (*magic == EV_MAGIC_SERVER) {
+                } else if (*magic == (int)EV_MAGIC_SERVER) {
                     conn = container_of(magic, struct proxy_conn, magic_server);
                     efd = conn->svr_sock;
                 } else {
