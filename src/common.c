@@ -3,88 +3,94 @@
 #include <assert.h>
 #include <sys/file.h>
 
-const char *g_pidfile = NULL;
-static int g_pidfile_fd = -1;
-volatile sig_atomic_t g_terminate = 0;
-bool g_daemonized = false;
+struct app_state g_state = {
+    .pidfile = NULL,
+    .pidfile_fd = -1,
+    .terminate = 0,
+    .daemonized = false
+};
 
 void on_signal(int sig)
 {
     (void)sig;
-    g_terminate = 1;
+    g_state.terminate = 1;
 }
 
 void cleanup_pidfile(void)
 {
-    if (g_pidfile_fd >= 0) {
-        if (close(g_pidfile_fd) < 0) {
+    if (g_state.pidfile_fd >= 0) {
+        if (close(g_state.pidfile_fd) < 0) {
             P_LOG_WARN("close(pidfile): %s", strerror(errno));
         }
-        g_pidfile_fd = -1;
+        g_state.pidfile_fd = -1;
     }
-    if (g_pidfile) {
-        unlink(g_pidfile);
+    if (g_state.pidfile) {
+        unlink(g_state.pidfile);
     }
 }
 
-void write_pidfile(const char *filepath)
+int write_pidfile(const char *filepath)
 {
     char buf[32];
     ssize_t wlen;
     pid_t pid = getpid();
 
-    g_pidfile = filepath;
+    g_state.pidfile = filepath;
 
-    g_pidfile_fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
-    if (g_pidfile_fd < 0) {
+    g_state.pidfile_fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (g_state.pidfile_fd < 0) {
         if (errno != EEXIST) {
             P_LOG_ERR("open(%s) exclusively: %s", filepath, strerror(errno));
-            exit(1);
+            return -1;
         }
         /* File exists, try to open and lock it */
-        g_pidfile_fd = open(filepath, O_WRONLY, 0644);
-        if (g_pidfile_fd < 0) {
+        g_state.pidfile_fd = open(filepath, O_WRONLY, 0644);
+        if (g_state.pidfile_fd < 0) {
             P_LOG_ERR("open(%s) for locking: %s", filepath, strerror(errno));
-            exit(1);
+            return -1;
         }
     }
 
-    int flags = fcntl(g_pidfile_fd, F_GETFD, 0);
+    int flags = fcntl(g_state.pidfile_fd, F_GETFD, 0);
     if (flags != -1) {
-        fcntl(g_pidfile_fd, F_SETFD, flags | FD_CLOEXEC);
+        fcntl(g_state.pidfile_fd, F_SETFD, flags | FD_CLOEXEC);
     }
 
-    if (flock(g_pidfile_fd, LOCK_EX | LOCK_NB) < 0) {
+    if (flock(g_state.pidfile_fd, LOCK_EX | LOCK_NB) < 0) {
         if (errno == EWOULDBLOCK) {
             P_LOG_ERR("pidfile %s exists and is locked, another instance running?", filepath);
         } else {
             P_LOG_ERR("flock(%s): %s", filepath, strerror(errno));
         }
-        close(g_pidfile_fd);
-        exit(1);
+        close(g_state.pidfile_fd);
+        g_state.pidfile_fd = -1;
+        return -1;
     }
 
-    if (ftruncate(g_pidfile_fd, 0) < 0) {
+    if (ftruncate(g_state.pidfile_fd, 0) < 0) {
         P_LOG_ERR("ftruncate(%s): %s", filepath, strerror(errno));
-        close(g_pidfile_fd);
-        exit(1);
+        close(g_state.pidfile_fd);
+        g_state.pidfile_fd = -1;
+        return -1;
     }
 
     int len = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
     if (len < 0 || len >= (int)sizeof(buf)) {
         P_LOG_ERR("snprintf(pid) failed.");
-        close(g_pidfile_fd);
-        exit(1);
+        close(g_state.pidfile_fd);
+        g_state.pidfile_fd = -1;
+        return -1;
     }
-    wlen = write(g_pidfile_fd, buf, (size_t)len);
+    wlen = write(g_state.pidfile_fd, buf, (size_t)len);
     if (wlen != len) {
-        int saved = errno;
-        P_LOG_ERR("write(%s): %s", filepath, strerror(saved));
-        close(g_pidfile_fd);
-        exit(1);
+        P_LOG_ERR("write(%s): %s", filepath, strerror(errno));
+        close(g_state.pidfile_fd);
+        g_state.pidfile_fd = -1;
+        return -1;
     }
 
     atexit(cleanup_pidfile);
+    return 0;
 }
 
 int do_daemonize(void)
@@ -111,7 +117,7 @@ int do_daemonize(void)
             }
         }
         chdir("/");
-        g_daemonized = true;
+        g_state.daemonized = true;
     }
     return 0;
 }
@@ -136,23 +142,22 @@ void set_nonblock(int sockfd)
 
     /* Set O_NONBLOCK */
     flags = fcntl(sockfd, F_GETFL, 0);
-    if (flags < 0) {
-        P_LOG_WARN("fcntl(F_GETFL): %s", strerror(errno));
-        /* continue and try to set CLOEXEC anyway */
-    } else {
+    if (flags >= 0) {
         if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-            P_LOG_WARN("fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
+            P_LOG_WARN("fcntl(F_SETFL, O_NONBLOCK): %s", strerror(errno));
         }
+    } else {
+        P_LOG_WARN("fcntl(F_GETFL): %s", strerror(errno));
     }
 
     /* Set FD_CLOEXEC */
     flags = fcntl(sockfd, F_GETFD, 0);
-    if (flags < 0) {
+    if (flags >= 0) {
+        if (fcntl(sockfd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+            P_LOG_WARN("fcntl(F_SETFD, FD_CLOEXEC): %s", strerror(errno));
+        }
+    } else {
         P_LOG_WARN("fcntl(F_GETFD): %s", strerror(errno));
-        return;
-    }
-    if (fcntl(sockfd, F_SETFD, flags | FD_CLOEXEC) < 0) {
-        P_LOG_WARN("fcntl(F_SETFD,FD_CLOEXEC): %s", strerror(errno));
     }
 }
 
@@ -204,35 +209,25 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
     strncpy(s_addr, pair, sizeof(s_addr) - 1);
     s_addr[sizeof(s_addr) - 1] = '\0';
 
-    if (s_addr[0] == '[') {
-        /* IPv6 address literal */
+    char *last_colon = strrchr(s_addr, ':');
+    char *bracket = strchr(s_addr, ']');
+
+    if (s_addr[0] == '[' && bracket != NULL && bracket < last_colon) {
+        /* IPv6 format: [host]:port */
         host = s_addr + 1;
-        port = strchr(host, ']');
-        if (!port) {
-            return -EINVAL; /* Unmatched '[' */
-        }
-        *port = '\0'; /* Terminate host */
-        port++; /* Move to char after ']' */
-        if (*port != ':' && *port != '\0') {
-            return -EINVAL; /* Must be ':' or end of string */
-        }
-        if (*port == ':') {
-            port++;
+        *bracket = '\0';
+        port = last_colon + 1;
+    } else if (last_colon != NULL && (bracket == NULL || last_colon > bracket)) {
+        /* IPv4 or hostname format: host:port */
+        host = s_addr;
+        *last_colon = '\0';
+        port = last_colon + 1;
+        if (host == port - 1) { /* Bare port format: :port */
+            host = NULL;
         }
     } else {
-        /* IPv4, hostname, or bare port */
-        port = strrchr(s_addr, ':');
-        if (port) {
-            host = s_addr;
-            *port = '\0';
-            port++;
-            if (host == port -1) { /* Bare port, e.g. ":8080" */
-                host = NULL;
-            }
-        }
-    }
-
-    if (!port) {
+        /* No port found, treat the whole string as a port */
+        host = NULL;
         port = s_addr;
     }
 

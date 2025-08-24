@@ -24,9 +24,6 @@
 #include <linux/netfilter_ipv4.h>
 #endif
 
-#include <syslog.h>
-#include <stddef.h>
-
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 /* Tunables for throughput */
@@ -177,10 +174,10 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
 {
     int i;
 
-    /**
-     * Clear possible fd events that might belong to current
-     *  connection. The event must be cleared or an invalid
-     *  pointer might be accessed.
+    /*
+     * Clear any pending epoll events for this connection's file descriptors.
+     * This prevents use-after-free bugs where the event loop might process
+     * an event for a connection that has already been released.
      */
     for (i = 0; i < *nfds; i++) {
         struct epoll_event *ev = &events[i];
@@ -230,10 +227,11 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
 }
 
 /**
- * Close both sockets of the connection and remove it
- *  from the current ready list.
- *  'conn'. Different conn->state and buffer status will
- *  affect the polling behaviors.
+ * @brief Updates epoll event registrations for a connection based on its state.
+ *
+ * Sets EPOLLIN/EPOLLOUT flags for client and server sockets according to the
+ * current state (e.g., connecting, forwarding) and buffer status to ensure
+ * correct I/O notifications.
  */
 static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
 {
@@ -251,42 +249,26 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
         if (conn->request.dlen < sizeof(conn->request.data))
             ev_cli.events |= EPOLLIN; /* for detecting client close */
         ev_svr.events |= EPOLLOUT;
-        ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-        ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
         break;
     case S_FORWARDING:
-        /* Connection established, data forwarding in progress. */
-        if (!conn->cli_in_eof && conn->request.dlen < sizeof(conn->request.data))
+        if (conn->cli_buf.len < conn->cli_buf.cap)
             ev_cli.events |= EPOLLIN;
-        if (!conn->svr_in_eof && conn->response.dlen < sizeof(conn->response.data))
-            ev_svr.events |= EPOLLIN;
-        if (conn->request.rpos < conn->request.dlen)
-            ev_svr.events |= EPOLLOUT;
-        if (conn->response.rpos < conn->response.dlen)
+        if (conn->svr_buf.len > 0)
             ev_cli.events |= EPOLLOUT;
-        /* Edge-triggered for data sockets */
-        ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
-        ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+        if (conn->svr_buf.len < conn->svr_buf.cap)
+            ev_svr.events |= EPOLLIN;
+        if (conn->cli_buf.len > 0)
+            ev_svr.events |= EPOLLOUT;
         break;
-    case S_INITIAL:
-    case S_CONNECTING:
-    case S_SERVER_CONNECTED:
-    case S_CLOSING:
-        /* These states are transitional and don't require specific epoll handling here */
+    default:
         break;
     }
 
-    /* Reset epoll status */
-    if (ep_add_or_mod(epfd, conn->cli_sock, &ev_cli) < 0) {
-        P_LOG_WARN("epoll_ctl(MOD/ADD, cli): %s", strerror(errno));
-        conn->state = S_CLOSING;
-        return;
-    }
-    if (ep_add_or_mod(epfd, conn->svr_sock, &ev_svr) < 0) {
-        P_LOG_WARN("epoll_ctl(MOD/ADD, svr): %s", strerror(errno));
-        conn->state = S_CLOSING;
-        return;
-    }
+    ev_cli.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+    ev_svr.events |= EPOLLRDHUP | EPOLLHUP | EPOLLERR | EPOLLET;
+
+    ep_add_or_mod(epfd, conn->cli_sock, &ev_cli);
+    ep_add_or_mod(epfd, conn->svr_sock, &ev_svr);
 }
 
 static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, const union sockaddr_inx *cli_addr)
@@ -404,10 +386,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     }
 
 err:
-    /**
-     * 'conn' has only been used among this function,
-     * so don't need the caller to release anything
-     */
+    /* On error, the connection is released here. The caller doesn't need to do anything. */
     if (conn)
         release_proxy_conn(conn, NULL, 0, -1);
     return NULL;
@@ -568,69 +547,52 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     }
 #endif
 
-    /* Userspace copy fallback for non-Linux or if pipe() failed */
-    struct buffer_info *src_buf, *dst_buf;
-    int src_sock, dst_sock, rc;
-
-    if (ev->data.ptr == &conn->magic_client) { /* client -> server */
-        src_sock = conn->cli_sock;
-        dst_sock = conn->svr_sock;
-        src_buf = &conn->request;
-        dst_buf = &conn->response;
-    } else { /* server -> client */
-        src_sock = conn->svr_sock;
-        dst_sock = conn->cli_sock;
-        src_buf = &conn->response;
-        dst_buf = &conn->request;
-    }
 
     if (ev->events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
         goto err;
     }
 
     if (ev->events & EPOLLIN) {
-        if ((dst_buf->dlen - dst_buf->rpos) < TCP_PROXY_BACKPRESSURE_WM) {
+        int can_read = (ev->data.ptr == &conn->magic_client) ? 
+                       (conn->svr_buf.dlen - conn->svr_buf.rpos < TCP_PROXY_BACKPRESSURE_WM) :
+                       (conn->cli_buf.dlen - conn->cli_buf.rpos < TCP_PROXY_BACKPRESSURE_WM);
+
+        if (can_read) {
+            struct buffer *read_buf = (ev->data.ptr == &conn->magic_client) ? &conn->cli_buf : &conn->svr_buf;
+            int read_sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
+            ssize_t rc;
+
             for (;;) {
-                rc = recv(src_sock, src_buf->data + src_buf->dlen, sizeof(src_buf->data) - src_buf->dlen, 0);
+                rc = recv(read_sock, read_buf->data + read_buf->dlen, read_buf->cap - read_buf->dlen, 0);
                 if (rc == 0) {
-                    if (src_sock == conn->cli_sock) conn->cli_in_eof = true;
+                    if (read_sock == conn->cli_sock) conn->cli_in_eof = true;
                     else conn->svr_in_eof = true;
-                    break;
+                    break; 
                 }
                 if (rc < 0) {
                     if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                     goto err;
                 }
-                src_buf->dlen += rc;
-                if (src_buf->dlen >= sizeof(src_buf->data)) break;
+                read_buf->dlen += rc;
+                if (read_buf->dlen >= read_buf->cap) break;
             }
-        }
-    }
-
-    if (src_buf->dlen > src_buf->rpos) {
-        rc = send(dst_sock, src_buf->data + src_buf->rpos, src_buf->dlen - src_buf->rpos, 0);
-        if (rc > 0) {
-            src_buf->rpos += rc;
-        }
-        else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-            goto err;
-        }
-        if (src_buf->rpos >= src_buf->dlen) {
-            src_buf->rpos = src_buf->dlen = 0;
         }
     }
 
     if (ev->events & EPOLLOUT) {
-        if (dst_buf->dlen > dst_buf->rpos) {
-            rc = send(src_sock, dst_buf->data + dst_buf->rpos, dst_buf->dlen - dst_buf->rpos, 0);
+        struct buffer *write_buf = (ev->data.ptr == &conn->magic_client) ? &conn->svr_buf : &conn->cli_buf;
+        int write_sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
+        ssize_t rc;
+
+        if (write_buf->dlen > write_buf->rpos) {
+            rc = send(write_sock, write_buf->data + write_buf->rpos, write_buf->dlen - write_buf->rpos, 0);
             if (rc > 0) {
-                dst_buf->rpos += rc;
-            }
-            else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                write_buf->rpos += rc;
+            } else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 goto err;
             }
-            if (dst_buf->rpos >= dst_buf->dlen) {
-                dst_buf->rpos = dst_buf->dlen = 0;
+            if (write_buf->rpos >= write_buf->dlen) {
+                write_buf->rpos = write_buf->dlen = 0;
             }
         }
     }
@@ -660,11 +622,35 @@ err:
     return 0;
 }
 
+static void handle_new_connection(int listen_sock, int epfd, struct config *cfg)
+{
+    for (;;) {
+        union sockaddr_inx cli_addr;
+        socklen_t cli_alen = sizeof(cli_addr);
+        int cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+        if (cli_sock < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Processed all incoming connections. */
+                break;
+            }
+            P_LOG_ERR("accept(): %s", strerror(errno));
+            break;
+        }
+
+        struct proxy_conn *conn = create_proxy_conn(cfg, cli_sock, &cli_addr);
+        if (conn) {
+            set_conn_epoll_fds(conn, epfd);
+        } else {
+            close(cli_sock);
+        }
+    }
+}
+
 static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
 {
     struct epoll_event events[512];
 
-    while (!g_terminate) {
+    while (!g_state.terminate) {
         int nfds = epoll_wait(epfd, events, countof(events), 1000);
         if (nfds < 0) {
             if (errno == EINTR)
@@ -684,26 +670,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
             }
 
             if (*(int *)ev->data.ptr == (int)EV_MAGIC_LISTENER) { /* Listener socket */
-                for (;;) {
-                    union sockaddr_inx cli_addr;
-                    socklen_t cli_alen = sizeof(cli_addr);
-                    int cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
-                    if (cli_sock < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            /* Processed all incoming connections. */
-                            break;
-                        }
-                        P_LOG_ERR("accept(): %s", strerror(errno));
-                        break;
-                    }
-
-                    struct proxy_conn *conn = create_proxy_conn(cfg, cli_sock, &cli_addr);
-                    if (conn) {
-                        set_conn_epoll_fds(conn, epfd);
-                    } else {
-                        close(cli_sock);
-                    }
-                }
+                handle_new_connection(listen_sock, epfd, cfg);
                 continue;
             } else { /* Client or server socket */
                 int *magic = (int *)ev->data.ptr;
@@ -769,43 +736,45 @@ int main(int argc, char *argv[])
 
     memset(&cfg, 0, sizeof(cfg));
 
-    for (i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-d") == 0 || strcmp(argv[i], "--daemonize") == 0) {
+    int opt;
+    while ((opt = getopt(argc, argv, "dp:br6h")) != -1) {
+        switch (opt) {
+        case 'd':
             cfg.daemonize = true;
-        } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--pidfile") == 0) {
-            if (i + 1 >= argc) {
-                P_LOG_ERR("-p/--pidfile requires an argument.");
-                return 1;
-            }
-            cfg.pidfile = argv[++i];
-        } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--base-addr-mode") == 0) {
+            break;
+        case 'p':
+            cfg.pidfile = optarg;
+            break;
+        case 'b':
             cfg.base_addr_mode = true;
-        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--reuse-addr") == 0) {
+            break;
+        case 'r':
             cfg.reuse_addr = true;
-        } else if (strcmp(argv[i], "-6") == 0 || strcmp(argv[i], "--v6only") == 0) {
+            break;
+        case '6':
             cfg.v6only = true;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+            break;
+        case 'h':
             show_help(argv[0]);
             return 0;
-        } else if (argv[i][0] == '-') {
-            P_LOG_ERR("Unknown option: %s", argv[i]);
+        case '?':
             return 1;
-        } else {
+        default:
             break;
         }
     }
 
-    if (i + 2 != argc) {
+    if (optind + 2 != argc) {
         show_help(argv[0]);
         return 1;
     }
 
-    if (get_sockaddr_inx_pair(argv[i], &cfg.src_addr, false) != 0) {
-        P_LOG_ERR("Invalid src_addr: %s", argv[i]);
+    if (get_sockaddr_inx_pair(argv[optind], &cfg.src_addr, false) != 0) {
+        P_LOG_ERR("Invalid src_addr: %s", argv[optind]);
         return 1;
     }
-    if (get_sockaddr_inx_pair(argv[i + 1], &cfg.dst_addr, false) != 0) {
-        P_LOG_ERR("Invalid dst_addr: %s", argv[i + 1]);
+    if (get_sockaddr_inx_pair(argv[optind + 1], &cfg.dst_addr, false) != 0) {
+        P_LOG_ERR("Invalid dst_addr: %s", argv[optind + 1]);
         return 1;
     }
 
@@ -820,8 +789,10 @@ int main(int argc, char *argv[])
         goto cleanup;
 
     if (cfg.pidfile) {
-        g_pidfile = cfg.pidfile;
-        write_pidfile(g_pidfile);
+        if (write_pidfile(cfg.pidfile) < 0) {
+            rc = 1;
+            goto cleanup;
+        }
     }
 
     setup_signal_handlers();
@@ -882,9 +853,6 @@ cleanup:
         epoll_close_comp(epfd);
     }
     destroy_conn_pool();
-    if (cfg.pidfile) {
-        unlink(cfg.pidfile);
-    }
     closelog();
 
     return rc;

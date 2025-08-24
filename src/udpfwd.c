@@ -20,8 +20,6 @@
 #include <time.h>
 #include <stdbool.h>
 
-#include "common.h"
-
 #ifdef __linux__
     #include <sys/epoll.h>
     #include <sys/uio.h>
@@ -31,6 +29,7 @@
 #endif
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define MAX_EVENTS 1024
 
 /* Tunables */
 #ifndef UDP_PROXY_SOCKBUF_CAP
@@ -83,11 +82,31 @@ static LIST_HEAD(g_lru_list);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-/* Forward declarations */
 static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max, int epfd);
 static bool proxy_conn_evict_one(int epfd);
 static struct proxy_conn *alloc_proxy_conn(void);
 static void release_proxy_conn_to_pool(struct proxy_conn *conn);
+
+static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
+#ifdef __linux__
+static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd,
+                             struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
+                             struct iovec *s_iovs, char (*c_bufs)[UDP_PROXY_DGRAM_CAP]);
+#else
+static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd);
+#endif
+
+#ifdef __linux__
+static void init_batching_resources(
+    struct mmsghdr **c_msgs, struct iovec **c_iov,
+    struct sockaddr_storage **c_addrs, char (**c_bufs)[UDP_PROXY_DGRAM_CAP],
+    struct mmsghdr **s_msgs, struct iovec **s_iovs);
+
+static void destroy_batching_resources(
+    struct mmsghdr *c_msgs, struct iovec *c_iov,
+    struct sockaddr_storage *c_addrs, char (*c_bufs)[UDP_PROXY_DGRAM_CAP],
+    struct mmsghdr *s_msgs, struct iovec *s_iovs);
+#endif
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -182,18 +201,23 @@ static struct proxy_conn *proxy_conn_get_or_create(
         }
     }
 
-    /* Enforce connection cap before creating a new one */
+    /* Enforce connection capacity */
     if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
-        /* First, aggressively recycle timeouts */
+        /* First, try to recycle any timed-out connections */
         proxy_conn_walk_continue(cfg, conn_tbl_len, epfd);
+
+        /* If still full, try to evict the oldest connection */
         if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
-            if (!proxy_conn_evict_one(epfd)) {
-                inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
-                          s_addr, sizeof(s_addr));
-                P_LOG_WARN("Conn table full (%u). Drop %s:%d",
+            proxy_conn_evict_one(epfd);
+        }
+
+        /* If still full after all attempts, drop the new connection */
+        if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
+            inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
+                      s_addr, sizeof(s_addr));
+            P_LOG_WARN("Conn table full (%u), dropping %s:%d",
                        conn_tbl_len, s_addr, ntohs(*port_of_sockaddr(cli_addr)));
-                goto err;
-            }
+            goto err;
         }
     }
 
@@ -255,8 +279,11 @@ err:
 }
 
 /**
- * Close both sockets of the connection and remove it
- * from the current ready list.
+ * @brief Releases a proxy connection.
+ *
+ * This function removes the connection from the hash table and LRU list,
+ * deregisters its socket from epoll, closes the server-side socket, and
+ * returns the connection object to the memory pool.
  */
 static void release_proxy_conn(struct proxy_conn *conn, int epfd)
 {
@@ -277,6 +304,10 @@ static void proxy_conn_walk_continue(const struct config *cfg, unsigned walk_max
 {
     unsigned walked = 0;
     time_t now = time(NULL);
+
+    if (list_empty(&g_lru_list))
+        return;
+
     while (walked < walk_max && !list_empty(&g_lru_list)) {
         struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
         if ((unsigned)(now - oldest->last_active) <= cfg->proxy_conn_timeo)
@@ -332,15 +363,189 @@ static bool proxy_conn_evict_one(int epfd)
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static void show_help(int argc, char *argv[])
+#ifdef __linux__
+static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd,
+                             struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
+                             struct iovec *s_iovs, char (*c_bufs)[UDP_PROXY_DGRAM_CAP])
+#else
+static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
+#endif
 {
-    (void)argc; /* unused */
+    struct proxy_conn *conn;
+
+#ifdef __linux__
+    if (c_msgs && s_msgs) {
+        int n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
+        if (n <= 0) {
+            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                P_LOG_WARN("recvmmsg(): %s", strerror(errno));
+            return;
+        }
+
+        struct send_batch {
+            int sock;
+            int msg_indices[UDP_PROXY_BATCH_SZ];
+            int count;
+        } batches[UDP_PROXY_BATCH_SZ];
+        int num_batches = 0;
+
+        for (int i = 0; i < n; i++) {
+            union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
+            if (!(conn = proxy_conn_get_or_create(cfg, sa, epfd)))
+                continue;
+            touch_proxy_conn(conn);
+
+            int batch_idx = -1;
+            for (int k = 0; k < num_batches; k++) {
+                if (batches[k].sock == conn->svr_sock) {
+                    batch_idx = k;
+                    break;
+                }
+            }
+            if (batch_idx == -1) {
+                batch_idx = num_batches++;
+                batches[batch_idx].sock = conn->svr_sock;
+                batches[batch_idx].count = 0;
+            }
+            batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+        }
+
+        for (int i = 0; i < num_batches; i++) {
+            struct send_batch *b = &batches[i];
+            for (int k = 0; k < b->count; k++) {
+                int msg_idx = b->msg_indices[k];
+                s_iovs[k].iov_base = c_bufs[msg_idx];
+                s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
+                /* s_msgs already configured in init loop */
+            }
+
+            int sent = sendmmsg(b->sock, s_msgs, b->count, 0);
+            if (sent < 0) {
+                P_LOG_WARN("sendmmsg(server): %s", strerror(errno));
+            } else if (sent != b->count) {
+                P_LOG_WARN("sendmmsg(server): partial send, sent %d of %d", sent, b->count);
+            }
+        }
+        return;
+    }
+#endif
+
+    char buffer[UDP_PROXY_DGRAM_CAP];
+    union sockaddr_inx cli_addr;
+    socklen_t cli_alen = sizeof(cli_addr);
+
+    int r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0,
+                   (struct sockaddr *)&cli_addr, &cli_alen);
+    if (r < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+            P_LOG_WARN("recvfrom(): %s", strerror(errno));
+        return; /* drop this datagram and move on */
+    }
+
+    if (!(conn = proxy_conn_get_or_create(cfg, &cli_addr, epfd)))
+        return;
+
+    /* refresh activity */
+    touch_proxy_conn(conn);
+
+    ssize_t wr = send(conn->svr_sock, buffer, r, 0);
+    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        P_LOG_WARN("send(server): %s", strerror(errno));
+    }
+}
+
+static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd)
+{
+    char buffer[UDP_PROXY_DGRAM_CAP];
+    int r;
+
+    for (;;) {
+        r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
+        if (r < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                break; /* drained */
+            P_LOG_WARN("recv(server): %s", strerror(errno));
+            /* fatal error on server socket: close session */
+            release_proxy_conn(conn, epfd);
+            break;
+        }
+
+        /* r >= 0: forward even zero-length datagrams */
+        touch_proxy_conn(conn);
+
+        ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
+                            sizeof_sockaddr(&conn->cli_addr));
+        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+            P_LOG_WARN("sendto(client): %s", strerror(errno));
+        }
+
+        if (r < (int)sizeof(buffer)) {
+            break; /* Drained */
+        }
+    }
+}
+
+#ifdef __linux__
+static void init_batching_resources(
+    struct mmsghdr **c_msgs, struct iovec **c_iov,
+    struct sockaddr_storage **c_addrs, char (**c_bufs)[UDP_PROXY_DGRAM_CAP],
+    struct mmsghdr **s_msgs, struct iovec **s_iovs)
+{
+    *c_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_msgs));
+    *c_iov = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_iov));
+    *c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_addrs));
+    *c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_bufs));
+    *s_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**s_msgs));
+    *s_iovs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**s_iovs));
+
+    if (!*c_msgs || !*c_iov || !*c_addrs || !*c_bufs || !*s_msgs || !*s_iovs) {
+        P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
+        free(*c_msgs);   *c_msgs = NULL;
+        free(*c_iov);    *c_iov = NULL;
+        free(*c_addrs);  *c_addrs = NULL;
+        free(*c_bufs);   *c_bufs = NULL;
+        free(*s_msgs);   *s_msgs = NULL;
+        free(*s_iovs);   *s_iovs = NULL;
+        return;
+    }
+
+    for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+        (*c_iov)[i].iov_base = (*c_bufs)[i];
+        (*c_iov)[i].iov_len = UDP_PROXY_DGRAM_CAP;
+        (*c_msgs)[i].msg_hdr.msg_iov = &(*c_iov)[i];
+        (*c_msgs)[i].msg_hdr.msg_iovlen = 1;
+        (*c_msgs)[i].msg_hdr.msg_name = &(*c_addrs)[i];
+        (*c_msgs)[i].msg_hdr.msg_namelen = sizeof((*c_addrs)[i]);
+
+        (*s_msgs)[i].msg_hdr.msg_iov = &(*s_iovs)[i];
+        (*s_msgs)[i].msg_hdr.msg_iovlen = 1;
+    }
+}
+
+static void destroy_batching_resources(
+    struct mmsghdr *c_msgs, struct iovec *c_iov,
+    struct sockaddr_storage *c_addrs, char (*c_bufs)[UDP_PROXY_DGRAM_CAP],
+    struct mmsghdr *s_msgs, struct iovec *s_iovs)
+{
+    free(c_msgs);
+    free(c_iov);
+    free(c_addrs);
+    free(c_bufs);
+    free(s_msgs);
+    free(s_iovs);
+}
+#endif
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+static void show_help(const char *prog)
+{
     P_LOG_INFO("Userspace UDP proxy.");
     P_LOG_INFO("Usage:");
-    P_LOG_INFO("  %s <local_ip:local_port> <dest_ip:dest_port> [options]", argv[0]);
+    P_LOG_INFO("  %s <local_ip:local_port> <dest_ip:dest_port> [options]", prog);
     P_LOG_INFO("Examples:");
-    P_LOG_INFO("  %s 0.0.0.0:10000 10.0.0.1:20000", argv[0]);
-    P_LOG_INFO("  %s [::]:10000 [2001:db8::1]:20000", argv[0]);
+        P_LOG_INFO("  %s 0.0.0.0:10000 10.0.0.1:20000", prog);
+    P_LOG_INFO("  %s [::]:10000 [2001:db8::1]:20000", prog);
     P_LOG_INFO("Options:");
     P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)", 60);
     P_LOG_INFO("  -d               run in background");
@@ -354,8 +559,8 @@ int main(int argc, char *argv[])
 {
     int opt, b_true = 1, lsn_sock = -1, epfd = -1, i, rc = 0;
     struct config cfg;
-    struct epoll_event ev, events[1024];
-    char buffer[1024 * 64], s_addr1[50] = "", s_addr2[50] = "";
+        struct epoll_event ev, events[MAX_EVENTS];
+    char buffer[UDP_PROXY_DGRAM_CAP], s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
 
     memset(&cfg, 0, sizeof(cfg));
@@ -382,7 +587,7 @@ int main(int argc, char *argv[])
             cfg.daemonize = true;
             break;
         case 'h':
-            show_help(argc, argv);
+            show_help(argv[0]);
             rc = 0;
             goto cleanup;
         case 'o':
@@ -406,7 +611,7 @@ int main(int argc, char *argv[])
     }
 
     if (optind > argc - 2) {
-        show_help(argc, argv);
+        show_help(argv[0]);
         rc = 1;
         goto cleanup;
     }
@@ -468,11 +673,15 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
 
-    if (cfg.daemonize)
-        do_daemonize();
+    if (cfg.daemonize && do_daemonize() != 0) {
+        rc = 1;
+        goto cleanup;
+    }
     if (cfg.pidfile) {
-        g_pidfile = cfg.pidfile;
-        write_pidfile(cfg.pidfile);
+        if (write_pidfile(cfg.pidfile) < 0) {
+            rc = 1;
+            goto cleanup;
+        }
     }
 
     setup_signal_handlers();
@@ -493,34 +702,7 @@ int main(int argc, char *argv[])
 
     /* Optional Linux batching init */
 #ifdef __linux__
-    c_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_msgs));
-    c_iov = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_iov));
-    c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_addrs));
-    c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_bufs));
-    s_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*s_msgs));
-    s_iovs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*s_iovs));
-
-    if (!c_msgs || !c_iov || !c_addrs || !c_bufs || !s_msgs || !s_iovs) {
-        P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
-        free(c_msgs);   c_msgs = NULL;
-        free(c_iov);    c_iov = NULL;
-        free(c_addrs);  c_addrs = NULL;
-        free(c_bufs);   c_bufs = NULL;
-        free(s_msgs);   s_msgs = NULL;
-        free(s_iovs);   s_iovs = NULL;
-    } else {
-        for (i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
-            c_iov[i].iov_base = c_bufs[i];
-            c_iov[i].iov_len = UDP_PROXY_DGRAM_CAP;
-            c_msgs[i].msg_hdr.msg_iov = &c_iov[i];
-            c_msgs[i].msg_hdr.msg_iovlen = 1;
-            c_msgs[i].msg_hdr.msg_name = &c_addrs[i];
-            c_msgs[i].msg_hdr.msg_namelen = sizeof(c_addrs[i]);
-
-            s_msgs[i].msg_hdr.msg_iov = &s_iovs[i];
-            s_msgs[i].msg_hdr.msg_iovlen = 1;
-        }
-    }
+    init_batching_resources(&c_msgs, &c_iov, &c_addrs, &c_bufs, &s_msgs, &s_iovs);
 #endif
 
     /* epoll loop */
@@ -553,7 +735,7 @@ int main(int argc, char *argv[])
             goto cleanup;
         }
 
-        if (g_terminate)
+        if (g_state.terminate)
             break;
 
         for (i = 0; i < nfds; i++) {
@@ -567,82 +749,11 @@ int main(int argc, char *argv[])
                     P_LOG_WARN("listener: EPOLLERR/HUP");
                     continue;
                 }
-                union sockaddr_inx cli_addr;
-                socklen_t cli_alen = sizeof(cli_addr);
 #ifdef __linux__
-                if (c_msgs && s_msgs) {
-                    int n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
-                    if (n <= 0) {
-                        if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-                            P_LOG_WARN("recvmmsg(): %s", strerror(errno));
-                        continue;
-                    }
-
-                    struct send_batch {
-                        int sock;
-                        int msg_indices[UDP_PROXY_BATCH_SZ];
-                        int count;
-                    } batches[UDP_PROXY_BATCH_SZ];
-                    int num_batches = 0;
-
-                    for (int i = 0; i < n; i++) {
-                        union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
-                        if (!(conn = proxy_conn_get_or_create(&cfg, sa, epfd)))
-                            continue;
-                        touch_proxy_conn(conn);
-
-                        int batch_idx = -1;
-                        for (int k = 0; k < num_batches; k++) {
-                            if (batches[k].sock == conn->svr_sock) {
-                                batch_idx = k;
-                                break;
-                            }
-                        }
-                        if (batch_idx == -1) {
-                            batch_idx = num_batches++;
-                            batches[batch_idx].sock = conn->svr_sock;
-                            batches[batch_idx].count = 0;
-                        }
-                        batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
-                    }
-
-                    for (int i = 0; i < num_batches; i++) {
-                        struct send_batch *b = &batches[i];
-                        for (int k = 0; k < b->count; k++) {
-                            int msg_idx = b->msg_indices[k];
-                            s_iovs[k].iov_base = c_bufs[msg_idx];
-                            s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
-                            /* s_msgs already configured in init loop */
-                        }
-
-                        int sent = sendmmsg(b->sock, s_msgs, b->count, 0);
-                        if (sent < 0) {
-                            P_LOG_WARN("sendmmsg(server): %s", strerror(errno));
-                        } else if (sent != b->count) {
-                            P_LOG_WARN("sendmmsg(server): partial send, sent %d of %d", sent, b->count);
-                        }
-                    }
-                    continue;
-                }
+                handle_client_data(&cfg, lsn_sock, epfd, c_msgs, s_msgs, s_iovs, c_bufs);
+#else
+                handle_client_data(&cfg, lsn_sock, epfd);
 #endif
-                r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0,
-                        (struct sockaddr *)&cli_addr, &cli_alen);
-                if (r < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                        continue; /* transient, try later */
-                    P_LOG_WARN("recvfrom(): %s", strerror(errno));
-                    continue; /* drop this datagram and move on */
-                }
-                if (!(conn = proxy_conn_get_or_create(&cfg, &cli_addr, epfd)))
-                    continue;
-                /* refresh activity */
-                touch_proxy_conn(conn);
-                {
-                    ssize_t wr = send(conn->svr_sock, buffer, r, 0);
-                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                        P_LOG_WARN("send(server): %s", strerror(errno));
-                    }
-                }
             } else {
                 /* Data from server */
                 conn = (struct proxy_conn *)evp->data.ptr;
@@ -651,28 +762,7 @@ int main(int argc, char *argv[])
                     release_proxy_conn(conn, epfd);
                     continue;
                 }
-                for (;;) {
-                    r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
-                    if (r < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
-                            break; /* drained */
-                        P_LOG_WARN("recv(server): %s", strerror(errno));
-                        /* fatal error on server socket: close session */
-                        release_proxy_conn(conn, epfd);
-                        break;
-                    }
-                    /* r >= 0: forward even zero-length datagrams */
-                    touch_proxy_conn(conn);
-                    {
-                        ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
-                                sizeof_sockaddr(&conn->cli_addr));
-                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                            P_LOG_WARN("sendto(client): %s", strerror(errno));
-                        }
-                    }
-                    if (r == 0)
-                        break;
-                }
+                handle_server_data(conn, lsn_sock, epfd);
             }
         }
     }
@@ -683,17 +773,11 @@ cleanup:
             P_LOG_WARN("close(lsn_sock=%d): %s", lsn_sock, strerror(errno));
         }
     }
-    if (epfd >= 0)
-        epoll_close_comp(epfd);
+    epoll_close_comp(epfd);
     free(conn_tbl_hbase);
     destroy_conn_pool();
 #ifdef __linux__
-    free(c_msgs);
-    free(c_iov);
-    free(c_addrs);
-    free(c_bufs);
-    free(s_msgs);
-    free(s_iovs);
+    destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
 #endif
     closelog();
 

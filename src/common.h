@@ -28,13 +28,18 @@ union sockaddr_inx {
     struct sockaddr_in6 sin6;
 };
 
-extern const char *g_pidfile;
-extern volatile sig_atomic_t g_terminate;
-extern bool g_daemonized;
+struct app_state {
+    const char *pidfile;
+    int pidfile_fd;
+    volatile sig_atomic_t terminate;
+    bool daemonized;
+};
+
+extern struct app_state g_state;
 
 void on_signal(int sig);
 void cleanup_pidfile(void);
-void write_pidfile(const char *path);
+int write_pidfile(const char *path);
 int do_daemonize(void);
 
 void setup_signal_handlers(void);
@@ -47,21 +52,23 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 void epoll_close_comp(int epfd);
 static inline int ep_add_or_mod(int epfd, int sock, struct epoll_event *ev)
 {
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, sock, ev) < 0) {
-        if (errno == ENOENT) {
-            /* If the fd is not in epoll set, add it. */
-            if (epoll_ctl(epfd, EPOLL_CTL_ADD, sock, ev) < 0)
-                return -1;
-        } else {
-            return -1;
-        }
+    /* First, try to modify an existing file descriptor. */
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, sock, ev) == 0) {
+        return 0; /* Success */
     }
-    return 0;
+
+    /* If the descriptor was not found, try to add it. */
+    if (errno == ENOENT) {
+        return epoll_ctl(epfd, EPOLL_CTL_ADD, sock, ev);
+    }
+
+    /* Any other error is a failure. */
+    return -1;
 }
 
 /* Standardized logging macros */
 #define LOG_MSG(level, fmt, ...) do { \
-    if (g_daemonized) \
+    if (g_state.daemonized) \
         syslog(level, fmt, ##__VA_ARGS__); \
     else \
         fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
