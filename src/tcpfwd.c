@@ -47,6 +47,11 @@
 #define TCP_PROXY_KEEPALIVE_CNT 6
 #endif
 
+/* Memory pool for connection objects */
+#ifndef TCP_PROXY_CONN_POOL_SIZE
+#define TCP_PROXY_CONN_POOL_SIZE 4096
+#endif
+
 #define container_of(ptr, type, member) ({          \
     const typeof(((type *)0)->member) * __mptr = (ptr); \
     (type *)((char *)__mptr - offsetof(type, member)); })
@@ -152,56 +157,82 @@ struct proxy_conn {
     int splice_pipe[2];
     bool use_splice;
 #endif
+
+    /* For memory pool */
+    struct proxy_conn *next;
 };
+
+struct conn_pool {
+    struct proxy_conn *connections;
+    struct proxy_conn *freelist;
+    int capacity;
+    int used_count;
+};
+
+static struct conn_pool g_conn_pool;
+
+static int init_conn_pool(void)
+{
+    g_conn_pool.capacity = TCP_PROXY_CONN_POOL_SIZE;
+    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) * g_conn_pool.capacity);
+    if (!g_conn_pool.connections) {
+        P_LOG_ERR("Failed to allocate connection pool");
+        return -1;
+    }
+
+    g_conn_pool.freelist = NULL;
+    for (int i = 0; i < g_conn_pool.capacity; i++) {
+        struct proxy_conn *conn = &g_conn_pool.connections[i];
+        conn->next = g_conn_pool.freelist;
+        g_conn_pool.freelist = conn;
+    }
+    g_conn_pool.used_count = 0;
+    P_LOG_INFO("Connection pool initialized with %d connections", g_conn_pool.capacity);
+    return 0;
+}
+
+static void destroy_conn_pool(void)
+{
+    if (g_conn_pool.connections) {
+        free(g_conn_pool.connections);
+        g_conn_pool.connections = NULL;
+        g_conn_pool.freelist = NULL;
+        g_conn_pool.capacity = 0;
+        g_conn_pool.used_count = 0;
+        P_LOG_INFO("Connection pool destroyed");
+    }
+}
 
 static inline struct proxy_conn *alloc_proxy_conn(void)
 {
     struct proxy_conn *conn;
 
-    if (!(conn = malloc(sizeof(*conn))))
+    if (!g_conn_pool.freelist) {
+        P_LOG_WARN("Connection pool exhausted!");
         return NULL;
+    }
+
+    conn = g_conn_pool.freelist;
+    g_conn_pool.freelist = conn->next;
+    g_conn_pool.used_count++;
+
     memset(conn, 0x0, sizeof(*conn));
 
     conn->cli_sock = -1;
     conn->svr_sock = -1;
-    conn->magic_client = EV_MAGIC_CLIENT;
-    conn->magic_server = EV_MAGIC_SERVER;
-    conn->state = S_INVALID;
-
-    conn->cli_in_eof = false;
-    conn->svr_in_eof = false;
-    conn->cli2svr_shutdown = false;
-    conn->svr2cli_shutdown = false;
-
 #ifdef __linux__
     conn->splice_pipe[0] = -1;
     conn->splice_pipe[1] = -1;
     conn->use_splice = false;
-    if (pipe2(conn->splice_pipe, O_NONBLOCK) == 0) {
-        conn->use_splice = true;
-    } else {
-        P_LOG_WARN("pipe2() failed: %s. Falling back to userspace copy.", strerror(errno));
-    }
 #endif
+    conn->magic_client = EV_MAGIC_CLIENT;
+    conn->magic_server = EV_MAGIC_SERVER;
 
     return conn;
 }
 
-/**
- * Close both sockets of the connection and remove it
- *  from the current ready list.
- */
-static int ep_add_or_mod(int epfd, int fd, struct epoll_event *ev)
-{
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, ev) == 0)
-        return 0;
-    if (errno == ENOENT)
-        return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, ev);
-    return -1;
-}
-
-static void release_proxy_conn(struct proxy_conn *conn,
-        struct epoll_event *pending_evs, int pending_fds, int epfd)
+static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *events,
+        int *nfds, int epfd)
 {
     int i;
 
@@ -210,8 +241,8 @@ static void release_proxy_conn(struct proxy_conn *conn,
      *  connection. The event must be cleared or an invalid
      *  pointer might be accessed.
      */
-    for (i = 0; i < pending_fds; i++) {
-        struct epoll_event *ev = &pending_evs[i];
+    for (i = 0; i < *nfds; i++) {
+        struct epoll_event *ev = &events[i];
         if (ev->data.ptr == &conn->magic_client ||
             ev->data.ptr == &conn->magic_server) {
             ev->data.ptr = NULL;
@@ -233,15 +264,17 @@ static void release_proxy_conn(struct proxy_conn *conn,
 #endif
     if (conn->cli_sock >= 0)
         close(conn->cli_sock);
-    if (conn->svr_sock >= 0)
+    if (conn->svr_sock != -1)
         close(conn->svr_sock);
 
-    free(conn);
+    conn->next = g_conn_pool.freelist;
+    g_conn_pool.freelist = conn;
+    g_conn_pool.used_count--;
 }
 
-
 /**
- * Add or activate the epoll fds according to the status of
+ * Close both sockets of the connection and remove it
+ *  from the current ready list.
  *  'conn'. Different conn->state and buffer status will
  *  affect the polling behaviors.
  */
@@ -794,7 +827,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    openlog(argv[0], LOG_PID | LOG_NDELAY, LOG_DAEMON);
+    openlog("tcpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
+
+    if (init_conn_pool() != 0) {
+        closelog();
+        return 1;
+    }
 
     if (cfg.daemonize && do_daemonize() != 0)
         goto cleanup;
@@ -858,7 +896,13 @@ cleanup:
     if (listen_sock >= 0)
         close(listen_sock);
     if (epfd >= 0)
-        epoll_close_comp(epfd);
+        close(epfd);
+
+    destroy_conn_pool();
+
+    if (cfg.pidfile)
+        unlink(cfg.pidfile);
+
     closelog();
 
     return rc;
