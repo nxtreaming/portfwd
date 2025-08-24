@@ -503,12 +503,10 @@ int main(int argc, char *argv[])
     c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(*c_bufs));
     if (!c_msgs || !c_iov || !c_addrs || !c_bufs) {
         P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
-        free(c_msgs);
-        free(c_iov);
-        free(c_addrs);
-        free(c_bufs);
-        c_msgs = NULL;
-        /* c_iov, c_addrs, c_bufs are not used if c_msgs is NULL */
+        free(c_msgs);   c_msgs = NULL;
+        free(c_iov);    c_iov = NULL;
+        free(c_addrs);  c_addrs = NULL;
+        free(c_bufs);   c_bufs = NULL;
     } else {
         for (i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
             memset(&c_addrs[i], 0, sizeof(c_addrs[i]));
