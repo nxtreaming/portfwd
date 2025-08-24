@@ -242,12 +242,12 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
 
     /* Reset epoll status */
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->cli_sock, &ev_cli) < 0) {
-        LOG_WARN("epoll_ctl(MOD, cli): %s", strerror(errno));
+        P_LOG_WARN("epoll_ctl(MOD, cli): %s", strerror(errno));
         conn->state = S_CLOSING;
         return;
     }
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &ev_svr) < 0) {
-        LOG_WARN("epoll_ctl(MOD, svr): %s", strerror(errno));
+        P_LOG_WARN("epoll_ctl(MOD, svr): %s", strerror(errno));
         conn->state = S_CLOSING;
         return;
     }
@@ -260,7 +260,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
 
     /* Client calls in, allocate session data for it. */
     if (!(conn = alloc_proxy_conn())) {
-        LOG_ERR("alloc_proxy_conn(): %s", strerror(errno));
+        P_LOG_ERR("alloc_proxy_conn(): %s", strerror(errno));
         close(cli_sock);
         return NULL;
     }
@@ -284,11 +284,11 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
         memset(&loc_addr, 0x0, sizeof(loc_addr));
         memset(&orig_dst, 0x0, sizeof(orig_dst));
         if (getsockname(conn->cli_sock, (struct sockaddr *)&loc_addr, &loc_alen)) {
-            LOG_ERR("getsockname(): %s.", strerror(errno));
+            P_LOG_ERR("getsockname(): %s.", strerror(errno));
             goto err;
         }
         if (getsockopt(conn->cli_sock, SOL_IP, SO_ORIGINAL_DST, &orig_dst, &orig_alen)) {
-            LOG_ERR("getsockopt(SO_ORIGINAL_DST): %s.", strerror(errno));
+            P_LOG_ERR("getsockopt(SO_ORIGINAL_DST): %s.", strerror(errno));
             goto err;
         }
 
@@ -302,7 +302,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
         base = ntohl(*addr_pos);
         sum = (int64_t)base + (int64_t)(int32_t)port_offset;
         if (sum < 0 || sum > UINT32_MAX) {
-            LOG_ERR("base address adjustment overflows: base=%u, off=%d", base, port_offset);
+            P_LOG_ERR("base address adjustment overflows: base=%u, off=%d", base, port_offset);
             goto err;
         }
 
@@ -314,13 +314,13 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
             s_addr1, sizeof(s_addr1));
     inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
             s_addr2, sizeof(s_addr2));
-    LOG_INFO("New connection [%s]:%d -> [%s]:%d",
+    P_LOG_INFO("New connection [%s]:%d -> [%s]:%d",
             s_addr1, ntohs(*port_of_sockaddr(&conn->cli_addr)),
             s_addr2, ntohs(*port_of_sockaddr(&conn->svr_addr)));
 
     /* Initiate the connection to server right now. */
     if ((conn->svr_sock = socket(conn->svr_addr.sa.sa_family, SOCK_STREAM, 0)) < 0) {
-        LOG_ERR("socket(svr_sock): %s", strerror(errno));
+        P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
         goto err;
     }
     set_nonblock(conn->svr_sock);
@@ -338,7 +338,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
         return conn;
     } else {
         /* Error occurs, drop the session. */
-        LOG_WARN("Connection to [%s]:%d failed: %s",
+        P_LOG_WARN("Connection to [%s]:%d failed: %s",
                 s_addr2, ntohs(*port_of_sockaddr(&conn->svr_addr)),
                 strerror(errno));
         goto err;
@@ -366,7 +366,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
         if (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err) {
             inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
                     s_addr, sizeof(s_addr));
-            LOG_WARN("Connection to [%s]:%d failed: %s",
+            P_LOG_WARN("Connection to [%s]:%d failed: %s",
                     s_addr, ntohs(*port_of_sockaddr(&conn->svr_addr)),
                     strerror(err ? err : errno));
             conn->state = S_CLOSING;
@@ -387,7 +387,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
             if (rc == 0) {
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                         s_addr, sizeof(s_addr));
-                LOG_INFO("Connection [%s]:%d closed during server handshake",
+                P_LOG_INFO("Connection [%s]:%d closed during server handshake",
                         s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
                 conn->state = S_CLOSING;
                 return 0;
@@ -396,7 +396,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
                     break; /* drained for now */
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                         s_addr, sizeof(s_addr));
-                LOG_INFO("Connection [%s]:%d error during server handshake: %s",
+                P_LOG_INFO("Connection [%s]:%d error during server handshake: %s",
                         s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), strerror(errno));
                 conn->state = S_CLOSING;
                 return 0;
@@ -521,7 +521,7 @@ skip_read:
         conn->request.rpos >= conn->request.dlen &&
         conn->response.rpos >= conn->response.dlen) {
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
-        LOG_INFO("Connection [%s]:%d closed (both directions finished)",
+        P_LOG_INFO("Connection [%s]:%d closed (both directions finished)",
                s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
         conn->state = S_CLOSING;
         return 0;
@@ -532,7 +532,7 @@ skip_read:
 
 err:
     inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
-    LOG_INFO("Connection [%s]:%d closed", s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
+    P_LOG_INFO("Connection [%s]:%d closed", s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
     conn->state = S_CLOSING;
     return 0;
 }
@@ -546,7 +546,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
         if (nfds < 0) {
             if (errno == EINTR)
                 continue;
-            LOG_ERR("epoll_wait(): %s", strerror(errno));
+            P_LOG_ERR("epoll_wait(): %s", strerror(errno));
             return 1;
         }
 
@@ -570,7 +570,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                             /* Processed all incoming connections. */
                             break;
                         }
-                        LOG_ERR("accept(): %s", strerror(errno));
+                        P_LOG_ERR("accept(): %s", strerror(errno));
                         break;
                     }
 
@@ -626,14 +626,14 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
 
 static void show_help(const char *prog)
 {
-    LOG_INFO("Usage: %s [options] <src_addr> <dst_addr>", prog);
-    LOG_INFO("  <src_addr>, <dst_addr>    -- IPv4/IPv6 address with port, e.g. 127.0.0.1:8080, [::1]:8080");
-    LOG_INFO("  -d, --daemonize           -- detach and run in background");
-    LOG_INFO("  -p, --pidfile <path>      -- create PID file at <path>");
-    LOG_INFO("  -b, --base-addr-mode      -- use src_addr as base for dst_addr (for load balancing)");
-    LOG_INFO("  -r, --reuse-addr          -- set SO_REUSEADDR on listener socket");
-    LOG_INFO("  -6, --v6only              -- set IPV6_V6ONLY on listener socket");
-    LOG_INFO("  -h, --help                -- show this help");
+    P_LOG_INFO("Usage: %s [options] <src_addr> <dst_addr>", prog);
+    P_LOG_INFO("  <src_addr>, <dst_addr>    -- IPv4/IPv6 address with port, e.g. 127.0.0.1:8080, [::1]:8080");
+    P_LOG_INFO("  -d, --daemonize           -- detach and run in background");
+    P_LOG_INFO("  -p, --pidfile <path>      -- create PID file at <path>");
+    P_LOG_INFO("  -b, --base-addr-mode      -- use src_addr as base for dst_addr (for load balancing)");
+    P_LOG_INFO("  -r, --reuse-addr          -- set SO_REUSEADDR on listener socket");
+    P_LOG_INFO("  -6, --v6only              -- set IPV6_V6ONLY on listener socket");
+    P_LOG_INFO("  -h, --help                -- show this help");
 }
 
 int main(int argc, char *argv[])
@@ -651,7 +651,7 @@ int main(int argc, char *argv[])
             cfg.daemonize = true;
         } else if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--pidfile") == 0) {
             if (i + 1 >= argc) {
-                LOG_ERR("-p/--pidfile requires an argument.");
+                P_LOG_ERR("-p/--pidfile requires an argument.");
                 return 1;
             }
             cfg.pidfile = argv[++i];
@@ -665,7 +665,7 @@ int main(int argc, char *argv[])
             show_help(argv[0]);
             return 0;
         } else if (argv[i][0] == '-') {
-            LOG_ERR("Unknown option: %s", argv[i]);
+            P_LOG_ERR("Unknown option: %s", argv[i]);
             return 1;
         } else {
             break;
@@ -678,11 +678,11 @@ int main(int argc, char *argv[])
     }
 
     if (get_sockaddr_inx_pair(argv[i], &cfg.src_addr, false) != 0) {
-        LOG_ERR("Invalid src_addr: %s", argv[i]);
+        P_LOG_ERR("Invalid src_addr: %s", argv[i]);
         return 1;
     }
     if (get_sockaddr_inx_pair(argv[i + 1], &cfg.dst_addr, false) != 0) {
-        LOG_ERR("Invalid dst_addr: %s", argv[i + 1]);
+        P_LOG_ERR("Invalid dst_addr: %s", argv[i + 1]);
         return 1;
     }
 
@@ -700,7 +700,7 @@ int main(int argc, char *argv[])
 
     listen_sock = socket(cfg.src_addr.sa.sa_family, SOCK_STREAM, 0);
     if (listen_sock < 0) {
-        LOG_ERR("socket(): %s", strerror(errno));
+        P_LOG_ERR("socket(): %s", strerror(errno));
         goto cleanup;
     }
 
@@ -715,12 +715,12 @@ int main(int argc, char *argv[])
     }
 
     if (bind(listen_sock, &cfg.src_addr.sa, sizeof_sockaddr(&cfg.src_addr)) < 0) {
-        LOG_ERR("bind(): %s", strerror(errno));
+        P_LOG_ERR("bind(): %s", strerror(errno));
         goto cleanup;
     }
 
     if (listen(listen_sock, 128) < 0) {
-        LOG_ERR("listen(): %s", strerror(errno));
+        P_LOG_ERR("listen(): %s", strerror(errno));
         goto cleanup;
     }
 
@@ -728,7 +728,7 @@ int main(int argc, char *argv[])
 
     epfd = epoll_create(1);
     if (epfd < 0) {
-        LOG_ERR("epoll_create(): %s", strerror(errno));
+        P_LOG_ERR("epoll_create(): %s", strerror(errno));
         goto cleanup;
     }
 
@@ -736,15 +736,15 @@ int main(int argc, char *argv[])
     ev.events = EPOLLIN;
     ev.data.ptr = &magic_listener;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &ev) < 0) {
-        LOG_ERR("epoll_ctl(ADD, listener): %s", strerror(errno));
+        P_LOG_ERR("epoll_ctl(ADD, listener): %s", strerror(errno));
         goto cleanup;
     }
 
-    LOG_INFO("TCP forwarding started.");
+    P_LOG_INFO("TCP forwarding started.");
 
     rc = proxy_loop(epfd, listen_sock, &cfg);
 
-    LOG_INFO("TCP forwarding stopped.");
+    P_LOG_INFO("TCP forwarding stopped.");
 
 cleanup:
     if (listen_sock >= 0)

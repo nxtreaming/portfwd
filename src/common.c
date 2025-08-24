@@ -32,36 +32,36 @@ void write_pidfile(const char *filepath)
 
     g_pidfile_fd = open(filepath, O_WRONLY | O_CREAT, 0644);
     if (g_pidfile_fd < 0) {
-        LOG_ERR("open(%s): %s", filepath, strerror(errno));
+        P_LOG_ERR("open(%s): %s", filepath, strerror(errno));
         exit(1);
     }
 
     if (flock(g_pidfile_fd, LOCK_EX | LOCK_NB) < 0) {
         if (errno == EWOULDBLOCK) {
-            LOG_ERR("pidfile %s exists and is locked, another instance running?", filepath);
+            P_LOG_ERR("pidfile %s exists and is locked, another instance running?", filepath);
         } else {
-            LOG_ERR("flock(%s): %s", filepath, strerror(errno));
+            P_LOG_ERR("flock(%s): %s", filepath, strerror(errno));
         }
         close(g_pidfile_fd);
         exit(1);
     }
 
     if (ftruncate(g_pidfile_fd, 0) < 0) {
-        LOG_ERR("ftruncate(%s): %s", filepath, strerror(errno));
+        P_LOG_ERR("ftruncate(%s): %s", filepath, strerror(errno));
         close(g_pidfile_fd);
         exit(1);
     }
 
     int len = snprintf(buf, sizeof(buf), "%d\n", (int)pid);
     if (len < 0 || len >= (int)sizeof(buf)) {
-        LOG_ERR("snprintf(pid) failed.");
+        P_LOG_ERR("snprintf(pid) failed.");
         close(g_pidfile_fd);
         exit(1);
     }
     wlen = write(g_pidfile_fd, buf, (size_t)len);
     if (wlen != len) {
         int saved = errno;
-        LOG_ERR("write(%s): %s", filepath, strerror(saved));
+        P_LOG_ERR("write(%s): %s", filepath, strerror(saved));
         close(g_pidfile_fd);
         exit(1);
     }
@@ -74,7 +74,7 @@ int do_daemonize(void)
     int rc;
 
     if ((rc = fork()) < 0) {
-        LOG_ERR("fork() error: %s.", strerror(errno));
+        P_LOG_ERR("fork() error: %s.", strerror(errno));
         return rc;
     } else if (rc > 0) {
         /* In parent process */
@@ -113,11 +113,11 @@ void set_nonblock(int sockfd)
 {
     int flags = fcntl(sockfd, F_GETFL, 0);
     if (flags < 0) {
-        LOG_WARN("fcntl(F_GETFL): %s", strerror(errno));
+        P_LOG_WARN("fcntl(F_GETFL): %s", strerror(errno));
         return;
     }
     if (fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        LOG_WARN("fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
+        P_LOG_WARN("fcntl(F_SETFL,O_NONBLOCK): %s", strerror(errno));
     }
 }
 
@@ -215,7 +215,7 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 
     int rc = getaddrinfo(host, s_port, &hints, &result);
     if (rc != 0) {
-        LOG_ERR("getaddrinfo(%s:%s): %s", host, s_port, gai_strerror(rc));
+        P_LOG_ERR("getaddrinfo(%s:%s): %s", host, s_port, gai_strerror(rc));
         return -EHOSTUNREACH;
     }
 

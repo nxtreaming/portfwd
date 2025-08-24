@@ -53,8 +53,8 @@ void epoll_close_comp(int epfd);
         fprintf(stderr, fmt "\n", ##__VA_ARGS__); \
 } while(0)
 
-#define LOG_ERR(fmt, ...)   LOG_MSG(LOG_ERR, "ERROR: " fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  LOG_MSG(LOG_WARNING, "WARN: " fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  LOG_MSG(LOG_INFO, fmt, ##__VA_ARGS__)
+#define P_LOG_ERR(fmt, ...) LOG_MSG(LOG_ERR, "ERROR: " fmt, ##__VA_ARGS__)
+#define P_LOG_WARN(fmt, ...) LOG_MSG(LOG_WARNING, "WARN: " fmt, ##__VA_ARGS__)
+#define P_LOG_INFO(fmt, ...) LOG_MSG(LOG_INFO, fmt, ##__VA_ARGS__)
 
 #endif /* __PORTFWD_COMMON_H__ */
