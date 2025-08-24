@@ -17,7 +17,9 @@ void on_signal(int sig)
 void cleanup_pidfile(void)
 {
     if (g_pidfile_fd >= 0) {
-        close(g_pidfile_fd);
+        if (close(g_pidfile_fd) < 0) {
+            P_LOG_WARN("close(pidfile): %s", strerror(errno));
+        }
         g_pidfile_fd = -1;
     }
     if (g_pidfile) {
@@ -33,10 +35,18 @@ void write_pidfile(const char *filepath)
 
     g_pidfile = filepath;
 
-    g_pidfile_fd = open(filepath, O_WRONLY | O_CREAT, 0644);
+    g_pidfile_fd = open(filepath, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (g_pidfile_fd < 0) {
-        P_LOG_ERR("open(%s): %s", filepath, strerror(errno));
-        exit(1);
+        if (errno != EEXIST) {
+            P_LOG_ERR("open(%s) exclusively: %s", filepath, strerror(errno));
+            exit(1);
+        }
+        /* File exists, try to open and lock it */
+        g_pidfile_fd = open(filepath, O_WRONLY, 0644);
+        if (g_pidfile_fd < 0) {
+            P_LOG_ERR("open(%s) for locking: %s", filepath, strerror(errno));
+            exit(1);
+        }
     }
 
     int flags = fcntl(g_pidfile_fd, F_GETFD, 0);
@@ -95,8 +105,11 @@ int do_daemonize(void)
         dup2(fd, STDIN_FILENO);
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
-        if (fd > 2)
-            close(fd);
+        if (fd > 2) {
+            if (close(fd) < 0) {
+                P_LOG_WARN("close(/dev/null): %s", strerror(errno));
+            }
+        }
         chdir("/");
         g_daemonized = true;
     }

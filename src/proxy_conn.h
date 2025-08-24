@@ -39,6 +39,7 @@ struct proxy_conn {
     int magic_server;
 
     bool use_splice;
+    size_t splice_pending;
     int splice_pipe[2];
     bool cli_in_eof;
     bool svr_in_eof;

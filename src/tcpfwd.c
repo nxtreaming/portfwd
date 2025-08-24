@@ -192,22 +192,38 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
     }
 
     if (epfd >= 0) {
-        if (conn->cli_sock >= 0)
-            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL);
-        if (conn->svr_sock >= 0)
-            epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL);
+        if (conn->cli_sock >= 0) {
+            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL) < 0) {
+                P_LOG_WARN("epoll_ctl(DEL, cli_sock=%d): %s", conn->cli_sock, strerror(errno));
+            }
+        }
+        if (conn->svr_sock >= 0) {
+            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0) {
+                P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock, strerror(errno));
+            }
+        }
     }
 
 #ifdef __linux__
     if (conn->use_splice) {
-        close(conn->splice_pipe[0]);
-        close(conn->splice_pipe[1]);
+        if (close(conn->splice_pipe[0]) < 0) {
+            P_LOG_WARN("close(splice_pipe[0]=%d): %s", conn->splice_pipe[0], strerror(errno));
+        }
+        if (close(conn->splice_pipe[1]) < 0) {
+            P_LOG_WARN("close(splice_pipe[1]=%d): %s", conn->splice_pipe[1], strerror(errno));
+        }
     }
 #endif
-    if (conn->cli_sock >= 0)
-        close(conn->cli_sock);
-    if (conn->svr_sock != -1)
-        close(conn->svr_sock);
+    if (conn->cli_sock >= 0) {
+        if (close(conn->cli_sock) < 0) {
+            P_LOG_WARN("close(cli_sock=%d): %s", conn->cli_sock, strerror(errno));
+        }
+    }
+    if (conn->svr_sock != -1) {
+        if (close(conn->svr_sock) < 0) {
+            P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock, strerror(errno));
+        }
+    }
 
     conn->next = g_conn_pool.freelist;
     g_conn_pool.freelist = conn;
@@ -478,29 +494,46 @@ static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event 
     }
 
     while (1) {
-        n_in = splice(src_fd, NULL, pipe_fds[1], NULL, 65536, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
-        if (n_in == 0) {
-            if (src_fd == conn->cli_sock) conn->cli_in_eof = true;
-            else conn->svr_in_eof = true;
-            break;
-        }
-        if (n_in < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break; 
-            P_LOG_ERR("splice(in) from fd %d failed: %s", src_fd, strerror(errno));
-            conn->state = S_CLOSING;
-            return 0;
+        size_t to_write = conn->splice_pending;
+
+        if (to_write == 0) {
+            /* Pipe is empty, read from source */
+            n_in = splice(src_fd, NULL, pipe_fds[1], NULL, 65536, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            if (n_in == 0) {
+                if (src_fd == conn->cli_sock) conn->cli_in_eof = true;
+                else conn->svr_in_eof = true;
+                break; /* EOF */
+            }
+            if (n_in < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) break; /* Drained */
+                P_LOG_ERR("splice(in) from fd %d failed: %s", src_fd, strerror(errno));
+                conn->state = S_CLOSING;
+                return 0;
+            }
+            to_write = n_in;
         }
 
-        n_out = splice(pipe_fds[0], NULL, dst_fd, NULL, n_in, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        /* Write to destination */
+        n_out = splice(pipe_fds[0], NULL, dst_fd, NULL, to_write, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (n_out < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                P_LOG_WARN("splice(out) to fd %d would block. Data remains in pipe.", dst_fd);
+                /* Can't write, so data is now pending */
+                conn->splice_pending = to_write;
                 break;
             }
             P_LOG_ERR("splice(out) to fd %d failed: %s", dst_fd, strerror(errno));
             conn->state = S_CLOSING;
             return 0;
         }
+
+        if ((size_t)n_out < to_write) {
+            /* Partial write, update pending and try again */
+            conn->splice_pending = to_write - n_out;
+            continue;
+        }
+
+        /* Full write */
+        conn->splice_pending = 0;
     }
 
     return -EAGAIN;
@@ -840,19 +873,19 @@ int main(int argc, char *argv[])
 
     rc = proxy_loop(epfd, listen_sock, &cfg);
 
-    P_LOG_INFO("TCP forwarding stopped.");
-
 cleanup:
-    if (listen_sock >= 0)
-        close(listen_sock);
-    if (epfd >= 0)
-        close(epfd);
-
+    if (listen_sock >= 0) {
+        if (close(listen_sock) < 0) {
+            P_LOG_WARN("close(listen_sock=%d): %s", listen_sock, strerror(errno));
+        }
+    }
+    if (epfd >= 0) {
+        epoll_close_comp(epfd);
+    }
     destroy_conn_pool();
-
-    if (cfg.pidfile)
+    if (cfg.pidfile) {
         unlink(cfg.pidfile);
-
+    }
     closelog();
 
     return rc;

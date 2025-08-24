@@ -245,8 +245,11 @@ static struct proxy_conn *proxy_conn_get_or_create(
     return conn;
 
 err:
-    if (svr_sock >= 0)
-        close(svr_sock);
+    if (svr_sock >= 0) {
+        if (close(svr_sock) < 0) {
+            P_LOG_WARN("close(svr_sock=%d): %s", svr_sock, strerror(errno));
+        }
+    }
     if (conn)
         release_proxy_conn_to_pool(conn);
     return NULL;
@@ -263,9 +266,11 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
     /* remove from LRU as well */
     list_del(&conn->lru);
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF) {
-        P_LOG_WARN("epoll_ctl(DEL, svr_sock): %s", strerror(errno));
+        P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock, strerror(errno));
     }
-    close(conn->svr_sock);
+    if (close(conn->svr_sock) < 0) {
+        P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock, strerror(errno));
+    }
     release_proxy_conn_to_pool(conn);
 }
 
@@ -674,8 +679,11 @@ int main(int argc, char *argv[])
     }
 
 cleanup:
-    if (lsn_sock >= 0)
-        close(lsn_sock);
+    if (lsn_sock >= 0) {
+        if (close(lsn_sock) < 0) {
+            P_LOG_WARN("close(lsn_sock=%d): %s", lsn_sock, strerror(errno));
+        }
+    }
     if (epfd >= 0)
         epoll_close_comp(epfd);
     free(conn_tbl_hbase);
