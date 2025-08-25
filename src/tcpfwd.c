@@ -580,8 +580,6 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         struct epoll_event *ev)
 {
     char s_addr[50] = "";
-    bool can_read_cli = true, can_read_svr = true;
-    bool can_write_cli = true, can_write_svr = true;
 
     (void)efd;
     (void)epfd;
@@ -589,7 +587,6 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
 #ifdef __linux__
     if (conn->use_splice) {
         int io_state = handle_forwarding_splice(conn, ev);
-
         if (conn->cli_in_eof && !conn->cli2svr_shutdown) {
             shutdown(conn->svr_sock, SHUT_WR);
             conn->cli2svr_shutdown = true;
@@ -598,10 +595,8 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
             shutdown(conn->cli_sock, SHUT_WR);
             conn->svr2cli_shutdown = true;
         }
-
         if (conn->cli_in_eof && conn->svr_in_eof) {
             conn->state = S_CLOSING;
-            return 0;
         }
         return io_state;
     }
@@ -611,62 +606,41 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         goto err;
     }
 
-    do {
-        // 1. Read from client, if possible
-        if (can_read_cli && conn->request.dlen < conn->request.capacity) {
-            ssize_t rc = recv(conn->cli_sock, conn->request.data + conn->request.dlen, conn->request.capacity - conn->request.dlen, MSG_DONTWAIT);
-            if (rc == 0) { conn->cli_in_eof = true; can_read_cli = false; }
-            else if (rc < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK) goto err;
-                can_read_cli = false;
-            } else {
-                conn->request.dlen += rc;
+    if (ev->events & EPOLLIN) {
+        int sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
+        struct buffer_info *buf = (ev->data.ptr == &conn->magic_client) ? &conn->request : &conn->response;
+        ssize_t rc;
+        while (buf->dlen < buf->capacity) {
+            rc = recv(sock, buf->data + buf->dlen, buf->capacity - buf->dlen, 0);
+            if (rc == 0) {
+                if (sock == conn->cli_sock) conn->cli_in_eof = true;
+                else conn->svr_in_eof = true;
+                break;
             }
-        }
-
-        // 2. Read from server, if possible
-        if (can_read_svr && conn->response.dlen < conn->response.capacity) {
-            ssize_t rc = recv(conn->svr_sock, conn->response.data + conn->response.dlen, conn->response.capacity - conn->response.dlen, MSG_DONTWAIT);
-            if (rc == 0) { conn->svr_in_eof = true; can_read_svr = false; }
-            else if (rc < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK) goto err;
-                can_read_svr = false;
-            } else {
-                conn->response.dlen += rc;
-            }
-        }
-
-        // 3. Write to server, if possible
-        if (can_write_svr && conn->request.dlen > conn->request.rpos) {
-            ssize_t rc = send(conn->svr_sock, conn->request.data + conn->request.rpos, conn->request.dlen - conn->request.rpos, MSG_DONTWAIT);
             if (rc < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) goto err;
-                can_write_svr = false;
-            } else {
-                conn->request.rpos += rc;
+                break;
             }
+            buf->dlen += rc;
         }
+    }
 
-        // 4. Write to client, if possible
-        if (can_write_cli && conn->response.dlen > conn->response.rpos) {
-            ssize_t rc = send(conn->cli_sock, conn->response.data + conn->response.rpos, conn->response.dlen - conn->response.rpos, MSG_DONTWAIT);
+    if (ev->events & EPOLLOUT) {
+        int sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
+        struct buffer_info *buf = (ev->data.ptr == &conn->magic_client) ? &conn->response : &conn->request;
+        ssize_t rc;
+        if (buf->dlen > buf->rpos) {
+            rc = send(sock, buf->data + buf->rpos, buf->dlen - buf->rpos, 0);
             if (rc < 0) {
                 if (errno != EAGAIN && errno != EWOULDBLOCK) goto err;
-                can_write_cli = false;
             } else {
-                conn->response.rpos += rc;
+                buf->rpos += rc;
             }
         }
-
-        // Compact buffers if fully read
-        if (conn->request.rpos > 0 && conn->request.rpos == conn->request.dlen) {
-            conn->request.rpos = conn->request.dlen = 0;
+        if (buf->rpos >= buf->dlen) {
+            buf->rpos = buf->dlen = 0; // Compact buffer
         }
-        if (conn->response.rpos > 0 && conn->response.rpos == conn->response.dlen) {
-            conn->response.rpos = conn->response.dlen = 0;
-        }
-
-    } while (can_read_cli || can_read_svr || can_write_cli || can_write_svr);
+    }
 
 
     if (conn->cli_in_eof && !conn->cli2svr_shutdown && conn->request.rpos >= conn->request.dlen) {
@@ -682,10 +656,9 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         conn->request.rpos >= conn->request.dlen &&
         conn->response.rpos >= conn->response.dlen) {
         conn->state = S_CLOSING;
-        return 0;
     }
 
-    return -EAGAIN;
+    return 0;
 
 err:
     inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
@@ -766,23 +739,20 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                     continue; /* Should not happen */
                 }
 
-                while (conn->state != S_CLOSING && io_state == 0) {
-                    switch (conn->state) {
-                    case S_FORWARDING:
-                        io_state = handle_forwarding(conn, efd, epfd, ev);
-                        break;
-                    case S_SERVER_CONNECTING:
-                        io_state = handle_server_connecting(conn, efd);
-                        break;
-                    case S_SERVER_CONNECTED:
-                        io_state = handle_server_connected(conn, efd);
-                        break;
-                    default:
-                        conn->state = S_CLOSING;
-                        break;
-                    }
+                switch (conn->state) {
+                case S_FORWARDING:
+                    handle_forwarding(conn, efd, epfd, ev);
+                    break;
+                case S_SERVER_CONNECTING:
+                    handle_server_connecting(conn, efd);
+                    break;
+                case S_SERVER_CONNECTED:
+                    handle_server_connected(conn, efd);
+                    break;
+                default:
+                    conn->state = S_CLOSING;
+                    break;
                 }
-            }
 
             if (conn) {
                 if (conn->state == S_CLOSING) {
