@@ -62,6 +62,7 @@ struct config {
     int daemonize;
     int v6only;
     int reuseaddr;
+    int reuseport;
 };
 
 static struct list_head *conn_tbl_hbase;
@@ -622,6 +623,7 @@ static void show_help(const char *prog)
     P_LOG_INFO("  -d               run in background");
     P_LOG_INFO("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)");
     P_LOG_INFO("  -r               set SO_REUSEADDR before binding local port");
+    P_LOG_INFO("  -R               set SO_REUSEPORT before binding local port");
     P_LOG_INFO("  -H <size>        hash table size (default: 4093)");
     P_LOG_INFO("  -p <pidfile>     write PID to file");
 }
@@ -649,7 +651,7 @@ int main(int argc, char *argv[])
     struct iovec   *s_iovs = NULL;
 #endif
 
-    while ((opt = getopt(argc, argv, "t:dhorp:H:")) != -1) {
+    while ((opt = getopt(argc, argv, "t:dhorp:H:R")) != -1) {
         switch (opt) {
         case 't':
             cfg.proxy_conn_timeo = strtoul(optarg, NULL, 10);
@@ -666,6 +668,9 @@ int main(int argc, char *argv[])
             break;
         case 'r':
             cfg.reuseaddr = true;
+            break;
+        case 'R':
+            cfg.reuseport = true;
             break;
         case 'p':
             cfg.pidfile = optarg;
@@ -718,6 +723,10 @@ int main(int argc, char *argv[])
     }
     if (cfg.reuseaddr)
         setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true, sizeof(b_true));
+#ifdef SO_REUSEPORT
+    if (cfg.reuseport)
+        setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEPORT, &b_true, sizeof(b_true));
+#endif
     if (cfg.src_addr.sa.sa_family == AF_INET6 && cfg.v6only)
         setsockopt(lsn_sock, IPPROTO_IPV6, IPV6_V6ONLY, &b_true, sizeof(b_true));
     if (bind(lsn_sock, (struct sockaddr *)&cfg.src_addr,

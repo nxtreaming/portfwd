@@ -66,6 +66,7 @@ struct config {
     bool daemonize;
     bool base_addr_mode;
     bool reuse_addr;
+    bool reuse_port;
     bool v6only;
 };
 
@@ -788,6 +789,7 @@ static void show_help(const char *prog)
     P_LOG_INFO("  -p, --pidfile <path>      -- create PID file at <path>");
     P_LOG_INFO("  -b, --base-addr-mode      -- use src_addr as base for dst_addr (for load balancing)");
     P_LOG_INFO("  -r, --reuse-addr          -- set SO_REUSEADDR on listener socket");
+    P_LOG_INFO("  -R, --reuse-port          -- set SO_REUSEPORT on listener socket");
     P_LOG_INFO("  -6, --v6only              -- set IPV6_V6ONLY on listener socket");
     P_LOG_INFO("  -h, --help                -- show this help");
 }
@@ -802,7 +804,7 @@ int main(int argc, char *argv[])
     memset(&cfg, 0, sizeof(cfg));
 
     int opt;
-    while ((opt = getopt(argc, argv, "dp:br6h")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:brR6h")) != -1) {
         switch (opt) {
         case 'd':
             cfg.daemonize = true;
@@ -815,6 +817,9 @@ int main(int argc, char *argv[])
             break;
         case 'r':
             cfg.reuse_addr = true;
+            break;
+        case 'R':
+            cfg.reuse_port = true;
             break;
         case '6':
             cfg.v6only = true;
@@ -872,6 +877,13 @@ int main(int argc, char *argv[])
         int on = 1;
         (void)setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     }
+
+#ifdef SO_REUSEPORT
+    if (cfg.reuse_port) {
+        int on = 1;
+        (void)setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+    }
+#endif
 
     if (cfg.src_addr.sa.sa_family == AF_INET6 && cfg.v6only) {
         int on = 1;
