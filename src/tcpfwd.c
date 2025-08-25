@@ -785,10 +785,11 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
             }
 
             if (conn) {
-                if (conn->state == S_CLOSING)
+                if (conn->state == S_CLOSING) {
                     release_proxy_conn(conn, events, &nfds, epfd);
-                else if (io_state == -EAGAIN)
+                } else {
                     set_conn_epoll_fds(conn, epfd);
+                }
             }
         }
     }
