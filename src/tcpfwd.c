@@ -804,6 +804,7 @@ int main(int argc, char *argv[])
     int magic_listener = EV_MAGIC_LISTENER;
 
     memset(&cfg, 0, sizeof(cfg));
+    cfg.reuse_addr = true;
 
     int opt;
     while ((opt = getopt(argc, argv, "dp:brR6h")) != -1) {
