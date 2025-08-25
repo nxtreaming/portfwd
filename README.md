@@ -7,14 +7,34 @@ User-space TCP/UDP port forwarding services
  This project contains two applications: tcpfwd, udpfwd, which are for TCP and UDP port forwarding literally.
  Written in pure C.
  
-## Usage ##
+## Usage
 
-    tcpfwd|udpfwd <local_addr:local_port> <dest_addr:dest_port> [-d] [-o]
-     
+### tcpfwd (TCP forwarder)
+
+    tcpfwd [options] <local_addr:local_port> <dest_addr:dest_port>
+
     Options:
-      -d              run in background
-      -o              accept IPv6 connections only for IPv6 listener
-      -p <pidfile>    write PID to file
+      -d                 run in background (daemonize)
+      -p <pidfile>       write PID to file
+      -b                 base-addr mode (Linux TPROXY/original-dst based address math; expert use only)
+      -r                 set SO_REUSEADDR on listener socket
+      -R                 set SO_REUSEPORT on listener socket
+      -6                 for IPv6 listener, set IPV6_V6ONLY
+      -h                 show help
+
+### udpfwd (UDP forwarder)
+
+    udpfwd <local_addr:local_port> <dest_addr:dest_port> [options]
+
+    Options:
+      -t <seconds>       proxy session timeout (default: 60)
+      -d                 run in background (daemonize)
+      -o                 for IPv6 listener, set IPV6_V6ONLY
+      -r                 set SO_REUSEADDR before binding listener
+      -R                 set SO_REUSEPORT before binding listener
+      -H <size>          hash table size for UDP connection tracking (default: 4093)
+      -p <pidfile>       write PID to file
+      -h                 show help
 
 ## Examples
 
@@ -126,6 +146,10 @@ Notes:
   - TCP_PROXY_KEEPALIVE_IDLE (60s)
   - TCP_PROXY_KEEPALIVE_INTVL (10s)
   - TCP_PROXY_KEEPALIVE_CNT (6)
+
+### Linux zero-copy acceleration (splice)
+
+On Linux, `tcpfwd` opportunistically uses `splice()` with a non-blocking pipe to reduce copies and syscalls on the hot path. This is automatic when available, with graceful fallback to userspace buffering. No runtime flag is required.
 
 ## Build
 
