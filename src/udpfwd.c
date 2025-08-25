@@ -632,7 +632,7 @@ int main(int argc, char *argv[])
 {
     int opt, b_true = 1, lsn_sock = -1, epfd = -1, i, rc = 0;
     struct config cfg;
-        struct epoll_event ev, events[MAX_EVENTS];
+    struct epoll_event ev, events[MAX_EVENTS];
     char s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
 
@@ -774,7 +774,7 @@ int main(int argc, char *argv[])
         rc = 1;
         goto cleanup;
     }
-        for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++)
+    for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++)
         INIT_LIST_HEAD(&conn_tbl_hbase[i]);
     conn_tbl_len = 0;
 
