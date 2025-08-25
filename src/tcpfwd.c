@@ -406,8 +406,8 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
 
     if (connect(conn->svr_sock, (struct sockaddr *)&conn->svr_addr,
             sizeof_sockaddr(&conn->svr_addr)) == 0) {
-        /* Connected, prepare for data forwarding. */
-        conn->state = S_SERVER_CONNECTED;
+        /* Connected, ready for data forwarding immediately. */
+        conn->state = S_FORWARDING;
         /* Set up splice (Linux) */
 #ifdef __linux__
         if (!conn->use_splice) {
@@ -450,7 +450,12 @@ err:
     return NULL;
 }
 
-static int handle_server_connecting(struct proxy_conn *conn, int efd)
+/* Forward declaration */
+static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
+        struct epoll_event *ev);
+
+static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
+        struct epoll_event *ev)
 {
     char s_addr[50] = "";
 
@@ -469,9 +474,13 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
             return 0;
         }
 
-        /* Connected, preparing for data forwarding. */
-        conn->state = S_SERVER_CONNECTED;
-        return 0;
+        /* Connected, start forwarding immediately using this event. */
+        conn->state = S_FORWARDING;
+        /* If we buffered any client data while waiting for the server,
+         * disable splice so it gets flushed through the user buffer first. */
+        if (conn->request.dlen > conn->request.rpos)
+            conn->use_splice = false;
+        return handle_forwarding(conn, efd, epfd, ev);
     } else {
         /* Received data early before server connection is OK */
         struct buffer_info *rxb = &conn->request;
@@ -503,13 +512,6 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd)
         }
         return -EAGAIN;
     }
-}
-
-static int handle_server_connected(struct proxy_conn *conn, int efd)
-{
-    (void)efd; /* unused */
-    conn->state = S_FORWARDING;
-    return -EAGAIN;
 }
 
 #ifdef __linux__
@@ -743,10 +745,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                     handle_forwarding(conn, efd, epfd, ev);
                     break;
                 case S_SERVER_CONNECTING:
-                    handle_server_connecting(conn, efd);
-                    break;
-                case S_SERVER_CONNECTED:
-                    handle_server_connected(conn, efd);
+                    handle_server_connecting(conn, efd, epfd, ev);
                     break;
                 default:
                     conn->state = S_CLOSING;
