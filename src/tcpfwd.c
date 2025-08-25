@@ -612,8 +612,8 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
 
     if (ev->events & EPOLLIN) {
         int can_read = (ev->data.ptr == &conn->magic_client) ?
-                       (conn->request.dlen - conn->request.rpos < TCP_PROXY_BACKPRESSURE_WM) :
-                       (conn->response.dlen - conn->response.rpos < TCP_PROXY_BACKPRESSURE_WM);
+                       (conn->request.dlen < conn->request.capacity) :
+                       (conn->response.dlen < conn->response.capacity);
 
         if (can_read) {
             struct buffer_info *read_buf = (ev->data.ptr == &conn->magic_client) ? &conn->request : &conn->response;
