@@ -716,7 +716,6 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
         for (int i = 0; i < nfds; i++) {
             struct epoll_event *ev = &events[i];
             struct proxy_conn *conn = NULL;
-            int io_state = 0;
 
             /* Skip events that have been cleared by release_proxy_conn */
             if (ev->data.ptr == NULL) {
@@ -753,6 +752,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                     conn->state = S_CLOSING;
                     break;
                 }
+            }
 
             if (conn) {
                 if (conn->state == S_CLOSING) {
