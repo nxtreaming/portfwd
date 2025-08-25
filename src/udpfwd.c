@@ -59,10 +59,10 @@ struct config {
     const char *pidfile;
     unsigned proxy_conn_timeo;
     unsigned conn_tbl_hash_size;
-    int daemonize;
-    int v6only;
-    int reuseaddr;
-    int reuseport;
+    bool daemonize;
+    bool v6only;
+    bool reuse_addr;
+    bool reuse_port;
 };
 
 static struct list_head *conn_tbl_hbase;
@@ -622,8 +622,8 @@ static void show_help(const char *prog)
     P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)", 60);
     P_LOG_INFO("  -d               run in background");
     P_LOG_INFO("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)");
-    P_LOG_INFO("  -r               set SO_REUSEADDR before binding local port");
-    P_LOG_INFO("  -R               set SO_REUSEPORT before binding local port");
+    P_LOG_INFO("  -r, --reuse-addr set SO_REUSEADDR before binding local port");
+    P_LOG_INFO("  -R, --reuse-port set SO_REUSEPORT before binding local port");
     P_LOG_INFO("  -H <size>        hash table size (default: 4093)");
     P_LOG_INFO("  -p <pidfile>     write PID to file");
 }
@@ -667,10 +667,10 @@ int main(int argc, char *argv[])
             cfg.v6only = true;
             break;
         case 'r':
-            cfg.reuseaddr = true;
+            cfg.reuse_addr = true;
             break;
         case 'R':
-            cfg.reuseport = true;
+            cfg.reuse_port = true;
             break;
         case 'p':
             cfg.pidfile = optarg;
@@ -721,14 +721,22 @@ int main(int argc, char *argv[])
         rc = 1;
         goto cleanup;
     }
-    if (cfg.reuseaddr)
-        setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true, sizeof(b_true));
+    if (cfg.reuse_addr) {
+        if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true, sizeof(b_true)) < 0) {
+            P_LOG_WARN("setsockopt(SO_REUSEADDR): %s", strerror(errno));
+            goto cleanup;
+        }
+    }
 #ifdef SO_REUSEPORT
-    if (cfg.reuseport)
-        setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEPORT, &b_true, sizeof(b_true));
+    if (cfg.reuse_port) {
+        if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEPORT, &b_true, sizeof(b_true)) < 0) {
+            P_LOG_WARN("setsockopt(SO_REUSEPORT): %s", strerror(errno));
+            goto cleanup;
+        }
+    }
 #endif
     if (cfg.src_addr.sa.sa_family == AF_INET6 && cfg.v6only)
-        setsockopt(lsn_sock, IPPROTO_IPV6, IPV6_V6ONLY, &b_true, sizeof(b_true));
+        (void)setsockopt(lsn_sock, IPPROTO_IPV6, IPV6_V6ONLY, &b_true, sizeof(b_true));
     if (bind(lsn_sock, (struct sockaddr *)&cfg.src_addr,
             sizeof_sockaddr(&cfg.src_addr)) < 0) {
         P_LOG_ERR("bind(): %s.", strerror(errno));

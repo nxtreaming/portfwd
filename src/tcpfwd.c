@@ -875,13 +875,19 @@ int main(int argc, char *argv[])
 
     if (cfg.reuse_addr) {
         int on = 1;
-        (void)setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
+            P_LOG_ERR("setsockopt(SO_REUSEADDR): %s", strerror(errno));
+            goto cleanup;
+        }
     }
 
 #ifdef SO_REUSEPORT
     if (cfg.reuse_port) {
         int on = 1;
-        (void)setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
+            P_LOG_ERR("setsockopt(SO_REUSEPORT): %s", strerror(errno));
+            goto cleanup;
+        }
     }
 #endif
 
