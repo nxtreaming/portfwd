@@ -15,7 +15,6 @@ enum proxy_state {
     S_INITIAL = 0,
     S_CONNECTING,
     S_SERVER_CONNECTING,
-    S_SERVER_CONNECTED,
     S_FORWARDING,
     S_CLOSING,
 };
