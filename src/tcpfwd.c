@@ -605,53 +605,55 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     }
 #endif
 
-
     if (ev->events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
         goto err;
     }
 
-    if (ev->events & EPOLLIN) {
-        int can_read = (ev->data.ptr == &conn->magic_client) ?
-                       (conn->request.dlen < conn->request.capacity) :
-                       (conn->response.dlen < conn->response.capacity);
-
-        if (can_read) {
-            struct buffer_info *read_buf = (ev->data.ptr == &conn->magic_client) ? &conn->request : &conn->response;
-            int read_sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
+    /* Client -> Server */
+    if (ev->events & EPOLLIN && ev->data.ptr == &conn->magic_client) {
+        struct buffer_info *read_buf = &conn->request;
+        if (read_buf->dlen < read_buf->capacity) {
             ssize_t rc;
-
             for (;;) {
-                rc = recv(read_sock, read_buf->data + read_buf->dlen, read_buf->capacity - read_buf->dlen, 0);
-                if (rc == 0) {
-                    if (read_sock == conn->cli_sock) conn->cli_in_eof = true;
-                    else conn->svr_in_eof = true;
-                    break;
-                }
-                if (rc < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                    goto err;
-                }
+                rc = recv(conn->cli_sock, read_buf->data + read_buf->dlen, read_buf->capacity - read_buf->dlen, 0);
+                if (rc == 0) { conn->cli_in_eof = true; break; }
+                if (rc < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto err; }
                 read_buf->dlen += rc;
                 if (read_buf->dlen >= read_buf->capacity) break;
             }
         }
     }
-
-    if (ev->events & EPOLLOUT) {
-        struct buffer_info *write_buf = (ev->data.ptr == &conn->magic_client) ? &conn->response : &conn->request;
-        int write_sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
-        ssize_t rc;
-
+    if (ev->events & EPOLLOUT && ev->data.ptr == &conn->magic_server) {
+        struct buffer_info *write_buf = &conn->request;
         if (write_buf->dlen > write_buf->rpos) {
-            rc = send(write_sock, write_buf->data + write_buf->rpos, write_buf->dlen - write_buf->rpos, 0);
-            if (rc > 0) {
-                write_buf->rpos += rc;
-            } else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                goto err;
+            ssize_t rc = send(conn->svr_sock, write_buf->data + write_buf->rpos, write_buf->dlen - write_buf->rpos, 0);
+            if (rc > 0) { write_buf->rpos += rc; }
+            else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { goto err; }
+            if (write_buf->rpos >= write_buf->dlen) { write_buf->rpos = write_buf->dlen = 0; }
+        }
+    }
+
+    /* Server -> Client */
+    if (ev->events & EPOLLIN && ev->data.ptr == &conn->magic_server) {
+        struct buffer_info *read_buf = &conn->response;
+        if (read_buf->dlen < read_buf->capacity) {
+            ssize_t rc;
+            for (;;) {
+                rc = recv(conn->svr_sock, read_buf->data + read_buf->dlen, read_buf->capacity - read_buf->dlen, 0);
+                if (rc == 0) { conn->svr_in_eof = true; break; }
+                if (rc < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) break; goto err; }
+                read_buf->dlen += rc;
+                if (read_buf->dlen >= read_buf->capacity) break;
             }
-            if (write_buf->rpos >= write_buf->dlen) {
-                write_buf->rpos = write_buf->dlen = 0;
-            }
+        }
+    }
+    if (ev->events & EPOLLOUT && ev->data.ptr == &conn->magic_client) {
+        struct buffer_info *write_buf = &conn->response;
+        if (write_buf->dlen > write_buf->rpos) {
+            ssize_t rc = send(conn->cli_sock, write_buf->data + write_buf->rpos, write_buf->dlen - write_buf->rpos, 0);
+            if (rc > 0) { write_buf->rpos += rc; }
+            else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { goto err; }
+            if (write_buf->rpos >= write_buf->dlen) { write_buf->rpos = write_buf->dlen = 0; }
         }
     }
 
