@@ -165,11 +165,24 @@ static uint32_t fnv1a_32_hash(const void *data, size_t len)
 static uint32_t hash_addr(const union sockaddr_inx *a)
 {
     if (a->sa.sa_family == AF_INET) {
-        struct { uint32_t addr; uint16_t port; } k = { a->sin.sin_addr.s_addr, a->sin.sin_port };
+        struct {
+            uint32_t addr;
+            uint16_t port;
+        } k = {
+            a->sin.sin_addr.s_addr,
+            a->sin.sin_port
+        };
         return fnv1a_32_hash(&k, sizeof(k));
     } else if (a->sa.sa_family == AF_INET6) {
-        struct { struct in6_addr addr; uint16_t port; uint32_t scope; } k =
-            { a->sin6.sin6_addr, a->sin6.sin6_port, a->sin6.sin6_scope_id };
+        struct {
+            struct in6_addr addr;
+            uint16_t port;
+            uint32_t scope;
+        } k = {
+            a->sin6.sin6_addr,
+            a->sin6.sin6_port,
+            a->sin6.sin6_scope_id
+        };
         return fnv1a_32_hash(&k, sizeof(k));
     }
     return 0;
