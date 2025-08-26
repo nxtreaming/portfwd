@@ -79,6 +79,10 @@ struct conn_pool {
 
 static struct conn_pool g_conn_pool;
 
+/* Forward declaration */
+static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
+    struct epoll_event *ev);
+
 static void set_sock_buffers(int sockfd)
 {
     int sz = TCP_PROXY_SOCKBUF_CAP;
@@ -449,10 +453,6 @@ err:
         release_proxy_conn(conn, NULL, 0, -1);
     return NULL;
 }
-
-/* Forward declaration */
-static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
-        struct epoll_event *ev);
 
 static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
         struct epoll_event *ev)
