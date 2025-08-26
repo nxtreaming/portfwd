@@ -489,8 +489,7 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
         int rc;
 
         for (;;) {
-            rc = recv(efd , rxb->data + rxb->dlen,
-                    rxb->capacity - rxb->dlen, 0);
+            rc = recv(efd , rxb->data + rxb->dlen, rxb->capacity - rxb->dlen, 0);
             if (rc == 0) {
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                         s_addr, sizeof(s_addr));
@@ -525,10 +524,12 @@ static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event 
 
     pipe_fds = conn->splice_pipe;
 
-    if (ev->data.ptr == &conn->magic_client) { /* client -> server */
+    if (ev->data.ptr == &conn->magic_client) {
+        /* client -> server */
         src_fd = conn->cli_sock;
         dst_fd = conn->svr_sock;
-    } else { /* server -> client */
+    } else {
+        /* server -> client */
         src_fd = conn->svr_sock;
         dst_fd = conn->cli_sock;
     }
@@ -540,12 +541,15 @@ static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event 
             /* Pipe is empty, read from source */
             n_in = splice(src_fd, NULL, pipe_fds[1], NULL, 65536, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
             if (n_in == 0) {
-                if (src_fd == conn->cli_sock) conn->cli_in_eof = true;
-                else conn->svr_in_eof = true;
+                if (src_fd == conn->cli_sock)
+                    conn->cli_in_eof = true;
+                else
+                    conn->svr_in_eof = true;
                 break; /* EOF */
             }
             if (n_in < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) break; /* Drained */
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                    break; /* Drained */
                 P_LOG_ERR("splice(in) from fd %d failed: %s", src_fd, strerror(errno));
                 conn->state = S_CLOSING;
                 return 0;
@@ -617,12 +621,15 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         while (buf->dlen < buf->capacity) {
             rc = recv(sock, buf->data + buf->dlen, buf->capacity - buf->dlen, 0);
             if (rc == 0) {
-                if (sock == conn->cli_sock) conn->cli_in_eof = true;
-                else conn->svr_in_eof = true;
+                if (sock == conn->cli_sock)
+                    conn->cli_in_eof = true;
+                else
+                    conn->svr_in_eof = true;
                 break;
             }
             if (rc < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK) goto err;
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    goto err;
                 break;
             }
             buf->dlen += rc;
@@ -636,7 +643,8 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         if (buf->dlen > buf->rpos) {
             rc = send(sock, buf->data + buf->rpos, buf->dlen - buf->rpos, 0);
             if (rc < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK) goto err;
+                if (errno != EAGAIN && errno != EWOULDBLOCK)
+                    goto err;
             } else {
                 buf->rpos += rc;
             }
@@ -726,10 +734,12 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                 continue;
             }
 
-            if (*(const uint32_t *)ev->data.ptr == EV_MAGIC_LISTENER) { /* Listener socket */
+            if (*(const uint32_t *)ev->data.ptr == EV_MAGIC_LISTENER) {
+                /* Listener socket */
                 handle_new_connection(listen_sock, epfd, cfg);
                 continue;
-            } else { /* Client or server socket */
+            } else {
+                /* Client or server socket */
                 uint32_t *magic = ev->data.ptr;
                 int efd = -1;
                 if (*magic == EV_MAGIC_CLIENT) {
