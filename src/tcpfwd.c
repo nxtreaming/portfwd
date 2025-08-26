@@ -14,6 +14,7 @@
 #include <fcntl.h>
 #include <syslog.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "common.h"
 #include "list.h"
@@ -53,9 +54,9 @@
 /* Memory pool for connection objects */
 #define TCP_PROXY_CONN_POOL_SIZE 4096
 
-#define EV_MAGIC_LISTENER 0xdeadbeef
-#define EV_MAGIC_CLIENT   0xfeedface
-#define EV_MAGIC_SERVER   0xbaadcafe
+#define EV_MAGIC_LISTENER 0xdeadbeefU
+#define EV_MAGIC_CLIENT   0xfeedfaceU
+#define EV_MAGIC_SERVER   0xbaadcafeU
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -117,7 +118,8 @@ static void set_tcp_nodelay(int sockfd)
 static int init_conn_pool(void)
 {
     g_conn_pool.capacity = TCP_PROXY_CONN_POOL_SIZE;
-    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) * g_conn_pool.capacity);
+    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) *
+                                     (size_t)g_conn_pool.capacity);
     if (!g_conn_pool.connections) {
         P_LOG_ERR("Failed to allocate connection pool");
         return -1;
@@ -724,16 +726,16 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
                 continue;
             }
 
-            if (*(int *)ev->data.ptr == (int)EV_MAGIC_LISTENER) { /* Listener socket */
+            if (*(const uint32_t *)ev->data.ptr == EV_MAGIC_LISTENER) { /* Listener socket */
                 handle_new_connection(listen_sock, epfd, cfg);
                 continue;
             } else { /* Client or server socket */
-                int *magic = (int *)ev->data.ptr;
+                uint32_t *magic = ev->data.ptr;
                 int efd = -1;
-                if (*magic == (int)EV_MAGIC_CLIENT) {
+                if (*magic == EV_MAGIC_CLIENT) {
                     conn = container_of(magic, struct proxy_conn, magic_client);
                     efd = conn->cli_sock;
-                } else if (*magic == (int)EV_MAGIC_SERVER) {
+                } else if (*magic == EV_MAGIC_SERVER) {
                     conn = container_of(magic, struct proxy_conn, magic_server);
                     efd = conn->svr_sock;
                 } else {
@@ -783,7 +785,7 @@ int main(int argc, char *argv[])
     int rc = 1;
     struct config cfg;
     int listen_sock = -1, epfd = -1;
-    int magic_listener = EV_MAGIC_LISTENER;
+    uint32_t magic_listener = EV_MAGIC_LISTENER;
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.reuse_addr = true;

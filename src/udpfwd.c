@@ -117,7 +117,8 @@ static void destroy_batching_resources(
 static int init_conn_pool(void)
 {
     g_conn_pool.capacity = UDP_PROXY_MAX_CONNS;
-    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) * g_conn_pool.capacity);
+    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) *
+                                     (size_t)g_conn_pool.capacity);
     if (!g_conn_pool.connections) {
         P_LOG_ERR("Failed to allocate connection pool");
         return -1;
