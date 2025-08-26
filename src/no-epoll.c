@@ -76,20 +76,31 @@ int epoll_create(int size)
     for (i = 0; i < pseudo_epolls_cap; i++) {
         if (pseudo_epolls[i] == NULL) {
             struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
-            if (!eh) { errno = ENOMEM; return -1; }
+            if (!eh) {
+                errno = ENOMEM;
+                return -1;
+            }
             eh->cap = 16;
             eh->pfds = (struct pollfd *)calloc(eh->cap, sizeof(struct pollfd));
             eh->evs = (struct epoll_event *)calloc(eh->cap, sizeof(struct epoll_event));
             eh->fd_map = (struct ht *)calloc(1, sizeof(struct ht));
             if (!eh->pfds || !eh->evs || !eh->fd_map) {
-                free(eh->pfds); free(eh->evs); ht_destroy(eh->fd_map); free(eh);
-                errno = ENOMEM; return -1;
+                free(eh->pfds);
+                free(eh->evs);
+                ht_destroy(eh->fd_map);
+                free(eh);
+                errno = ENOMEM;
+                return -1;
             }
             eh->fd_map->capacity = HT_INITIAL_CAPACITY;
             eh->fd_map->buckets = (struct ht_entry **)calloc(eh->fd_map->capacity, sizeof(struct ht_entry *));
             if (!eh->fd_map->buckets) {
-                free(eh->pfds); free(eh->evs); ht_destroy(eh->fd_map); free(eh);
-                errno = ENOMEM; return -1;
+                free(eh->pfds);
+                free(eh->evs);
+                ht_destroy(eh->fd_map);
+                free(eh);
+                errno = ENOMEM;
+                return -1;
             }
             pseudo_epolls[i] = eh;
             return (int)i;
@@ -99,26 +110,41 @@ int epoll_create(int size)
     size_t old_cap = pseudo_epolls_cap;
     size_t new_cap = old_cap ? (old_cap + 8) : 8;
     void *np = realloc(pseudo_epolls, new_cap * sizeof(*pseudo_epolls));
-    if (!np) { errno = ENOMEM; return -1; }
+    if (!np) {
+        errno = ENOMEM;
+        return -1;
+    }
     pseudo_epolls = (struct pseudo_epoll_handle **)np;
-    for (i = old_cap; i < new_cap; i++) pseudo_epolls[i] = NULL;
+    for (i = old_cap; i < new_cap; i++)
+        pseudo_epolls[i] = NULL;
     pseudo_epolls_cap = new_cap;
     /* Allocate first new slot */
     struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
-    if (!eh) { errno = ENOMEM; return -1; }
+    if (!eh) {
+        errno = ENOMEM;
+        return -1;
+    }
     eh->cap = 16;
     eh->pfds = (struct pollfd *)calloc(eh->cap, sizeof(struct pollfd));
     eh->evs = (struct epoll_event *)calloc(eh->cap, sizeof(struct epoll_event));
     eh->fd_map = (struct ht *)calloc(1, sizeof(struct ht));
     if (!eh->pfds || !eh->evs || !eh->fd_map) {
-        free(eh->pfds); free(eh->evs); ht_destroy(eh->fd_map); free(eh);
-        errno = ENOMEM; return -1;
+        free(eh->pfds);
+        free(eh->evs);
+        ht_destroy(eh->fd_map);
+        free(eh);
+        errno = ENOMEM;
+        return -1;
     }
     eh->fd_map->capacity = HT_INITIAL_CAPACITY;
     eh->fd_map->buckets = (struct ht_entry **)calloc(eh->fd_map->capacity, sizeof(struct ht_entry *));
     if (!eh->fd_map->buckets) {
-        free(eh->pfds); free(eh->evs); ht_destroy(eh->fd_map); free(eh);
-        errno = ENOMEM; return -1;
+        free(eh->pfds);
+        free(eh->evs);
+        ht_destroy(eh->fd_map);
+        free(eh);
+        errno = ENOMEM;
+        return -1;
     }
     pseudo_epolls[old_cap] = eh;
     return (int)old_cap;
@@ -152,14 +178,25 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
     switch (op) {
     case EPOLL_CTL_ADD:
     case EPOLL_CTL_MOD: {
-        if (!event) { errno = EINVAL; return -1; }
+        if (!event) {
+            errno = EINVAL;
+            return -1;
+        }
 
         short pev = 0;
-        if (event->events & EPOLLIN) pev |= POLLIN;
-        if (event->events & EPOLLOUT) pev |= POLLOUT;
+        if (event->events & EPOLLIN)
+            pev |= POLLIN;
+        if (event->events & EPOLLOUT)
+            pev |= POLLOUT;
 
-        if (op == EPOLL_CTL_ADD && entry) { errno = EEXIST; return -1; }
-        if (op == EPOLL_CTL_MOD && !entry) { errno = ENOENT; return -1; }
+        if (op == EPOLL_CTL_ADD && entry) {
+            errno = EEXIST;
+            return -1;
+        }
+        if (op == EPOLL_CTL_MOD && !entry) {
+            errno = ENOENT;
+            return -1;
+        }
 
         if (!entry) { /* ADD */
             if (eh->len == eh->cap) {
@@ -167,18 +204,25 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
                 struct pollfd *npfds = (struct pollfd *)realloc(eh->pfds, ncap * sizeof(*npfds));
                 struct epoll_event *nevs = (struct epoll_event *)realloc(eh->evs, ncap * sizeof(*nevs));
                 if (!npfds || !nevs) {
-                    if (npfds != eh->pfds) free(npfds);
-                    if (nevs != eh->evs) free(nevs);
-                    errno = ENOMEM; return -1;
+                    if (npfds != eh->pfds)
+                        free(npfds);
+                    if (nevs != eh->evs)
+                        free(nevs);
+                    errno = ENOMEM;
+                    return -1;
                 }
-                eh->pfds = npfds; eh->evs = nevs; eh->cap = ncap;
+                eh->pfds = npfds;
+                eh->evs = nevs;
+                eh->cap = ncap;
             }
             size_t new_idx = eh->len;
             eh->pfds[new_idx].fd = fd;
             eh->pfds[new_idx].events = pev;
             eh->pfds[new_idx].revents = 0;
             eh->evs[new_idx] = *event;
-            if (ht_insert(eh->fd_map, fd, new_idx) != 0) { return -1; }
+            if (ht_insert(eh->fd_map, fd, new_idx) != 0) {
+                return -1;
+            }
             eh->len++;
         } else { /* MOD */
             eh->pfds[entry->index].events = pev;
@@ -187,7 +231,9 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
         break;
     }
     case EPOLL_CTL_DEL: {
-        if (!entry) return 0; /* not found, success */
+        if (!entry) {
+            return 0; /* not found, success */
+        }
         size_t idx_to_del = entry->index;
         ht_remove(eh->fd_map, fd);
 
@@ -241,13 +287,17 @@ static int ht_resize(struct ht *ht) {
 
 static int ht_insert(struct ht *ht, int fd, size_t index) {
     if (ht->size >= ht->capacity / 2) { // Rehash when 50% full
-        if (ht_resize(ht) != 0) return -1;
+        if (ht_resize(ht) != 0)
+            return -1;
     }
 
     unsigned long hash = (unsigned long)fd;
     size_t bucket_index = hash % ht->capacity;
     struct ht_entry *new_entry = (struct ht_entry *)malloc(sizeof(struct ht_entry));
-    if (!new_entry) { errno = ENOMEM; return -1; }
+    if (!new_entry) {
+        errno = ENOMEM;
+        return -1;
+    }
 
     new_entry->fd = fd;
     new_entry->index = index;
@@ -302,19 +352,25 @@ int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
     struct pseudo_epoll_handle *eh = pseudo_epolls[epfd];
 
     int nfds = poll(eh->pfds, (nfds_t)eh->len, timeout);
-    if (nfds <= 0) return nfds;
+    if (nfds <= 0)
+        return nfds;
 
     int out = 0;
     for (size_t i = 0; i < eh->len && out < maxevents; i++) {
         if (eh->pfds[i].revents) {
             uint32_t evs = 0;
-            if (eh->pfds[i].revents & POLLIN)   evs |= EPOLLIN;
-            if (eh->pfds[i].revents & POLLOUT)  evs |= EPOLLOUT;
-            if (eh->pfds[i].revents & POLLERR)  evs |= EPOLLERR;
+            if (eh->pfds[i].revents & POLLIN)
+                evs |= EPOLLIN;
+            if (eh->pfds[i].revents & POLLOUT)
+                evs |= EPOLLOUT;
+            if (eh->pfds[i].revents & POLLERR)
+                evs |= EPOLLERR;
 #ifdef POLLRDHUP
-            if (eh->pfds[i].revents & POLLRDHUP) evs |= EPOLLRDHUP;
+            if (eh->pfds[i].revents & POLLRDHUP)
+                evs |= EPOLLRDHUP;
 #endif
-            if (eh->pfds[i].revents & POLLHUP)   evs |= EPOLLHUP;
+            if (eh->pfds[i].revents & POLLHUP)
+                evs |= EPOLLHUP;
             events[out] = eh->evs[i];
             events[out].events = evs;
             out++;

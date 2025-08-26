@@ -573,12 +573,19 @@ static void init_batching_resources(
 
     if (!*c_msgs || !*c_iov || !*c_addrs || !*c_bufs || !*s_msgs || !*s_iovs) {
         P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
-        free(*c_msgs);   *c_msgs = NULL;
-        free(*c_iov);    *c_iov = NULL;
-        free(*c_addrs);  *c_addrs = NULL;
-        free(*c_bufs);   *c_bufs = NULL;
-        free(*s_msgs);   *s_msgs = NULL;
-        free(*s_iovs);   *s_iovs = NULL;
+        free(*c_msgs);
+        free(*c_iov);
+        free(*c_addrs);
+        free(*c_bufs);
+        free(*s_msgs);
+        free(*s_iovs);
+
+        *c_msgs = NULL;
+        *c_iov = NULL;
+        *c_addrs = NULL;
+        *c_bufs = NULL;
+        *s_msgs = NULL;
+        *s_iovs = NULL;
         return;
     }
 
@@ -645,7 +652,7 @@ int main(int argc, char *argv[])
     struct mmsghdr *c_msgs = NULL;          /* client -> server */
     struct iovec   *c_iov = NULL;
     struct sockaddr_storage *c_addrs = NULL;
-    char          (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL;
+    char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL;
 
     /* For sendmmsg() */
     struct mmsghdr *s_msgs = NULL;

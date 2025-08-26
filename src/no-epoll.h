@@ -26,9 +26,9 @@ struct epoll_event {
 #define EPOLL_CTL_DEL 2
 #define EPOLL_CTL_MOD 3
 
-extern int epoll_create(int size);
-extern int epoll_close(int epfd);
-extern int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
-extern int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
+int epoll_create(int size);
+int epoll_close(int epfd);
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event);
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout);
 
 #endif /* __NO_EPOLL_H */
