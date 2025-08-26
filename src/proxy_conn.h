@@ -2,6 +2,7 @@
 #define __PORTFWD_PROXY_CONN_H__
 
 #include "list.h"
+#include <stdint.h>
 
 /* Shared buffer structure */
 struct buffer_info {
@@ -32,8 +33,8 @@ struct proxy_conn {
     struct buffer_info request;  /* client -> server */
     struct buffer_info response; /* server -> client */
 
-    int magic_client;
-    int magic_server;
+    uint32_t magic_client;
+    uint32_t magic_server;
 
     bool use_splice;
     size_t splice_pending;
