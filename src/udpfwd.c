@@ -68,6 +68,9 @@ struct config {
 static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
 static unsigned conn_tbl_len;
+/* Function pointer to compute bucket index from a 32-bit hash. */
+/* Function pointer to compute bucket index from a client address. */
+static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 
 struct conn_pool {
     struct proxy_conn *connections;
@@ -135,6 +138,25 @@ static int init_conn_pool(void)
     return 0;
 }
 
+/* Small helper to check if an unsigned value is a power of two. */
+static inline bool is_power_of_two(unsigned v)
+{
+    return v && ((v & (v - 1)) == 0);
+}
+
+/* Bucket index strategies (selected once at init) */
+static unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa)
+{
+    uint32_t h = hash_addr(sa);
+    return h & (g_conn_tbl_hash_size - 1);
+}
+
+static unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa)
+{
+    uint32_t h = hash_addr(sa);
+    return h % g_conn_tbl_hash_size;
+}
+
 static void destroy_conn_pool(void)
 {
     if (g_conn_pool.connections) {
@@ -190,11 +212,6 @@ static uint32_t hash_addr(const union sockaddr_inx *a)
     return 0;
 }
 
-static unsigned int proxy_conn_hash(const union sockaddr_inx *sa)
-{
-    return hash_addr(sa) % g_conn_tbl_hash_size;
-}
-
 static inline void touch_proxy_conn(struct proxy_conn *conn)
 {
     /* Move to MRU (tail) and refresh timestamp */
@@ -206,7 +223,7 @@ static inline void touch_proxy_conn(struct proxy_conn *conn)
 static struct proxy_conn *proxy_conn_get_or_create(
         const struct config *cfg, const union sockaddr_inx *cli_addr, int epfd)
 {
-    struct list_head *chain = &conn_tbl_hbase[proxy_conn_hash(cli_addr)];
+    struct list_head *chain = &conn_tbl_hbase[bucket_index_fun(cli_addr)];
     struct proxy_conn *conn = NULL;
     int svr_sock = -1;
     struct epoll_event ev;
@@ -308,7 +325,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd)
     conn_tbl_len--;
     /* remove from LRU as well */
     list_del(&conn->lru);
-    if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF) {
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF && errno != ENOENT) {
         P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock, strerror(errno));
     }
     if (close(conn->svr_sock) < 0) {
@@ -350,6 +367,7 @@ static struct proxy_conn *alloc_proxy_conn(void)
     struct proxy_conn *conn = g_conn_pool.freelist;
     g_conn_pool.freelist = conn->next;
     g_conn_pool.used_count++;
+    assert(g_conn_pool.used_count <= g_conn_pool.capacity);
     memset(conn, 0, sizeof(*conn));
     return conn;
 }
@@ -358,6 +376,7 @@ static void release_proxy_conn_to_pool(struct proxy_conn *conn)
 {
     conn->next = g_conn_pool.freelist;
     g_conn_pool.freelist = conn;
+    assert(g_conn_pool.used_count > 0);
     g_conn_pool.used_count--;
 }
 
@@ -459,7 +478,7 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                         break;
                     }
                     if (sent == 0) {
-                        /* Shouldn't happen for non-blocking UDP, but avoid tight loop */
+                        /* Avoid tight loop if nothing progressed */
                         break;
                     }
                     remaining -= sent;
@@ -504,56 +523,56 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd)
     int r;
 
 #ifdef __linux__
-    /* Batch up to UDP_PROXY_BATCH_SZ packets from server to client */
+    /* Use recvmmsg() to batch receive from server and sendmmsg() to client */
     struct mmsghdr msgs[UDP_PROXY_BATCH_SZ];
     struct iovec   iovs[UDP_PROXY_BATCH_SZ];
     static __thread char bufs[UDP_PROXY_BATCH_SZ][UDP_PROXY_DGRAM_CAP];
-    int count = 0;
 
-    memset(msgs, 0, sizeof(msgs));
-    for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
-        iovs[i].iov_base = bufs[i];
-        iovs[i].iov_len  = UDP_PROXY_DGRAM_CAP;
-        msgs[i].msg_hdr.msg_iov = &iovs[i];
-        msgs[i].msg_hdr.msg_iovlen = 1;
-        /* Destination is the original client */
-        msgs[i].msg_hdr.msg_name = &conn->cli_addr;
-        msgs[i].msg_hdr.msg_namelen = (socklen_t)sizeof_sockaddr(&conn->cli_addr);
-    }
+    int iterations = 0;
+    const int max_iterations = 64; /* fairness cap per event */
 
-    /* Drain server socket into our batch buffers */
-    for (; count < UDP_PROXY_BATCH_SZ; count++) {
-        r = recv(conn->svr_sock, bufs[count], UDP_PROXY_DGRAM_CAP, 0);
-        if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                break; /* drained */
+    for (; iterations < max_iterations; iterations++) {
+        memset(msgs, 0, sizeof(msgs));
+        for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+            iovs[i].iov_base = bufs[i];
+            iovs[i].iov_len  = UDP_PROXY_DGRAM_CAP;
+            msgs[i].msg_hdr.msg_iov = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            /* For recvmmsg on connected UDP, msg_name must be NULL */
+            msgs[i].msg_hdr.msg_name = NULL;
+            msgs[i].msg_hdr.msg_namelen = 0;
+        }
+
+        int n = recvmmsg(conn->svr_sock, msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
+        if (n <= 0) {
+            if (n < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    break; /* drained */
+                }
+                P_LOG_WARN("recvmmsg(server): %s", strerror(errno));
+                /* fatal error on server socket: close session */
+                release_proxy_conn(conn, epfd);
             }
-            P_LOG_WARN("recv(server): %s", strerror(errno));
-            /* fatal error on server socket: close session */
-            release_proxy_conn(conn, epfd);
             return;
         }
-        /* r >= 0: forward even zero-length datagrams */
-        msgs[count].msg_len = (unsigned)r;
-        iovs[count].iov_len = (size_t)r;
-        touch_proxy_conn(conn);
 
-        /* If less than buffer size, likely drained */
-        if (r < (int)UDP_PROXY_DGRAM_CAP) {
-            count++;
-            break;
+        /* Prepare destination (original client) for each message */
+        for (int i = 0; i < n; i++) {
+            msgs[i].msg_hdr.msg_name = &conn->cli_addr;
+            msgs[i].msg_hdr.msg_namelen = (socklen_t)sizeof_sockaddr(&conn->cli_addr);
+            /* Ensure iov_len matches actual datagram size */
+            iovs[i].iov_len = msgs[i].msg_len;
+            touch_proxy_conn(conn);
         }
-    }
 
-    if (count > 0) {
-        /* Retry on partial send to avoid dropping remaining packets */
-        int remaining = count;
+        /* Send out the batch to client, retry on partial */
+        int remaining = n;
         struct mmsghdr *msgp = msgs;
         do {
             int sent = sendmmsg(lsn_sock, msgp, remaining, 0);
             if (sent < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                    /* Transient backpressure; leave rest for later */
+                    /* leave remaining for later */
                     break;
                 }
                 P_LOG_WARN("sendmmsg(client): %s", strerror(errno));
@@ -778,8 +797,7 @@ int main(int argc, char *argv[])
 #ifdef SO_REUSEPORT
     if (cfg.reuse_port) {
         if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEPORT, &b_true, sizeof(b_true)) < 0) {
-            P_LOG_WARN("setsockopt(SO_REUSEPORT): %s", strerror(errno));
-            goto cleanup;
+            P_LOG_WARN("setsockopt(SO_REUSEPORT): %s (continuing without reuseport)", strerror(errno));
         }
     }
 #endif
@@ -836,6 +854,29 @@ int main(int argc, char *argv[])
 
     /* Initialize the connection table */
     g_conn_tbl_hash_size = cfg.conn_tbl_hash_size;
+    /*
+     * Round up to the next power-of-two for faster hashing with bitmasking.
+     * Rationale:
+     *  - When size is 2^k, we can index buckets via: hash & (size - 1)
+     *    which is faster than modulus.
+     *  - This block first clamps to a sane min/max, then uses a classic
+     *    bit-twiddling trick to expand the highest set bit to all lower bits
+     *    and finally adds 1 to obtain the next power-of-two.
+     * Notes:
+     *  - Input must be > 0 (we enforce a minimum below).
+     *  - For 64-bit widths, add: v |= v >> 32.
+     */
+    if (g_conn_tbl_hash_size < 64) g_conn_tbl_hash_size = 64;
+    if (g_conn_tbl_hash_size > (1u << 20)) g_conn_tbl_hash_size = (1u << 20);
+    /* bit-twiddling: round up to next power of two */
+    unsigned v = g_conn_tbl_hash_size - 1;
+    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+    g_conn_tbl_hash_size = v + 1;
+
+    /* Select bucket indexing strategy once to avoid per-call checks */
+    bucket_index_fun = is_power_of_two(g_conn_tbl_hash_size) ? proxy_conn_hash_bitwise : proxy_conn_hash_mod;
+    assert(bucket_index_fun != NULL);
+
     conn_tbl_hbase = malloc(sizeof(struct list_head) * g_conn_tbl_hash_size);
     if (!conn_tbl_hbase) {
         P_LOG_ERR("Failed to allocate connection hash table");
