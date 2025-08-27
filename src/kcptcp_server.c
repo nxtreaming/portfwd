@@ -19,7 +19,6 @@
 
 static void print_usage(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <local_udp_addr:port> <target_tcp_addr:port>", prog);
-    P_LOG_INFO("");
     P_LOG_INFO("Options (subset; KCP tunables to be added):");
     P_LOG_INFO("  -d                 run in background (daemonize)");
     P_LOG_INFO("  -p <pidfile>       write PID to file");
@@ -70,7 +69,8 @@ int main(int argc, char **argv) {
             if (end == optarg || *end != '\0' || v <= 0) {
                 P_LOG_WARN("invalid -S value '%s'", optarg);
             } else {
-                if (v < 4096) v = 4096; if (v > (8<<20)) v = (8<<20);
+                if (v < 4096) v = 4096;
+                if (v > (8<<20)) v = (8<<20);
                 cfg.sockbuf_bytes = (int)v;
             }
             break;
