@@ -51,7 +51,7 @@
 #define TCP_PROXY_KEEPALIVE_CNT 6
 #endif
 
-/* Memory pool for connection objects */
+/* Memory pool for connection objects (default) */
 #define TCP_PROXY_CONN_POOL_SIZE 4096
 
 #define EV_MAGIC_LISTENER 0xdeadbeefU
@@ -80,13 +80,22 @@ struct conn_pool {
 
 static struct conn_pool g_conn_pool;
 
+/* Runtime tunables (overridable via CLI) */
+static int g_conn_pool_capacity = TCP_PROXY_CONN_POOL_SIZE;
+static int g_userbuf_cap_runtime = TCP_PROXY_USERBUF_CAP;
+static int g_sockbuf_cap_runtime = TCP_PROXY_SOCKBUF_CAP;
+static int g_ka_idle = TCP_PROXY_KEEPALIVE_IDLE;
+static int g_ka_intvl = TCP_PROXY_KEEPALIVE_INTVL;
+static int g_ka_cnt = TCP_PROXY_KEEPALIVE_CNT;
+static int g_backpressure_wm = TCP_PROXY_BACKPRESSURE_WM;
+
 /* Forward declaration */
 static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     struct epoll_event *ev);
 
 static void set_sock_buffers(int sockfd)
 {
-    int sz = TCP_PROXY_SOCKBUF_CAP;
+    int sz = g_sockbuf_cap_runtime;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
 }
@@ -96,9 +105,9 @@ static void set_keepalive(int sockfd)
     int on = 1;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
 #ifdef __linux__
-    int idle = TCP_PROXY_KEEPALIVE_IDLE;
-    int intvl = TCP_PROXY_KEEPALIVE_INTVL;
-    int cnt = TCP_PROXY_KEEPALIVE_CNT;
+    int idle = g_ka_idle;
+    int intvl = g_ka_intvl;
+    int cnt = g_ka_cnt;
     (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
     (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
     (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
@@ -117,7 +126,7 @@ static void set_tcp_nodelay(int sockfd)
 
 static int init_conn_pool(void)
 {
-    g_conn_pool.capacity = TCP_PROXY_CONN_POOL_SIZE;
+    g_conn_pool.capacity = (g_conn_pool_capacity > 0) ? g_conn_pool_capacity : TCP_PROXY_CONN_POOL_SIZE;
     g_conn_pool.connections = malloc(sizeof(struct proxy_conn) *
                                      (size_t)g_conn_pool.capacity);
     if (!g_conn_pool.connections) {
@@ -273,16 +282,17 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
         switch(conn->state) {
         case S_SERVER_CONNECTING:
             /* Wait for the server connection to establish. */
-            if (conn->request.dlen < conn->request.capacity)
+            if (conn->request.dlen < conn->request.capacity && conn->request.dlen < (size_t)g_backpressure_wm)
                 ev_cli.events |= EPOLLIN; /* for detecting client close */
             ev_svr.events |= EPOLLOUT;
             break;
         case S_FORWARDING:
-            if (conn->request.dlen < conn->request.capacity)
+            /* Enable reads only when below backpressure watermark */
+            if (conn->request.dlen < conn->request.capacity && conn->request.dlen < (size_t)g_backpressure_wm)
                 ev_cli.events |= EPOLLIN;
             if (conn->response.dlen > 0)
                 ev_cli.events |= EPOLLOUT;
-            if (conn->response.dlen < conn->response.capacity)
+            if (conn->response.dlen < conn->response.capacity && conn->response.dlen < (size_t)g_backpressure_wm)
                 ev_svr.events |= EPOLLIN;
             if (conn->request.dlen > 0)
                 ev_svr.events |= EPOLLOUT;
@@ -397,16 +407,16 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     set_tcp_nodelay(conn->svr_sock);
 
     /* Allocate per-connection user buffers */
-    conn->request.data = (char *)malloc(TCP_PROXY_USERBUF_CAP);
-    conn->response.data = (char *)malloc(TCP_PROXY_USERBUF_CAP);
+    conn->request.data = (char *)malloc((size_t)g_userbuf_cap_runtime);
+    conn->response.data = (char *)malloc((size_t)g_userbuf_cap_runtime);
     if (!conn->request.data || !conn->response.data) {
         P_LOG_ERR("malloc(user buffers) failed");
         goto err;
     }
-    conn->request.capacity = TCP_PROXY_USERBUF_CAP;
+    conn->request.capacity = (size_t)g_userbuf_cap_runtime;
     conn->request.dlen = 0;
     conn->request.rpos = 0;
-    conn->response.capacity = TCP_PROXY_USERBUF_CAP;
+    conn->response.capacity = (size_t)g_userbuf_cap_runtime;
     conn->response.dlen = 0;
     conn->response.rpos = 0;
 
@@ -787,6 +797,12 @@ static void show_help(const char *prog)
     P_LOG_INFO("  -r, --reuse-addr          -- set SO_REUSEADDR on listener socket");
     P_LOG_INFO("  -R, --reuse-port          -- set SO_REUSEPORT on listener socket");
     P_LOG_INFO("  -6, --v6only              -- set IPV6_V6ONLY on listener socket");
+    P_LOG_INFO("  -C <pool_size>            -- connection pool size (default: %d)", TCP_PROXY_CONN_POOL_SIZE);
+    P_LOG_INFO("  -U <userbuf_bytes>        -- per-direction user buffer size (default: %d)", TCP_PROXY_USERBUF_CAP);
+    P_LOG_INFO("  -S <sockbuf_bytes>        -- SO_RCVBUF/SO_SNDBUF size (default: %d)", TCP_PROXY_SOCKBUF_CAP);
+    P_LOG_INFO("  -I <ka_idle>              -- TCP keepalive idle seconds (default: %d)", TCP_PROXY_KEEPALIVE_IDLE);
+    P_LOG_INFO("  -N <ka_intvl>             -- TCP keepalive interval seconds (default: %d)", TCP_PROXY_KEEPALIVE_INTVL);
+    P_LOG_INFO("  -K <ka_cnt>               -- TCP keepalive probe count (default: %d)", TCP_PROXY_KEEPALIVE_CNT);
     P_LOG_INFO("  -h, --help                -- show this help");
 }
 
@@ -801,7 +817,7 @@ int main(int argc, char *argv[])
     cfg.reuse_addr = true;
 
     int opt;
-    while ((opt = getopt(argc, argv, "dp:brR6h")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:brR6hC:U:S:I:N:K:")) != -1) {
         switch (opt) {
         case 'd':
             cfg.daemonize = true;
@@ -821,6 +837,90 @@ int main(int argc, char *argv[])
         case '6':
             cfg.v6only = true;
             break;
+        case 'C': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -C value '%s', keeping default %d", optarg, g_conn_pool_capacity);
+            } else {
+                if (v < 64)
+                    v = 64;
+                if (v > (1<<20))
+                    v = (1<<20);
+                g_conn_pool_capacity = (int)v;
+            }
+            break;
+        }
+        case 'U': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -U value '%s', keeping default %d", optarg, g_userbuf_cap_runtime);
+            } else {
+                if (v < 4096)
+                    v = 4096; /* min 4KB */
+                if (v > (8<<20))
+                    v = (8<<20); /* max 8MB */
+                g_userbuf_cap_runtime = (int)v;
+            }
+            break;
+        }
+        case 'S': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -S value '%s', keeping default %d", optarg, g_sockbuf_cap_runtime);
+            } else {
+                if (v < 4096)
+                    v = 4096;
+                if (v > (8<<20))
+                    v = (8<<20);
+                g_sockbuf_cap_runtime = (int)v;
+            }
+            break;
+        }
+        case 'I': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -I value '%s', keeping default %d", optarg, g_ka_idle);
+            } else {
+                if (v < 10)
+                    v = 10;
+                if (v > 86400)
+                    v = 86400;
+                g_ka_idle = (int)v;
+            }
+            break;
+        }
+        case 'N': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -N value '%s', keeping default %d", optarg, g_ka_intvl);
+            } else {
+                if (v < 5)
+                    v = 5;
+                if (v > 3600)
+                    v = 3600;
+                g_ka_intvl = (int)v;
+            }
+            break;
+        }
+        case 'K': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -K value '%s', keeping default %d", optarg, g_ka_cnt);
+            } else {
+                if (v < 1)
+                    v = 1;
+                if (v > 100)
+                    v = 100;
+                g_ka_cnt = (int)v;
+            }
+            break;
+        }
         case 'h':
             show_help(argv[0]);
             return 0;
@@ -846,6 +946,9 @@ int main(int argc, char *argv[])
     }
 
     openlog("tcpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
+
+    /* Recompute backpressure WM if userbuf changed */
+    g_backpressure_wm = (g_userbuf_cap_runtime * 3) / 4;
 
     if (init_conn_pool() != 0) {
         closelog();
@@ -873,8 +976,7 @@ int main(int argc, char *argv[])
     if (cfg.reuse_addr) {
         int on = 1;
         if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
-            P_LOG_ERR("setsockopt(SO_REUSEADDR): %s", strerror(errno));
-            goto cleanup;
+            P_LOG_WARN("setsockopt(SO_REUSEADDR): %s (continuing without reuseaddr)", strerror(errno));
         }
     }
 
@@ -882,8 +984,7 @@ int main(int argc, char *argv[])
     if (cfg.reuse_port) {
         int on = 1;
         if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
-            P_LOG_ERR("setsockopt(SO_REUSEPORT): %s", strerror(errno));
-            goto cleanup;
+            P_LOG_WARN("setsockopt(SO_REUSEPORT): %s (continuing without reuseport)", strerror(errno));
         }
     }
 #endif
@@ -905,7 +1006,14 @@ int main(int argc, char *argv[])
 
     set_nonblock(listen_sock);
 
+    /* Prefer epoll_create1 with CLOEXEC when available */
+#ifdef EPOLL_CLOEXEC
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL))
+        epfd = epoll_create(1);
+#else
     epfd = epoll_create(1);
+#endif
     if (epfd < 0) {
         P_LOG_ERR("epoll_create(): %s", strerror(errno));
         goto cleanup;
@@ -913,6 +1021,10 @@ int main(int argc, char *argv[])
 
     struct epoll_event ev;
     ev.events = EPOLLIN;
+#ifdef EPOLLEXCLUSIVE
+    /* Reduce thundering herd with multiple processes listening on the same socket */
+    ev.events |= EPOLLEXCLUSIVE;
+#endif
     ev.data.ptr = &magic_listener;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &ev) < 0) {
         P_LOG_ERR("epoll_ctl(ADD, listener): %s", strerror(errno));
