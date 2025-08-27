@@ -25,6 +25,13 @@ kcptcp-client: kcptcp_client.o kcp_common.o 3rd/kcp/ikcp.o common.o $(NO_EPOLL_O
 kcptcp-server: kcptcp_server.o kcp_common.o kcp_map.o 3rd/kcp/ikcp.o common.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o kcptcp-server kcptcp_server.o kcp_common.o kcp_map.o 3rd/kcp/ikcp.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
+# Convenience aliases: allow underscored targets too
+.PHONY: kcptcp_client kcptcp_server
+kcptcp_client: kcptcp-client
+	@:
+kcptcp_server: kcptcp-server
+	@:
+
 tcpfwd.o: tcpfwd.c common.h proxy_conn.h
 udpfwd.o: udpfwd.c common.h proxy_conn.h
 common.o: common.c common.h
