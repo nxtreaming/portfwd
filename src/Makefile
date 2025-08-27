@@ -18,12 +18,12 @@ tcpfwd: tcpfwd.o common.o $(NO_EPOLL_O)
 udpfwd: udpfwd.o common.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd udpfwd.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
-# KCP-based TCP-over-UDP binaries (initial scaffolding; no ikcp dependency yet)
-kcptcp-client: kcptcp_client.o kcp_common.o common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o kcptcp-client kcptcp_client.o kcp_common.o common.o $(NO_EPOLL_O) $(LDFLAGS)
+# KCP-based TCP-over-UDP binaries (link with placeholder ikcp for now)
+kcptcp-client: kcptcp_client.o kcp_common.o 3rd/kcp/ikcp.o common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o kcptcp-client kcptcp_client.o kcp_common.o 3rd/kcp/ikcp.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
-kcptcp-server: kcptcp_server.o kcp_common.o kcp_map.o common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o kcptcp-server kcptcp_server.o kcp_common.o kcp_map.o common.o $(NO_EPOLL_O) $(LDFLAGS)
+kcptcp-server: kcptcp_server.o kcp_common.o kcp_map.o 3rd/kcp/ikcp.o common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o kcptcp-server kcptcp_server.o kcp_common.o kcp_map.o 3rd/kcp/ikcp.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
 tcpfwd.o: tcpfwd.c common.h proxy_conn.h
 udpfwd.o: udpfwd.c common.h proxy_conn.h
@@ -33,6 +33,10 @@ kcptcp_client.o: kcptcp_client.c common.h proxy_conn.h
 kcptcp_server.o: kcptcp_server.c common.h proxy_conn.h
 kcp_common.o: kcp_common.c kcp_common.h proxy_conn.h common.h
 kcp_map.o: kcp_map.c kcp_map.h proxy_conn.h common.h
+
+# Placeholder KCP vendor objects
+3rd/kcp/ikcp.o: 3rd/kcp/ikcp.c 3rd/kcp/ikcp.h
+	$(CC) $(CFLAGS) -c -o 3rd/kcp/ikcp.o 3rd/kcp/ikcp.c
 
 install: all
 	mkdir -p $(PREFIX)/bin
