@@ -437,12 +437,26 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                 /* s_msgs already configured in init loop */
             }
 
-            int sent = sendmmsg(b->sock, s_msgs, b->count, 0);
-            if (sent < 0) {
-                P_LOG_WARN("sendmmsg(server): %s", strerror(errno));
-            } else if (sent != b->count) {
-                P_LOG_WARN("sendmmsg(server): partial send, sent %d of %d", sent, b->count);
-            }
+            /* Retry on partial send to avoid dropping remaining packets */
+            int remaining = b->count;
+            struct mmsghdr *msgp = s_msgs;
+            do {
+                int sent = sendmmsg(b->sock, msgp, remaining, 0);
+                if (sent < 0) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                        /* Transient backpressure; give up remaining for now */
+                        break;
+                    }
+                    P_LOG_WARN("sendmmsg(server): %s", strerror(errno));
+                    break;
+                }
+                if (sent == 0) {
+                    /* Shouldn't happen for non-blocking UDP, but avoid tight loop */
+                    break;
+                }
+                remaining -= sent;
+                msgp += sent;
+            } while (remaining > 0);
         }
         return;
     }
@@ -519,13 +533,26 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd)
     }
 
     if (count > 0) {
-        int sent = sendmmsg(lsn_sock, msgs, count, 0);
-        if (sent < 0) {
-            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+        /* Retry on partial send to avoid dropping remaining packets */
+        int remaining = count;
+        struct mmsghdr *msgp = msgs;
+        do {
+            int sent = sendmmsg(lsn_sock, msgp, remaining, 0);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                    /* Transient backpressure; leave rest for later */
+                    break;
+                }
                 P_LOG_WARN("sendmmsg(client): %s", strerror(errno));
-        } else if (sent != count) {
-            P_LOG_WARN("sendmmsg(client): partial send, sent %d of %d", sent, count);
-        }
+                break;
+            }
+            if (sent == 0) {
+                /* Avoid tight loop if nothing progressed */
+                break;
+            }
+            remaining -= sent;
+            msgp += sent;
+        } while (remaining > 0);
     }
     return;
 #else
