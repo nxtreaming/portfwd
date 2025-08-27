@@ -3,6 +3,10 @@
 
 #include "list.h"
 #include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <time.h>
+#include "common.h" /* for union sockaddr_inx */
 
 /* Forward declaration to avoid forcing ikcp.h inclusion here */
 struct IKCPCB;
