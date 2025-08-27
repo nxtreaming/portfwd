@@ -68,9 +68,10 @@ struct config {
 static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
 static unsigned conn_tbl_len;
+
 /* Function pointer to compute bucket index from a 32-bit hash. */
-/* Function pointer to compute bucket index from a client address. */
 static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
+static uint32_t hash_addr(const union sockaddr_inx *a);
 
 struct conn_pool {
     struct proxy_conn *connections;
@@ -520,8 +521,6 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
 
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd)
 {
-    int r;
-
 #ifdef __linux__
     /* Use recvmmsg() to batch receive from server and sendmmsg() to client */
     struct mmsghdr msgs[UDP_PROXY_BATCH_SZ];
@@ -589,6 +588,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd)
     return;
 #else
     char buffer[UDP_PROXY_DGRAM_CAP];
+    int r;
 
     for (;;) {
         r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
