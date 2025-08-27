@@ -55,7 +55,10 @@ int kcp_map_put(struct kcp_map *m, uint32_t conv, struct proxy_conn *c) {
     struct list_head *head = &m->buckets[idx].head;
     struct kcp_map_entry *e;
     list_for_each_entry(e, head, node) {
-        if (e->conv == conv) { e->conn = c; return 0; }
+        if (e->conv == conv) {
+            e->conn = c;
+            return 0;
+        }
     }
     e = (struct kcp_map_entry*)calloc(1, sizeof(*e));
     if (!e) return -1;

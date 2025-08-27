@@ -660,7 +660,8 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
             }
         }
         if (buf->rpos >= buf->dlen) {
-            buf->rpos = buf->dlen = 0; // Compact buffer
+            buf->rpos = 0;
+            buf->dlen = 0; // Compact buffer
         }
     }
 

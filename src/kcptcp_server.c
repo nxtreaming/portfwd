@@ -43,8 +43,7 @@ struct cfg_server {
     int sockbuf_bytes;
 };
 
-static void set_sock_buffers_sz(int sockfd, int bytes)
-{
+static void set_sock_buffers_sz(int sockfd, int bytes) {
     if (bytes <= 0) return;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
@@ -55,22 +54,35 @@ int main(int argc, char **argv) {
     int epfd = -1, usock = -1;
     uint32_t magic_listener = 0xcafef00dU;
     struct cfg_server cfg;
-    struct kcp_map cmap; memset(&cmap, 0, sizeof(cmap));
-    struct list_head conns; INIT_LIST_HEAD(&conns);
+    struct kcp_map cmap;
+    struct list_head conns;
+    INIT_LIST_HEAD(&conns);
 
+    memset(&cmap, 0, sizeof(cmap));
     memset(&cfg, 0, sizeof(cfg));
     cfg.reuse_addr = true;
 
     int opt;
     while ((opt = getopt(argc, argv, "dp:rR6S:h")) != -1) {
         switch (opt) {
-        case 'd': cfg.daemonize = true; break;
-        case 'p': cfg.pidfile = optarg; break;
-        case 'r': cfg.reuse_addr = true; break;
-        case 'R': cfg.reuse_port = true; break;
-        case '6': cfg.v6only = true; break;
+        case 'd':
+            cfg.daemonize = true;
+            break;
+        case 'p':
+            cfg.pidfile = optarg;
+            break;
+        case 'r':
+            cfg.reuse_addr = true;
+            break;
+        case 'R':
+            cfg.reuse_port = true;
+            break;
+        case '6':
+            cfg.v6only = true;
+            break;
         case 'S': {
-            char *end = NULL; long v = strtol(optarg, &end, 10);
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v <= 0) {
                 P_LOG_WARN("invalid -S value '%s'", optarg);
             } else {
@@ -80,7 +92,8 @@ int main(int argc, char **argv) {
             }
             break;
         }
-        case 'h': default:
+        case 'h':
+        default:
             print_usage(argv[0]);
             return (opt == 'h') ? 0 : 2;
         }
@@ -101,7 +114,8 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.daemonize) {
-        if (do_daemonize() != 0) return 1;
+        if (do_daemonize() != 0)
+            return 1;
         g_state.daemonized = true;
     }
     setup_signal_handlers();
@@ -113,41 +127,58 @@ int main(int argc, char **argv) {
     }
 
     epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0) { P_LOG_ERR("epoll_create1: %s", strerror(errno)); goto cleanup; }
+    if (epfd < 0) {
+        P_LOG_ERR("epoll_create1: %s", strerror(errno));
+        goto cleanup;
+    }
 
     /* Create UDP listen socket */
     usock = socket(cfg.laddr.sa.sa_family, SOCK_DGRAM, 0);
-    if (usock < 0) { P_LOG_ERR("socket(udp): %s", strerror(errno)); goto cleanup; }
+    if (usock < 0) {
+        P_LOG_ERR("socket(udp): %s", strerror(errno));
+        goto cleanup;
+    }
     if (cfg.reuse_addr) {
-        int on = 1; (void)setsockopt(usock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        int on = 1;
+        (void)setsockopt(usock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
     }
 #ifdef SO_REUSEPORT
     if (cfg.reuse_port) {
-        int on = 1; (void)setsockopt(usock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+        int on = 1; 
+        (void)setsockopt(usock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
     }
 #endif
 #ifdef IPV6_V6ONLY
     if (cfg.v6only && cfg.laddr.sa.sa_family == AF_INET6) {
-        int on = 1; (void)setsockopt(usock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+        int on = 1;
+        (void)setsockopt(usock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
     }
 #endif
     set_nonblock(usock);
     set_sock_buffers_sz(usock, cfg.sockbuf_bytes);
     if (bind(usock, &cfg.laddr.sa, (socklen_t)sizeof_sockaddr(&cfg.laddr)) < 0) {
-        P_LOG_ERR("bind(udp): %s", strerror(errno)); goto cleanup;
+        P_LOG_ERR("bind(udp): %s", strerror(errno));
+        goto cleanup;
     }
 
     struct epoll_event ev = {0};
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
     ev.data.ptr = &magic_listener; /* tag udp listener */
-    if (ep_add_or_mod(epfd, usock, &ev) < 0) { P_LOG_ERR("epoll_ctl add udp: %s", strerror(errno)); goto cleanup; }
+    if (ep_add_or_mod(epfd, usock, &ev) < 0) {
+        P_LOG_ERR("epoll_ctl add udp: %s", strerror(errno));
+        goto cleanup;
+    }
 
-    if (kcp_map_init(&cmap, 1024) != 0) { P_LOG_ERR("kcp_map_init failed"); goto cleanup; }
+    if (kcp_map_init(&cmap, 1024) != 0) {
+        P_LOG_ERR("kcp_map_init failed");
+        goto cleanup;
+    }
 
     P_LOG_INFO("kcptcp-server running: UDP %s -> TCP %s",
                sockaddr_to_string(&cfg.laddr), sockaddr_to_string(&cfg.taddr));
 
-    struct kcp_opts kopts; kcp_opts_set_defaults(&kopts);
+    struct kcp_opts kopts;
+    kcp_opts_set_defaults(&kopts);
 
     while (!g_state.terminate) {
         /* Compute timeout from all KCP sessions */
@@ -157,14 +188,20 @@ int main(int argc, char **argv) {
         list_for_each_entry(pc, &conns, list) {
             uint32_t due = ikcp_check(pc->kcp, now);
             int t = (int)((due > now) ? (due - now) : 0);
-            if (t < timeout_ms) timeout_ms = t;
+            if (t < timeout_ms)
+                timeout_ms = t;
         }
 
         struct epoll_event events[128];
         int nfds = epoll_wait(epfd, events, 128, timeout_ms);
         if (nfds < 0) {
-            if (errno == EINTR) { /* continue to timer */ }
-            else { P_LOG_ERR("epoll_wait: %s", strerror(errno)); break; }
+            if (errno == EINTR) {
+                /* continue to timer */
+            }
+            else {
+                P_LOG_ERR("epoll_wait: %s", strerror(errno));
+                break;
+            }
         }
 
         for (int i = 0; i < nfds; ++i) {
@@ -173,27 +210,41 @@ int main(int argc, char **argv) {
                 /* UDP packet(s) */
                 for (;;) {
                     char buf[64 * 1024];
-                    union sockaddr_inx ra; socklen_t ralen = sizeof(ra);
+                    union sockaddr_inx ra;
+                    socklen_t ralen = sizeof(ra);
                     ssize_t rn = recvfrom(usock, buf, sizeof(buf), MSG_DONTWAIT, &ra.sa, &ralen);
                     if (rn < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            break;
                         P_LOG_ERR("recvfrom: %s", strerror(errno));
                         break;
                     }
-                    if (rn == 0) break;
+                    if (rn == 0)
+                        break;
                     /* Extract conv and route */
                     uint32_t conv = ikcp_getconv(buf);
                     struct proxy_conn *c = kcp_map_get(&cmap, conv);
                     if (!c) {
                         /* New connection: create TCP to target */
                         int ts = socket(cfg.taddr.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
-                        if (ts < 0) { P_LOG_ERR("socket(tcp): %s", strerror(errno)); continue; }
+                        if (ts < 0) {
+                            P_LOG_ERR("socket(tcp): %s", strerror(errno));
+                            continue;
+                        }
                         (void)set_sock_buffers_sz(ts, cfg.sockbuf_bytes);
                         int cr = connect(ts, &cfg.taddr.sa, (socklen_t)sizeof_sockaddr(&cfg.taddr));
-                        if (cr < 0 && errno != EINPROGRESS) { P_LOG_ERR("connect: %s", strerror(errno)); close(ts); continue; }
+                        if (cr < 0 && errno != EINPROGRESS) {
+                            P_LOG_ERR("connect: %s", strerror(errno));
+                            close(ts);
+                            continue;
+                        }
 
                         c = (struct proxy_conn*)calloc(1, sizeof(*c));
-                        if (!c) { P_LOG_ERR("calloc conn"); close(ts); continue; }
+                        if (!c) {
+                            P_LOG_ERR("calloc conn");
+                            close(ts);
+                            continue;
+                        }
                         INIT_LIST_HEAD(&c->list);
                         c->state = S_SERVER_CONNECTING;
                         c->svr_sock = ts;
@@ -204,14 +255,22 @@ int main(int argc, char **argv) {
 
                         if (kcp_setup_conn(c, usock, &ra, conv, &kopts) != 0) {
                             P_LOG_ERR("kcp_setup_conn failed");
-                            close(ts); free(c); continue;
+                            close(ts);
+                            free(c);
+                            continue;
                         }
 
                         /* Register TCP server socket */
                         struct epoll_event tev = {0};
                         tev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
                         tev.data.ptr = c;
-                        if (ep_add_or_mod(epfd, ts, &tev) < 0) { P_LOG_ERR("epoll add tcp: %s", strerror(errno)); ikcp_release(c->kcp); close(ts); free(c); continue; }
+                        if (ep_add_or_mod(epfd, ts, &tev) < 0) {
+                            P_LOG_ERR("epoll add tcp: %s", strerror(errno));
+                            ikcp_release(c->kcp);
+                            close(ts);
+                            free(c);
+                            continue;
+                        }
 
                         list_add_tail(&c->list, &conns);
                         (void)kcp_map_put(&cmap, conv, c);
@@ -223,14 +282,21 @@ int main(int argc, char **argv) {
                     /* Drain to TCP */
                     for (;;) {
                         int peek = ikcp_peeksize(c->kcp);
-                        if (peek < 0) break;
-                        if (peek > (int)sizeof(buf)) peek = (int)sizeof(buf);
+                        if (peek < 0)
+                            break;
+                        if (peek > (int)sizeof(buf))
+                            peek = (int)sizeof(buf);
                         int got = ikcp_recv(c->kcp, buf, peek);
-                        if (got <= 0) break;
+                        if (got <= 0)
+                            break;
                         ssize_t wn = send(c->svr_sock, buf, (size_t)got, MSG_NOSIGNAL);
                         if (wn < 0) {
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) { /* drop for now */ break; }
-                            c->state = S_CLOSING; break;
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                /* drop for now */
+                                break;
+                            }
+                            c->state = S_CLOSING;
+                            break;
                         }
                     }
                     c->last_active = time(NULL);
@@ -244,7 +310,8 @@ int main(int argc, char **argv) {
                 c->state = S_CLOSING;
             }
             if ((events[i].events & EPOLLOUT) && c->state == S_SERVER_CONNECTING) {
-                int err = 0; socklen_t elen = sizeof(err);
+                int err = 0;
+                socklen_t elen = sizeof(err);
                 if (getsockopt(c->svr_sock, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err == 0) {
                     c->state = S_FORWARDING;
                 } else {
@@ -256,10 +323,16 @@ int main(int argc, char **argv) {
                 ssize_t rn;
                 while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) > 0) {
                     int sn = ikcp_send(c->kcp, sbuf, (int)rn);
-                    if (sn < 0) { c->state = S_CLOSING; break; }
+                    if (sn < 0) {
+                        c->state = S_CLOSING;
+                        break;
+                    }
                 }
-                if (rn == 0) { c->state = S_CLOSING; }
-                else if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { c->state = S_CLOSING; }
+                if (rn == 0) {
+                    c->state = S_CLOSING;
+                } else if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+                    c->state = S_CLOSING;
+                }
             }
         }
 

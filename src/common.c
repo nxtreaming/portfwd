@@ -10,14 +10,12 @@ struct app_state g_state = {
     .daemonized = false
 };
 
-void on_signal(int sig)
-{
+void on_signal(int sig) {
     (void)sig;
     g_state.terminate = 1;
 }
 
-void cleanup_pidfile(void)
-{
+void cleanup_pidfile(void) {
     if (g_state.pidfile_fd >= 0) {
         if (close(g_state.pidfile_fd) < 0) {
             P_LOG_WARN("close(pidfile): %s", strerror(errno));
@@ -29,8 +27,7 @@ void cleanup_pidfile(void)
     }
 }
 
-int write_pidfile(const char *filepath)
-{
+int write_pidfile(const char *filepath) {
     char buf[32];
     ssize_t wlen;
     pid_t pid = getpid();
@@ -93,8 +90,7 @@ int write_pidfile(const char *filepath)
     return 0;
 }
 
-int do_daemonize(void)
-{
+int do_daemonize(void) {
     int rc;
 
     if ((rc = fork()) < 0) {
@@ -122,8 +118,7 @@ int do_daemonize(void)
     return 0;
 }
 
-void setup_signal_handlers(void)
-{
+void setup_signal_handlers(void) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = on_signal;
@@ -136,8 +131,7 @@ void setup_signal_handlers(void)
     signal(SIGPIPE, SIG_IGN);
 }
 
-void set_nonblock(int sockfd)
-{
+void set_nonblock(int sockfd) {
     int flags;
 
     /* Set O_NONBLOCK */
@@ -161,31 +155,27 @@ void set_nonblock(int sockfd)
     }
 }
 
-void *addr_of_sockaddr(const union sockaddr_inx *addr)
-{
+void *addr_of_sockaddr(const union sockaddr_inx *addr) {
     assert(addr->sa.sa_family == AF_INET || addr->sa.sa_family == AF_INET6);
     if (addr->sa.sa_family == AF_INET6)
         return (void *)&addr->sin6.sin6_addr;
     return (void *)&addr->sin.sin_addr;
 }
 
-const unsigned short *port_of_sockaddr(const union sockaddr_inx *addr)
-{
+const unsigned short *port_of_sockaddr(const union sockaddr_inx *addr) {
     if (addr->sa.sa_family == AF_INET)
         return &addr->sin.sin_port;
     else
         return &addr->sin6.sin6_port;
 }
 
-size_t sizeof_sockaddr(const union sockaddr_inx *addr)
-{
+size_t sizeof_sockaddr(const union sockaddr_inx *addr) {
     if (addr->sa.sa_family == AF_INET6)
         return sizeof(struct sockaddr_in6);
     return sizeof(struct sockaddr_in);
 }
 
-bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b)
-{
+bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b) {
     if (a->sa.sa_family != b->sa.sa_family)
         return false;
     if (*port_of_sockaddr(a) != *port_of_sockaddr(b))
@@ -199,8 +189,7 @@ bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx
     return false;
 }
 
-int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
-{
+int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp) {
     char s_addr[256];
     char *host = NULL, *port = NULL;
     struct addrinfo hints, *result = NULL;
@@ -251,19 +240,18 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
     return 0;
 }
 
-void epoll_close_comp(int epfd)
-{
+void epoll_close_comp(int epfd) {
     if (epfd >= 0)
         close(epfd);
 }
 
-const char *sockaddr_to_string(const union sockaddr_inx *addr)
-{
+const char *sockaddr_to_string(const union sockaddr_inx *addr) {
     static char buf[128];
     if (!addr) return "(null)";
     void *a = addr_of_sockaddr(addr);
     unsigned short port = ntohs(*port_of_sockaddr(addr));
-    char ip[96]; ip[0] = '\0';
+    char ip[96];
+    ip[0] = '\0';
     if (addr->sa.sa_family == AF_INET6) {
         if (inet_ntop(AF_INET6, a, ip, sizeof(ip)) == NULL) {
             snprintf(ip, sizeof(ip), "?");
@@ -280,8 +268,8 @@ const char *sockaddr_to_string(const union sockaddr_inx *addr)
     return buf;
 }
 
-int ep_del(int epfd, int sock)
-{
-    struct epoll_event ev; memset(&ev, 0, sizeof(ev));
+int ep_del(int epfd, int sock) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
     return epoll_ctl(epfd, EPOLL_CTL_DEL, sock, &ev);
 }

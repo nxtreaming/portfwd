@@ -12,8 +12,7 @@
 #endif
 
 /* Output callback: sendto over UDP */
-static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *user)
-{
+static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *user) {
     (void)kcp;
     struct proxy_conn *pc = (struct proxy_conn*)user;
     if (!pc) return -1;

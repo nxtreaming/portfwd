@@ -48,8 +48,7 @@ static void ht_destroy(struct ht *ht) {
     free(ht);
 }
 
-static void cleanup_pseudo_epolls(void)
-{
+static void cleanup_pseudo_epolls(void) {
     if (pseudo_epolls) {
         for (size_t i = 0; i < pseudo_epolls_cap; i++) {
             if (pseudo_epolls[i]) {
@@ -65,8 +64,7 @@ static void cleanup_pseudo_epolls(void)
     }
 }
 
-int epoll_create(int size)
-{
+int epoll_create(int size) {
     if (pseudo_epolls == NULL) {
         atexit(cleanup_pseudo_epolls);
     }
@@ -150,8 +148,7 @@ int epoll_create(int size)
     return (int)old_cap;
 }
 
-int epoll_close(int epfd)
-{
+int epoll_close(int epfd) {
     if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
         errno = EINVAL;
         return -1;
@@ -166,8 +163,7 @@ int epoll_close(int epfd)
     return 0;
 }
 
-int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event)
-{
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
     if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
         errno = EINVAL;
         return -1;
@@ -343,8 +339,7 @@ static int ht_remove(struct ht *ht, int fd) {
     return -1; /* Not found */
 }
 
-int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)
-{
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
     if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
         errno = EINVAL;
         return -1;
