@@ -883,11 +883,18 @@ int main(int argc, char *argv[])
      *  - Input must be > 0 (we enforce a minimum below).
      *  - For 64-bit widths, add: v |= v >> 32.
      */
-    if (g_conn_tbl_hash_size < 64) g_conn_tbl_hash_size = 64;
-    if (g_conn_tbl_hash_size > (1u << 20)) g_conn_tbl_hash_size = (1u << 20);
+    if (g_conn_tbl_hash_size < 64)
+        g_conn_tbl_hash_size = 64;
+    if (g_conn_tbl_hash_size > (1u << 20))
+        g_conn_tbl_hash_size = (1u << 20);
     /* bit-twiddling: round up to next power of two */
     unsigned v = g_conn_tbl_hash_size - 1;
-    v |= v >> 1; v |= v >> 2; v |= v >> 4; v |= v >> 8; v |= v >> 16;
+
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
     g_conn_tbl_hash_size = v + 1;
 
     /* Select bucket indexing strategy once to avoid per-call checks */
