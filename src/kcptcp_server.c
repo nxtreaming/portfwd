@@ -210,9 +210,9 @@ int main(int argc, char **argv) {
                 /* UDP packet(s) */
                 for (;;) {
                     char buf[64 * 1024];
-                    union sockaddr_inx ra;
-                    socklen_t ralen = sizeof(ra);
-                    ssize_t rn = recvfrom(usock, buf, sizeof(buf), MSG_DONTWAIT, &ra.sa, &ralen);
+                    struct sockaddr_storage rss;
+                    socklen_t ralen = sizeof(rss);
+                    ssize_t rn = recvfrom(usock, buf, sizeof(buf), MSG_DONTWAIT, (struct sockaddr*)&rss, &ralen);
                     if (rn < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK)
                             break;
@@ -221,9 +221,30 @@ int main(int argc, char **argv) {
                     }
                     if (rn == 0)
                         break;
+                    /* Basic sanity: KCP header is 24 bytes */
+                    if (rn < 24) {
+                        P_LOG_WARN("drop short UDP pkt len=%zd", rn);
+                        continue;
+                    }
+                    /* Build union sockaddr_inx from rss */
+                    union sockaddr_inx ra;
+                    memset(&ra, 0, sizeof(ra));
+                    if (rss.ss_family == AF_INET) {
+                        ra.sin = *(struct sockaddr_in*)&rss;
+                    } else if (rss.ss_family == AF_INET6) {
+                        ra.sin6 = *(struct sockaddr_in6*)&rss;
+                    } else {
+                        P_LOG_WARN("drop UDP from unknown family=%d", (int)rss.ss_family);
+                        continue;
+                    }
                     /* Extract conv and route */
                     uint32_t conv = ikcp_getconv(buf);
                     struct proxy_conn *c = kcp_map_get(&cmap, conv);
+                    if (c && !is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
+                        P_LOG_WARN("drop UDP conv=%u from unexpected %s (expected %s)",
+                                   conv, sockaddr_to_string(&ra), sockaddr_to_string(&c->peer_addr));
+                        continue;
+                    }
                     if (!c) {
                         /* New connection: create TCP to target */
                         int ts = socket(cfg.taddr.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
