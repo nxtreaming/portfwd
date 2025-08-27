@@ -289,7 +289,29 @@ int main(int argc, char **argv) {
                 socklen_t rlen = sizeof(rss);
                 ssize_t rn = recvfrom(c->udp_sock, ubuf, sizeof(ubuf), MSG_DONTWAIT, (struct sockaddr*)&rss, &rlen);
                 if (rn > 0) {
-                    (void)ikcp_input(c->kcp, ubuf, (long)rn);
+                    /* Validate UDP source address matches expected peer */
+                    union sockaddr_inx ra;
+                    memset(&ra, 0, sizeof(ra));
+                    if (rss.ss_family == AF_INET) {
+                        struct sockaddr_in *in4 = (struct sockaddr_in*)&rss;
+                        ra.sin = *in4;
+                    } else if (rss.ss_family == AF_INET6) {
+                        struct sockaddr_in6 *in6 = (struct sockaddr_in6*)&rss;
+                        ra.sin6 = *in6;
+                    } else {
+                        /* Unknown family: drop */
+                        rn = -1;
+                    }
+                    if (rn > 0) {
+                        if (!is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
+                            P_LOG_WARN("dropping UDP from unexpected %s (expected %s)",
+                                       sockaddr_to_string(&ra), sockaddr_to_string(&c->peer_addr));
+                            rn = -1; /* mark as ignored */
+                        }
+                    }
+                    if (rn > 0) {
+                        (void)ikcp_input(c->kcp, ubuf, (long)rn);
+                    }
                     /* Drain KCP to TCP */
                     for (;;) {
                         int peek = ikcp_peeksize(c->kcp);
