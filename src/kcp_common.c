@@ -6,6 +6,9 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #ifndef MSG_DONTWAIT
 #define MSG_DONTWAIT 0
@@ -27,8 +30,13 @@ static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *use
 
 uint32_t kcp_now_ms(void) {
 #if defined(_WIN32)
-    /* Fallback: use CLOCK_MONOTONIC-like via GetTickCount if desired; for now use time() */
-    return (uint32_t)(time(NULL) * 1000u);
+# if defined(_WIN32_WINNT) && (_WIN32_WINNT >= 0x0600)
+    /* Windows Vista+ */
+    return (uint32_t)GetTickCount64();
+# else
+    /* Older Windows: 32-bit tick (wraps ~49 days) */
+    return (uint32_t)GetTickCount();
+# endif
 #else
 # ifdef CLOCK_MONOTONIC
     struct timespec ts;
