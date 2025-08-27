@@ -733,7 +733,6 @@ int main(int argc, char *argv[])
             }
             break;
         }
-            break;
         case 'd':
             cfg.daemonize = true;
             break;
@@ -767,7 +766,6 @@ int main(int argc, char *argv[])
             }
             break;
         }
-            break;
         default:
             print_usage();
             return 1;
@@ -810,10 +808,8 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
     if (cfg.reuse_addr) {
-        if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true, sizeof(b_true)) < 0) {
-            P_LOG_WARN("setsockopt(SO_REUSEADDR): %s", strerror(errno));
-            goto cleanup;
-        }
+        if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true, sizeof(b_true)) < 0)
+            P_LOG_WARN("setsockopt(SO_REUSEADDR): %s (continuing without reuseaddr)", strerror(errno));
     }
 #ifdef SO_REUSEPORT
     if (cfg.reuse_port) {
