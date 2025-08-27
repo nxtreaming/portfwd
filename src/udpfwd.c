@@ -727,8 +727,10 @@ int main(int argc, char *argv[])
             if (end == optarg || *end != '\0') {
                 P_LOG_WARN("invalid -t value '%s', keeping default %u", optarg, cfg.proxy_conn_timeo);
             } else {
-                if (v == 0) v = 1;                 /* minimum 1s */
-                if (v > 86400UL) v = 86400UL;      /* cap at 1 day */
+                if (v == 0)
+                    v = 1;
+                if (v > 86400UL)
+                    v = 86400UL;
                 cfg.proxy_conn_timeo = (unsigned)v;
             }
             break;
@@ -759,16 +761,20 @@ int main(int argc, char *argv[])
             if (end == optarg || *end != '\0') {
                 P_LOG_WARN("invalid -H value '%s', keeping default %u", optarg, cfg.conn_tbl_hash_size);
             } else {
-                if (v == 0) v = 4093UL;            /* legacy default */
-                if (v < 64UL) v = 64UL;            /* sane minimum */
-                if (v > (1UL << 20)) v = (1UL << 20); /* prevent huge allocs */
+                if (v == 0)
+                    v = 4093UL;
+                if (v < 64UL)
+                    v = 64UL;
+                if (v > (1UL << 20))
+                    v = (1UL << 20);
                 cfg.conn_tbl_hash_size = (unsigned)v;
             }
             break;
         }
         default:
-            print_usage();
-            return 1;
+            show_help(argv[0]);
+            rc = 1;
+            goto cleanup;
         }
     }
 
