@@ -82,6 +82,13 @@ struct conn_pool {
 
 static struct conn_pool g_conn_pool;
 
+/* Runtime tunables (overridable via CLI) */
+static int g_sockbuf_cap_runtime = UDP_PROXY_SOCKBUF_CAP;
+static int g_conn_pool_capacity = UDP_PROXY_MAX_CONNS;
+#ifdef __linux__
+static int g_batch_sz_runtime = UDP_PROXY_BATCH_SZ; /* for recvmmsg/sendmmsg */
+#endif
+
 /* Global LRU list for O(1) oldest selection */
 static LIST_HEAD(g_lru_list);
 
@@ -120,7 +127,7 @@ static void destroy_batching_resources(
 
 static int init_conn_pool(void)
 {
-    g_conn_pool.capacity = UDP_PROXY_MAX_CONNS;
+    g_conn_pool.capacity = (g_conn_pool_capacity > 0) ? g_conn_pool_capacity : UDP_PROXY_MAX_CONNS;
     g_conn_pool.connections = malloc(sizeof(struct proxy_conn) *
                                      (size_t)g_conn_pool.capacity);
     if (!g_conn_pool.connections) {
@@ -169,7 +176,7 @@ static void destroy_conn_pool(void)
 
 static void set_sock_buffers(int sockfd)
 {
-    int sz = UDP_PROXY_SOCKBUF_CAP;
+    int sz = g_sockbuf_cap_runtime;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
 }
@@ -238,23 +245,33 @@ static struct proxy_conn *proxy_conn_get_or_create(
     }
 
     /* Enforce connection capacity */
-    if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
+    if (conn_tbl_len >= (unsigned)g_conn_pool.capacity) {
         /* First, try to recycle any timed-out connections */
         proxy_conn_walk_continue(cfg, conn_tbl_len, epfd);
 
         /* If still full, try to evict the oldest connection */
-        if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
+        if (conn_tbl_len >= (unsigned)g_conn_pool.capacity) {
             proxy_conn_evict_one(epfd);
         }
 
         /* If still full after all attempts, drop the new connection */
-        if (conn_tbl_len >= UDP_PROXY_MAX_CONNS) {
+        if (conn_tbl_len >= (unsigned)g_conn_pool.capacity) {
             inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
                       s_addr, sizeof(s_addr));
             P_LOG_WARN("Conn table full (%u), dropping %s:%d",
                        conn_tbl_len, s_addr, ntohs(*port_of_sockaddr(cli_addr)));
             goto err;
         }
+    }
+
+    /* High-water one-time warning at ~90% capacity */
+    static bool warned_high_water = false;
+    if (!warned_high_water && g_conn_pool.capacity > 0 &&
+        conn_tbl_len >= (unsigned)((g_conn_pool.capacity * 9) / 10)) {
+        P_LOG_WARN("UDP conn table high-water: %u/%d (~%d%%). Consider raising -C or reducing -t.",
+                   conn_tbl_len, g_conn_pool.capacity,
+                   (int)((conn_tbl_len * 100) / (unsigned)g_conn_pool.capacity));
+        warned_high_water = true;
     }
 
     /* ------------------------------------------ */
@@ -415,13 +432,14 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
         /* Drain multiple batches per epoll wake to reduce syscalls */
         int iterations = 0;
         const int max_iterations = 64; /* fairness cap per tick */
+        const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
         for (; iterations < max_iterations; iterations++) {
             /* Ensure namelen is reset before each recvmmsg call */
-            for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+            for (int i = 0; i < ncap; i++) {
                 c_msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
             }
 
-            int n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
+            int n = recvmmsg(lsn_sock, c_msgs, ncap, 0, NULL);
             if (n <= 0) {
                 if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
                     P_LOG_WARN("recvmmsg(): %s", strerror(errno));
@@ -488,7 +506,7 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
             }
 
             /* If we read fewer than the batch, likely drained; stop early */
-            if (n < UDP_PROXY_BATCH_SZ)
+            if (n < ncap)
                 break;
         }
         return;
@@ -529,10 +547,11 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd)
 
     int iterations = 0;
     const int max_iterations = 64; /* fairness cap per event */
+    const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
 
     for (; iterations < max_iterations; iterations++) {
         memset(msgs, 0, sizeof(msgs));
-        for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+        for (int i = 0; i < ncap; i++) {
             iovs[i].iov_base = bufs[i];
             iovs[i].iov_len  = UDP_PROXY_DGRAM_CAP;
             msgs[i].msg_hdr.msg_iov = &iovs[i];
@@ -542,7 +561,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd)
             msgs[i].msg_hdr.msg_namelen = 0;
         }
 
-        int n = recvmmsg(conn->svr_sock, msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
+        int n = recvmmsg(conn->svr_sock, msgs, ncap, 0, NULL);
         if (n <= 0) {
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
@@ -623,12 +642,13 @@ static void init_batching_resources(
     struct sockaddr_storage **c_addrs, char (**c_bufs)[UDP_PROXY_DGRAM_CAP],
     struct mmsghdr **s_msgs, struct iovec **s_iovs)
 {
-    *c_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_msgs));
-    *c_iov = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_iov));
-    *c_addrs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_addrs));
-    *c_bufs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**c_bufs));
-    *s_msgs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**s_msgs));
-    *s_iovs = calloc(UDP_PROXY_BATCH_SZ, sizeof(**s_iovs));
+    int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
+    *c_msgs = calloc(ncap, sizeof(**c_msgs));
+    *c_iov = calloc(ncap, sizeof(**c_iov));
+    *c_addrs = calloc(ncap, sizeof(**c_addrs));
+    *c_bufs = calloc(ncap, sizeof(**c_bufs));
+    *s_msgs = calloc(ncap, sizeof(**s_msgs));
+    *s_iovs = calloc(ncap, sizeof(**s_iovs));
 
     if (!*c_msgs || !*c_iov || !*c_addrs || !*c_bufs || !*s_msgs || !*s_iovs) {
         P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
@@ -648,7 +668,7 @@ static void init_batching_resources(
         return;
     }
 
-    for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+    for (int i = 0; i < ncap; i++) {
         (*c_iov)[i].iov_base = (*c_bufs)[i];
         (*c_iov)[i].iov_len = UDP_PROXY_DGRAM_CAP;
         (*c_msgs)[i].msg_hdr.msg_iov = &(*c_iov)[i];
@@ -691,6 +711,10 @@ static void show_help(const char *prog)
     P_LOG_INFO("  -o               IPv6 listener accepts IPv6 only (sets IPV6_V6ONLY)");
     P_LOG_INFO("  -r, --reuse-addr set SO_REUSEADDR before binding local port");
     P_LOG_INFO("  -R, --reuse-port set SO_REUSEPORT before binding local port");
+    P_LOG_INFO("  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d)", UDP_PROXY_SOCKBUF_CAP);
+    P_LOG_INFO("  -C <max_conns>   maximum tracked UDP sessions (default: %d)", UDP_PROXY_MAX_CONNS);
+    P_LOG_INFO("  -B <batch>       Linux recvmmsg/sendmmsg batch size (1..%d, default: %d)",
+                 UDP_PROXY_BATCH_SZ, UDP_PROXY_BATCH_SZ);
     P_LOG_INFO("  -H <size>        hash table size (default: 4093)");
     P_LOG_INFO("  -p <pidfile>     write PID to file");
 }
@@ -718,7 +742,7 @@ int main(int argc, char *argv[])
     struct iovec   *s_iovs = NULL;
 #endif
 
-    while ((opt = getopt(argc, argv, "t:dhorp:H:R")) != -1) {
+    while ((opt = getopt(argc, argv, "t:dhorp:H:RS:C:B:")) != -1) {
         switch (opt) {
         case 't':
         {
@@ -751,6 +775,49 @@ int main(int argc, char *argv[])
         case 'R':
             cfg.reuse_port = true;
             break;
+        case 'S':
+        {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -S value '%s', keeping default %d", optarg, g_sockbuf_cap_runtime);
+            } else {
+                if (v < 4096) v = 4096;
+                if (v > (8<<20)) v = (8<<20);
+                g_sockbuf_cap_runtime = (int)v;
+            }
+            break;
+        }
+        case 'C':
+        {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -C value '%s', keeping default %d", optarg, g_conn_pool_capacity);
+            } else {
+                if (v < 64) v = 64;
+                if (v > (1<<20)) v = (1<<20);
+                g_conn_pool_capacity = (int)v;
+            }
+            break;
+        }
+        case 'B':
+        {
+#ifdef __linux__
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0') {
+                P_LOG_WARN("invalid -B value '%s', keeping default %d", optarg, g_batch_sz_runtime);
+            } else {
+                if (v < 1) v = 1;
+                if (v > UDP_PROXY_BATCH_SZ) v = UDP_PROXY_BATCH_SZ;
+                g_batch_sz_runtime = (int)v;
+            }
+#else
+            P_LOG_WARN("-B has no effect on non-Linux builds");
+#endif
+            break;
+        }
         case 'p':
             cfg.pidfile = optarg;
             break;
@@ -912,6 +979,9 @@ int main(int argc, char *argv[])
     /* epoll loop */
     ev.data.ptr = NULL;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+#ifdef EPOLLEXCLUSIVE
+    ev.events |= EPOLLEXCLUSIVE;
+#endif
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev) < 0) {
         P_LOG_ERR("epoll_ctl(ADD, listener): %s", strerror(errno));
         rc = 1;
