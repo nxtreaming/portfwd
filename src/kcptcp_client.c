@@ -303,10 +303,21 @@ int main(int argc, char **argv) {
                     continue;
                 }
                 char ubuf[64 * 1024];
-                struct sockaddr_storage rss;
-                socklen_t rlen = sizeof(rss);
-                ssize_t rn = recvfrom(c->udp_sock, ubuf, sizeof(ubuf), MSG_DONTWAIT, (struct sockaddr*)&rss, &rlen);
-                if (rn > 0) {
+                bool fed_kcp = false;
+                for (;;) {
+                    struct sockaddr_storage rss;
+                    socklen_t rlen = sizeof(rss);
+                    ssize_t rn = recvfrom(c->udp_sock, ubuf, sizeof(ubuf), MSG_DONTWAIT, (struct sockaddr*)&rss, &rlen);
+                    if (rn < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
+                        }
+                        P_LOG_WARN("recvfrom udp: %s", strerror(errno));
+                        break;
+                    }
+                    if (rn == 0) {
+                        break;
+                    }
                     /* Validate UDP source address matches expected peer */
                     union sockaddr_inx ra;
                     memset(&ra, 0, sizeof(ra));
@@ -317,20 +328,18 @@ int main(int argc, char **argv) {
                         struct sockaddr_in6 *in6 = (struct sockaddr_in6*)&rss;
                         ra.sin6 = *in6;
                     } else {
-                        /* Unknown family: drop */
-                        rn = -1;
+                        continue; /* Unknown family: drop */
                     }
-                    if (rn > 0) {
-                        if (!is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
-                            P_LOG_WARN("dropping UDP from unexpected %s (expected %s)",
-                                       sockaddr_to_string(&ra), sockaddr_to_string(&c->peer_addr));
-                            rn = -1; /* mark as ignored */
-                        }
+                    if (!is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
+                        P_LOG_WARN("dropping UDP from unexpected %s (expected %s)",
+                                   sockaddr_to_string(&ra), sockaddr_to_string(&c->peer_addr));
+                        continue;
                     }
-                    if (rn > 0) {
-                        (void)ikcp_input(c->kcp, ubuf, (long)rn);
-                    }
-                    /* Drain KCP to TCP */
+                    (void)ikcp_input(c->kcp, ubuf, (long)rn);
+                    fed_kcp = true;
+                }
+                if (fed_kcp) {
+                    /* Drain KCP to TCP once after ingesting all UDP */
                     for (;;) {
                         int peek = ikcp_peeksize(c->kcp);
                         if (peek < 0)
