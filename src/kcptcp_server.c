@@ -310,6 +310,27 @@ int main(int argc, char **argv) {
                         int got = ikcp_recv(c->kcp, buf, peek);
                         if (got <= 0)
                             break;
+                        /* If TCP connect not completed, buffer instead of sending */
+                        if (c->state != S_FORWARDING) {
+                            size_t need = (size_t)got;
+                            size_t freecap = (c->request.capacity > c->request.dlen) ? (c->request.capacity - c->request.dlen) : 0;
+                            if (freecap < need) {
+                                size_t ncap = c->request.capacity ? c->request.capacity * 2 : (size_t)65536;
+                                if (ncap < c->request.dlen + need) ncap = c->request.dlen + need;
+                                char *np = (char*)realloc(c->request.data, ncap);
+                                if (!np) { c->state = S_CLOSING; break; }
+                                c->request.data = np;
+                                c->request.capacity = ncap;
+                            }
+                            memcpy(c->request.data + c->request.dlen, buf, (size_t)got);
+                            c->request.dlen += (size_t)got;
+                            /* Ensure EPOLLOUT is enabled to both complete connect and flush later */
+                            struct epoll_event tev2 = (struct epoll_event){0};
+                            tev2.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                            tev2.data.ptr = c;
+                            (void)ep_add_or_mod(epfd, c->svr_sock, &tev2);
+                            break;
+                        }
                         ssize_t wn = send(c->svr_sock, buf, (size_t)got, MSG_NOSIGNAL);
                         if (wn < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) {
