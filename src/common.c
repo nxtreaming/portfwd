@@ -256,3 +256,32 @@ void epoll_close_comp(int epfd)
     if (epfd >= 0)
         close(epfd);
 }
+
+const char *sockaddr_to_string(const union sockaddr_inx *addr)
+{
+    static char buf[128];
+    if (!addr) return "(null)";
+    void *a = addr_of_sockaddr(addr);
+    unsigned short port = ntohs(*port_of_sockaddr(addr));
+    char ip[96]; ip[0] = '\0';
+    if (addr->sa.sa_family == AF_INET6) {
+        if (inet_ntop(AF_INET6, a, ip, sizeof(ip)) == NULL) {
+            snprintf(ip, sizeof(ip), "?");
+        }
+        snprintf(buf, sizeof(buf), "[%s]:%hu", ip, port);
+    } else if (addr->sa.sa_family == AF_INET) {
+        if (inet_ntop(AF_INET, a, ip, sizeof(ip)) == NULL) {
+            snprintf(ip, sizeof(ip), "?");
+        }
+        snprintf(buf, sizeof(buf), "%s:%hu", ip, port);
+    } else {
+        snprintf(buf, sizeof(buf), "(af=%d)", addr->sa.sa_family);
+    }
+    return buf;
+}
+
+int ep_del(int epfd, int sock)
+{
+    struct epoll_event ev; memset(&ev, 0, sizeof(ev));
+    return epoll_ctl(epfd, EPOLL_CTL_DEL, sock, &ev);
+}

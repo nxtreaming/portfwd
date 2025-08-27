@@ -18,6 +18,7 @@
 #include "proxy_conn.h"
 #include "kcp_common.h"
 #include "kcp_map.h"
+#include "3rd/kcp/ikcp.h"
 
 static void print_usage(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <local_udp_addr:port> <target_tcp_addr:port>", prog);

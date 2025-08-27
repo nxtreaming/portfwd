@@ -17,6 +17,7 @@
 #include "common.h"
 #include "proxy_conn.h"
 #include "kcp_common.h"
+#include "3rd/kcp/ikcp.h"
 
 static void print_usage(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <local_tcp_addr:port> <remote_udp_addr:port>", prog);
@@ -171,12 +172,13 @@ int main(int argc, char **argv) {
                 /* Accept one or more clients */
                 while (1) {
                     union sockaddr_inx ca; socklen_t calen = sizeof(ca);
-                    int cs = accept4(lsock, &ca.sa, &calen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+                    int cs = accept(lsock, &ca.sa, &calen);
                     if (cs < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         P_LOG_ERR("accept: %s", strerror(errno));
                         break;
                     }
+                    set_nonblock(cs);
                     /* Create per-connection UDP socket */
                     int us = socket(cfg.raddr.sa.sa_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                     if (us < 0) { P_LOG_ERR("socket(udp): %s", strerror(errno)); close(cs); continue; }
