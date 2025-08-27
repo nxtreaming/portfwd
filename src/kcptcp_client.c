@@ -477,11 +477,18 @@ int main(int argc, char **argv) {
             if (pos->state == S_CLOSING) {
                 (void)ep_del(epfd, pos->cli_sock);
                 (void)ep_del(epfd, pos->udp_sock);
-                if (pos->kcp) ikcp_release(pos->kcp);
+                if (pos->kcp)
+                    ikcp_release(pos->kcp);
                 close(pos->cli_sock);
                 close(pos->udp_sock);
-                if (pos->cli_tag) free(pos->cli_tag);
-                if (pos->udp_tag) free(pos->udp_tag);
+                if (pos->request.data)
+                    free(pos->request.data);
+                if (pos->response.data)
+                    free(pos->response.data);
+                if (pos->cli_tag)
+                    free(pos->cli_tag);
+                if (pos->udp_tag)
+                    free(pos->udp_tag);
                 list_del(&pos->list);
                 free(pos);
             }

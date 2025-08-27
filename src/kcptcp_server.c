@@ -466,6 +466,8 @@ int main(int argc, char **argv) {
                 kcp_map_del(&cmap, pos->conv);
                 if (pos->kcp) ikcp_release(pos->kcp);
                 close(pos->svr_sock);
+                if (pos->request.data) free(pos->request.data);
+                if (pos->response.data) free(pos->response.data);
                 list_del(&pos->list);
                 free(pos);
             }
