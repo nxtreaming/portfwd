@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include "common.h"
 #include "proxy_conn.h"
+#include "kcp_common.h"
+#include "kcp_map.h"
 
 static void print_usage(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <local_udp_addr:port> <target_tcp_addr:port>", prog);
@@ -52,6 +54,8 @@ int main(int argc, char **argv) {
     int epfd = -1, usock = -1;
     uint32_t magic_listener = 0xcafef00dU;
     struct cfg_server cfg;
+    struct kcp_map cmap; memset(&cmap, 0, sizeof(cmap));
+    struct list_head conns; INIT_LIST_HEAD(&conns);
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.reuse_addr = true;
@@ -134,19 +138,143 @@ int main(int argc, char **argv) {
 
     struct epoll_event ev = {0};
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-    ev.data.ptr = &magic_listener;
+    ev.data.ptr = &magic_listener; /* tag udp listener */
     if (ep_add_or_mod(epfd, usock, &ev) < 0) { P_LOG_ERR("epoll_ctl add udp: %s", strerror(errno)); goto cleanup; }
 
-    P_LOG_INFO("kcptcp-server initialized (UDP listener ready). KCP data path pending implementation.");
+    if (kcp_map_init(&cmap, 1024) != 0) { P_LOG_ERR("kcp_map_init failed"); goto cleanup; }
 
-    /* Minimal loop: keep process alive until terminated, no UDP dispatch yet. */
+    P_LOG_INFO("kcptcp-server running: UDP %s -> TCP %s",
+               sockaddr_to_string(&cfg.laddr), sockaddr_to_string(&cfg.taddr));
+
+    struct kcp_opts kopts; kcp_opts_set_defaults(&kopts);
+
     while (!g_state.terminate) {
-        struct epoll_event events[64];
-        int nfds = epoll_wait(epfd, events, 64, 1000);
+        /* Compute timeout from all KCP sessions */
+        int timeout_ms = 1000;
+        uint32_t now = kcp_now_ms();
+        struct proxy_conn *pc;
+        list_for_each_entry(pc, &conns, list) {
+            uint32_t due = ikcp_check(pc->kcp, now);
+            int t = (int)((due > now) ? (due - now) : 0);
+            if (t < timeout_ms) timeout_ms = t;
+        }
+
+        struct epoll_event events[128];
+        int nfds = epoll_wait(epfd, events, 128, timeout_ms);
         if (nfds < 0) {
-            if (errno == EINTR) continue;
-            P_LOG_ERR("epoll_wait: %s", strerror(errno));
-            break;
+            if (errno == EINTR) { /* continue to timer */ }
+            else { P_LOG_ERR("epoll_wait: %s", strerror(errno)); break; }
+        }
+
+        for (int i = 0; i < nfds; ++i) {
+            void *tag = events[i].data.ptr;
+            if (tag == &magic_listener) {
+                /* UDP packet(s) */
+                for (;;) {
+                    char buf[64 * 1024];
+                    union sockaddr_inx ra; socklen_t ralen = sizeof(ra);
+                    ssize_t rn = recvfrom(usock, buf, sizeof(buf), MSG_DONTWAIT, &ra.sa, &ralen);
+                    if (rn < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        P_LOG_ERR("recvfrom: %s", strerror(errno));
+                        break;
+                    }
+                    if (rn == 0) break;
+                    /* Extract conv and route */
+                    uint32_t conv = ikcp_getconv(buf);
+                    struct proxy_conn *c = kcp_map_get(&cmap, conv);
+                    if (!c) {
+                        /* New connection: create TCP to target */
+                        int ts = socket(cfg.taddr.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+                        if (ts < 0) { P_LOG_ERR("socket(tcp): %s", strerror(errno)); continue; }
+                        (void)set_sock_buffers_sz(ts, cfg.sockbuf_bytes);
+                        int cr = connect(ts, &cfg.taddr.sa, (socklen_t)sizeof_sockaddr(&cfg.taddr));
+                        if (cr < 0 && errno != EINPROGRESS) { P_LOG_ERR("connect: %s", strerror(errno)); close(ts); continue; }
+
+                        c = (struct proxy_conn*)calloc(1, sizeof(*c));
+                        if (!c) { P_LOG_ERR("calloc conn"); close(ts); continue; }
+                        INIT_LIST_HEAD(&c->list);
+                        c->state = S_SERVER_CONNECTING;
+                        c->svr_sock = ts;
+                        c->udp_sock = usock; /* shared */
+                        c->peer_addr = ra;   /* client udp addr */
+                        c->conv = conv;
+                        c->last_active = time(NULL);
+
+                        if (kcp_setup_conn(c, usock, &ra, conv, &kopts) != 0) {
+                            P_LOG_ERR("kcp_setup_conn failed");
+                            close(ts); free(c); continue;
+                        }
+
+                        /* Register TCP server socket */
+                        struct epoll_event tev = {0};
+                        tev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                        tev.data.ptr = c;
+                        if (ep_add_or_mod(epfd, ts, &tev) < 0) { P_LOG_ERR("epoll add tcp: %s", strerror(errno)); ikcp_release(c->kcp); close(ts); free(c); continue; }
+
+                        list_add_tail(&c->list, &conns);
+                        (void)kcp_map_put(&cmap, conv, c);
+                        P_LOG_INFO("new conv=%u from %s", conv, sockaddr_to_string(&ra));
+                    }
+
+                    /* Feed KCP */
+                    (void)ikcp_input(c->kcp, buf, (long)rn);
+                    /* Drain to TCP */
+                    for (;;) {
+                        int peek = ikcp_peeksize(c->kcp);
+                        if (peek < 0) break;
+                        if (peek > (int)sizeof(buf)) peek = (int)sizeof(buf);
+                        int got = ikcp_recv(c->kcp, buf, peek);
+                        if (got <= 0) break;
+                        ssize_t wn = send(c->svr_sock, buf, (size_t)got, MSG_NOSIGNAL);
+                        if (wn < 0) {
+                            if (errno == EAGAIN || errno == EWOULDBLOCK) { /* drop for now */ break; }
+                            c->state = S_CLOSING; break;
+                        }
+                    }
+                    c->last_active = time(NULL);
+                }
+                continue;
+            }
+
+            /* TCP events for an existing connection */
+            struct proxy_conn *c = (struct proxy_conn*)tag;
+            if (events[i].events & (EPOLLERR | EPOLLHUP)) {
+                c->state = S_CLOSING;
+            }
+            if ((events[i].events & EPOLLOUT) && c->state == S_SERVER_CONNECTING) {
+                int err = 0; socklen_t elen = sizeof(err);
+                if (getsockopt(c->svr_sock, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 && err == 0) {
+                    c->state = S_FORWARDING;
+                } else {
+                    c->state = S_CLOSING;
+                }
+            }
+            if (events[i].events & EPOLLIN) {
+                char sbuf[64 * 1024];
+                ssize_t rn;
+                while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) > 0) {
+                    int sn = ikcp_send(c->kcp, sbuf, (int)rn);
+                    if (sn < 0) { c->state = S_CLOSING; break; }
+                }
+                if (rn == 0) { c->state = S_CLOSING; }
+                else if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) { c->state = S_CLOSING; }
+            }
+        }
+
+        /* Timers and cleanup */
+        now = kcp_now_ms();
+        struct proxy_conn *pos, *tmp;
+        list_for_each_entry_safe(pos, tmp, &conns, list) {
+            (void)kcp_update_flush(pos, now);
+            if (pos->state == S_CLOSING) {
+                (void)ep_del(epfd, pos->svr_sock);
+                kcp_map_del(&cmap, pos->conv);
+                if (pos->kcp) ikcp_release(pos->kcp);
+                close(pos->svr_sock);
+                list_del(&pos->list);
+                free(pos);
+            }
         }
     }
 
@@ -155,6 +283,7 @@ int main(int argc, char **argv) {
 cleanup:
     if (usock >= 0) close(usock);
     if (epfd >= 0) epoll_close_comp(epfd);
+    kcp_map_free(&cmap);
     cleanup_pidfile();
     return rc;
 }
