@@ -10,7 +10,7 @@ else
 NO_EPOLL_O = no-epoll.o
 endif
 
-all: tcpfwd udpfwd
+all: tcpfwd udpfwd kcptcp-client kcptcp-server
 
 tcpfwd: tcpfwd.o common.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o tcpfwd tcpfwd.o common.o $(NO_EPOLL_O) $(LDFLAGS)
@@ -18,15 +18,24 @@ tcpfwd: tcpfwd.o common.o $(NO_EPOLL_O)
 udpfwd: udpfwd.o common.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd udpfwd.o common.o $(NO_EPOLL_O) $(LDFLAGS)
 
+# KCP-based TCP-over-UDP binaries (initial scaffolding; no ikcp dependency yet)
+kcptcp-client: kcptcp_client.o common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o kcptcp-client kcptcp_client.o common.o $(NO_EPOLL_O) $(LDFLAGS)
+
+kcptcp-server: kcptcp_server.o common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o kcptcp-server kcptcp_server.o common.o $(NO_EPOLL_O) $(LDFLAGS)
+
 tcpfwd.o: tcpfwd.c common.h proxy_conn.h
 udpfwd.o: udpfwd.c common.h proxy_conn.h
 common.o: common.c common.h
 no-epoll.o: no-epoll.c no-epoll.h
+kcptcp_client.o: kcptcp_client.c common.h proxy_conn.h
+kcptcp_server.o: kcptcp_server.c common.h proxy_conn.h
 
 install: all
 	mkdir -p $(PREFIX)/bin
-	cp -vf tcpfwd udpfwd $(PREFIX)/bin/
+	cp -vf tcpfwd udpfwd kcptcp-client kcptcp-server $(PREFIX)/bin/
 
 clean:
-	rm -f tcpfwd udpfwd *.o
+	rm -f tcpfwd udpfwd kcptcp-client kcptcp-server *.o
 

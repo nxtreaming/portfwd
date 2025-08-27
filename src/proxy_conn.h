@@ -4,6 +4,9 @@
 #include "list.h"
 #include <stdint.h>
 
+/* Forward declaration to avoid forcing ikcp.h inclusion here */
+struct IKCPCB;
+
 /* Shared buffer structure */
 struct buffer_info {
     char *data;
@@ -49,6 +52,14 @@ struct proxy_conn {
     int svr_fd;
     time_t last_active;
     struct list_head lru;          /* LRU linkage: oldest at head, newest at tail */
+
+    /* KCP tunneling fields (used by kcptcp-* binaries) */
+    struct IKCPCB *kcp;            /* KCP control block */
+    uint32_t conv;                 /* KCP conversation ID */
+    int udp_sock;                  /* UDP socket for KCP transport (per-conn or shared) */
+    union sockaddr_inx peer_addr;  /* Remote UDP peer */
+    bool use_kcp;                  /* Marks connection as using KCP path */
+    bool kcp_tx_pending;           /* Pending KCP flush due to EAGAIN/backpressure */
 };
 
 #endif /* __PORTFWD_PROXY_CONN_H__ */
