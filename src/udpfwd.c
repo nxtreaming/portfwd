@@ -721,7 +721,18 @@ int main(int argc, char *argv[])
     while ((opt = getopt(argc, argv, "t:dhorp:H:R")) != -1) {
         switch (opt) {
         case 't':
-            cfg.proxy_conn_timeo = strtoul(optarg, NULL, 10);
+        {
+            char *end = NULL;
+            unsigned long v = strtoul(optarg, &end, 10);
+            if (end == optarg || *end != '\0') {
+                P_LOG_WARN("invalid -t value '%s', keeping default %u", optarg, cfg.proxy_conn_timeo);
+            } else {
+                if (v == 0) v = 1;                 /* minimum 1s */
+                if (v > 86400UL) v = 86400UL;      /* cap at 1 day */
+                cfg.proxy_conn_timeo = (unsigned)v;
+            }
+            break;
+        }
             break;
         case 'd':
             cfg.daemonize = true;
@@ -743,13 +754,23 @@ int main(int argc, char *argv[])
             cfg.pidfile = optarg;
             break;
         case 'H':
-            cfg.conn_tbl_hash_size = strtoul(optarg, NULL, 10);
-            if (cfg.conn_tbl_hash_size == 0)
-                cfg.conn_tbl_hash_size = 4093;
+        {
+            char *end = NULL;
+            unsigned long v = strtoul(optarg, &end, 10);
+            if (end == optarg || *end != '\0') {
+                P_LOG_WARN("invalid -H value '%s', keeping default %u", optarg, cfg.conn_tbl_hash_size);
+            } else {
+                if (v == 0) v = 4093UL;            /* legacy default */
+                if (v < 64UL) v = 64UL;            /* sane minimum */
+                if (v > (1UL << 20)) v = (1UL << 20); /* prevent huge allocs */
+                cfg.conn_tbl_hash_size = (unsigned)v;
+            }
             break;
-        case '?':
-            rc = 1;
-            goto cleanup;
+        }
+            break;
+        default:
+            print_usage();
+            return 1;
         }
     }
 
