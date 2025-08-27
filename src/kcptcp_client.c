@@ -209,6 +209,9 @@ int main(int argc, char **argv) {
                         break;
                     }
                     set_nonblock(cs);
+                    /* Enable TCP keepalive */
+                    int yes = 1;
+                    (void)setsockopt(cs, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
                     /* Create per-connection UDP socket */
                     int us = socket(cfg.raddr.sa.sa_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                     if (us < 0) {
@@ -242,6 +245,7 @@ int main(int argc, char **argv) {
                         free(c);
                         continue;
                     }
+                    c->next_ka_ms = now + 30000; /* first heartbeat */
 
                     /* Prepare epoll tags */
                     struct ep_tag *ctag = (struct ep_tag*)malloc(sizeof(*ctag));
@@ -444,8 +448,8 @@ int main(int argc, char **argv) {
                     c->last_active = time(NULL);
                 }
                 if (rn == 0) {
-                    /* EOF */
-                    c->svr2cli_shutdown = true;
+                    /* TCP EOF -> close */
+                    c->state = S_CLOSING;
                 } else if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     c->state = S_CLOSING;
                 }
@@ -457,6 +461,19 @@ int main(int argc, char **argv) {
         struct proxy_conn *pos, *tmp;
         list_for_each_entry_safe(pos, tmp, &conns, list) {
             (void)kcp_update_flush(pos, now);
+            /* Heartbeat over KCP every 30s */
+            if (pos->state != S_CLOSING && pos->kcp && pos->next_ka_ms && (int32_t)(now - pos->next_ka_ms) >= 0) {
+                static const char ka = 0;
+                (void)ikcp_send(pos->kcp, &ka, 1);
+                pos->next_ka_ms = now + 30000;
+            }
+            /* Idle timeout (e.g., 180s) */
+            time_t ct = time(NULL);
+            const time_t IDLE_TO = 180;
+            if (pos->state != S_CLOSING && pos->last_active && (ct - pos->last_active) > IDLE_TO) {
+                P_LOG_INFO("idle timeout, conv=%u", pos->conv);
+                pos->state = S_CLOSING;
+            }
             if (pos->state == S_CLOSING) {
                 (void)ep_del(epfd, pos->cli_sock);
                 (void)ep_del(epfd, pos->udp_sock);

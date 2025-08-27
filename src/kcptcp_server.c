@@ -253,6 +253,9 @@ int main(int argc, char **argv) {
                             continue;
                         }
                         (void)set_sock_buffers_sz(ts, cfg.sockbuf_bytes);
+                        /* Enable TCP keepalive */
+                        int yes = 1;
+                        (void)setsockopt(ts, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
                         int cr = connect(ts, &cfg.taddr.sa, (socklen_t)sizeof_sockaddr(&cfg.taddr));
                         if (cr < 0 && errno != EINPROGRESS) {
                             P_LOG_ERR("connect: %s", strerror(errno));
@@ -273,6 +276,7 @@ int main(int argc, char **argv) {
                         c->peer_addr = ra;   /* client udp addr */
                         c->conv = conv;
                         c->last_active = time(NULL);
+                        c->next_ka_ms = now + 30000; /* schedule first heartbeat in 30s */
 
                         if (kcp_setup_conn(c, usock, &ra, conv, &kopts) != 0) {
                             P_LOG_ERR("kcp_setup_conn failed");
@@ -429,6 +433,7 @@ int main(int argc, char **argv) {
                         c->state = S_CLOSING;
                         break;
                     }
+                    c->last_active = time(NULL);
                 }
                 if (rn == 0) {
                     c->state = S_CLOSING;
@@ -443,6 +448,19 @@ int main(int argc, char **argv) {
         struct proxy_conn *pos, *tmp;
         list_for_each_entry_safe(pos, tmp, &conns, list) {
             (void)kcp_update_flush(pos, now);
+            /* Heartbeat over KCP every 30s to keep NAT/paths warm */
+            if (pos->state != S_CLOSING && pos->kcp && pos->next_ka_ms && (int32_t)(now - pos->next_ka_ms) >= 0) {
+                static const char ka = 0;
+                (void)ikcp_send(pos->kcp, &ka, 1);
+                pos->next_ka_ms = now + 30000;
+            }
+            /* Idle timeout (e.g., 180s) */
+            time_t ct = time(NULL);
+            const time_t IDLE_TO = 180;
+            if (pos->state != S_CLOSING && pos->last_active && (ct - pos->last_active) > IDLE_TO) {
+                P_LOG_INFO("idle timeout, conv=%u", pos->conv);
+                pos->state = S_CLOSING;
+            }
             if (pos->state == S_CLOSING) {
                 (void)ep_del(epfd, pos->svr_sock);
                 kcp_map_del(&cmap, pos->conv);

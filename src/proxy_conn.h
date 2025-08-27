@@ -68,6 +68,9 @@ struct proxy_conn {
     /* Epoll tagging (client side): distinguish TCP vs UDP events */
     struct ep_tag *cli_tag;        /* tag for client TCP fd */
     struct ep_tag *udp_tag;        /* tag for per-conn UDP fd */
+
+    /* Keepalive scheduling */
+    uint32_t next_ka_ms;           /* next time to send heartbeat over KCP */
 };
 
 /* Epoll event tag to disambiguate fd source */
