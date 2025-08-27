@@ -64,6 +64,16 @@ struct proxy_conn {
     union sockaddr_inx peer_addr;  /* Remote UDP peer */
     bool use_kcp;                  /* Marks connection as using KCP path */
     bool kcp_tx_pending;           /* Pending KCP flush due to EAGAIN/backpressure */
+
+    /* Epoll tagging (client side): distinguish TCP vs UDP events */
+    struct ep_tag *cli_tag;        /* tag for client TCP fd */
+    struct ep_tag *udp_tag;        /* tag for per-conn UDP fd */
+};
+
+/* Epoll event tag to disambiguate fd source */
+struct ep_tag {
+    struct proxy_conn *conn;
+    int which; /* 1 = TCP client socket, 2 = UDP socket, 3 = TCP server socket (if needed) */
 };
 
 #endif /* __PORTFWD_PROXY_CONN_H__ */

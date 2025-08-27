@@ -195,8 +195,8 @@ int main(int argc, char **argv) {
         }
 
         for (int i = 0; i < nfds; ++i) {
-            void *tag = events[i].data.ptr;
-            if (tag == &magic_listener) {
+            void *tptr = events[i].data.ptr;
+            if (tptr == &magic_listener) {
                 /* Accept one or more clients */
                 while (1) {
                     union sockaddr_inx ca;
@@ -243,27 +243,47 @@ int main(int argc, char **argv) {
                         continue;
                     }
 
-                    /* Register both fds */
-                    struct epoll_event cev = {0};
-                    cev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-                    cev.data.ptr = c; /* tag with connection */
-                    if (ep_add_or_mod(epfd, cs, &cev) < 0) {
-                        P_LOG_ERR("epoll add cli: %s", strerror(errno));
+                    /* Prepare epoll tags */
+                    struct ep_tag *ctag = (struct ep_tag*)malloc(sizeof(*ctag));
+                    struct ep_tag *utag = (struct ep_tag*)malloc(sizeof(*utag));
+                    if (!ctag || !utag) {
+                        P_LOG_ERR("malloc ep_tag");
+                        if (ctag) free(ctag);
+                        if (utag) free(utag);
                         ikcp_release(c->kcp);
                         close(cs);
                         close(us);
                         free(c);
                         continue;
                     }
+                    ctag->conn = c; ctag->which = 1; c->cli_tag = ctag;
+                    utag->conn = c; utag->which = 2; c->udp_tag = utag;
+
+                    /* Register both fds */
+                    struct epoll_event cev = {0};
+                    cev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                    cev.data.ptr = ctag; /* client TCP tag */
+                    if (ep_add_or_mod(epfd, cs, &cev) < 0) {
+                        P_LOG_ERR("epoll add cli: %s", strerror(errno));
+                        ikcp_release(c->kcp);
+                        close(cs);
+                        close(us);
+                        free(ctag);
+                        free(utag);
+                        free(c);
+                        continue;
+                    }
                     struct epoll_event uev = {0};
                     uev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-                    uev.data.ptr = c; /* same tag */
+                    uev.data.ptr = utag; /* UDP tag */
                     if (ep_add_or_mod(epfd, us, &uev) < 0) {
                         P_LOG_ERR("epoll add udp: %s", strerror(errno));
                         (void)ep_del(epfd, cs);
                         ikcp_release(c->kcp);
                         close(cs);
                         close(us);
+                        free(ctag);
+                        free(utag);
                         free(c);
                         continue;
                     }
@@ -274,16 +294,14 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            /* Connection event: figure out which fd by probing readable */
-            struct proxy_conn *c = (struct proxy_conn*)tag;
-            int goterr = (events[i].events & (EPOLLERR | EPOLLHUP)) != 0;
-            if (goterr) {
-                c->state = S_CLOSING;
-            }
-
-            /* Try UDP first */
-            if (events[i].events & EPOLLIN) {
-                /* We don't know if this event is from UDP or TCP since we reuse ptr; try nonblocking recvfrom */
+            /* Tagged connection event: disambiguate source */
+            struct ep_tag *etag = (struct ep_tag*)tptr;
+            struct proxy_conn *c = etag->conn;
+            if (etag->which == 2) {
+                /* UDP socket events */
+                if (!(events[i].events & EPOLLIN)) {
+                    continue;
+                }
                 char ubuf[64 * 1024];
                 struct sockaddr_storage rss;
                 socklen_t rlen = sizeof(rss);
@@ -340,7 +358,7 @@ int main(int argc, char **argv) {
                                 c->response.dlen += (size_t)got;
                                 struct epoll_event cev = (struct epoll_event){0};
                                 cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-                                cev.data.ptr = c;
+                                cev.data.ptr = c->cli_tag;
                                 (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
                                 break;
                             }
@@ -362,16 +380,22 @@ int main(int argc, char **argv) {
                             c->response.dlen += rem;
                             struct epoll_event cev = (struct epoll_event){0};
                             cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-                            cev.data.ptr = c;
+                            cev.data.ptr = c->cli_tag;
                             (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
                             break;
                         }
                     }
                     c->last_active = time(NULL);
                 }
+                continue;
             }
 
-            if (events[i].events & EPOLLOUT) {
+            /* TCP client socket events */
+            if (etag->which == 1 && (events[i].events & (EPOLLERR | EPOLLHUP))) {
+                c->state = S_CLOSING;
+            }
+
+            if (etag->which == 1 && (events[i].events & EPOLLOUT)) {
                 /* Flush pending data to client */
                 while (c->response.rpos < c->response.dlen) {
                     ssize_t wn = send(c->cli_sock,
@@ -393,12 +417,12 @@ int main(int argc, char **argv) {
                     /* Disable EPOLLOUT when drained */
                     struct epoll_event cev = (struct epoll_event){0};
                     cev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-                    cev.data.ptr = c;
+                    cev.data.ptr = c->cli_tag;
                     (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
                 }
             }
 
-            if (events[i].events & (EPOLLIN | EPOLLRDHUP)) {
+            if (etag->which == 1 && (events[i].events & (EPOLLIN | EPOLLRDHUP))) {
                 /* TCP side readable/half-closed */
                 char tbuf[64 * 1024];
                 ssize_t rn;
@@ -430,6 +454,8 @@ int main(int argc, char **argv) {
                 if (pos->kcp) ikcp_release(pos->kcp);
                 close(pos->cli_sock);
                 close(pos->udp_sock);
+                if (pos->cli_tag) free(pos->cli_tag);
+                if (pos->udp_tag) free(pos->udp_tag);
                 list_del(&pos->list);
                 free(pos);
             }
