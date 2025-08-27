@@ -64,6 +64,7 @@ struct proxy_conn {
     union sockaddr_inx peer_addr;  /* Remote UDP peer */
     bool use_kcp;                  /* Marks connection as using KCP path */
     bool kcp_tx_pending;           /* Pending KCP flush due to EAGAIN/backpressure */
+    struct buffer_info udp_backlog;/* Pending UDP datagram to retry sendto() */
 
     /* Epoll tagging (client side): distinguish TCP vs UDP events */
     struct ep_tag *cli_tag;        /* tag for client TCP fd */

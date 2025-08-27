@@ -14,15 +14,37 @@
 #define MSG_DONTWAIT 0
 #endif
 
-/* Output callback: sendto over UDP */
+/* Output callback: sendto over UDP with simple backlog handling on EAGAIN */
 static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *user) {
     (void)kcp;
     struct proxy_conn *pc = (struct proxy_conn*)user;
     if (!pc) return -1;
+    /* Try to send current datagram */
     ssize_t n = sendto(pc->udp_sock, buf, (size_t)len, MSG_DONTWAIT,
                        &pc->peer_addr.sa, (socklen_t)sizeof_sockaddr(&pc->peer_addr));
     if (n < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) return 0; /* will flush later */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            /* Kernel TX queue full: store one-packet backlog and retry on next update */
+            if (pc->udp_backlog.dlen == 0) {
+                size_t need = (size_t)len;
+                size_t cap = pc->udp_backlog.capacity;
+                if (cap < need) {
+                    size_t ncap = cap ? (cap * 2) : (size_t)2048;
+                    if (ncap < need) ncap = need;
+                    char *np = (char*)realloc(pc->udp_backlog.data, ncap);
+                    if (!np) {
+                        return 0; /* drop; KCP will retransmit later */
+                    }
+                    pc->udp_backlog.data = np;
+                    pc->udp_backlog.capacity = ncap;
+                }
+                memcpy(pc->udp_backlog.data, buf, need);
+                pc->udp_backlog.dlen = need;
+                pc->udp_backlog.rpos = 0;
+                pc->kcp_tx_pending = true;
+            }
+            return 0; /* report success to KCP; we'll flush shortly */
+        }
         return -1;
     }
     return (int)n;
@@ -77,6 +99,28 @@ int kcp_setup_conn(struct proxy_conn *c, int udp_fd, const union sockaddr_inx *p
 
 int kcp_update_flush(struct proxy_conn *c, uint32_t now_ms) {
     if (!c || !c->kcp) return -1;
+    /* If we have a pending UDP datagram due to previous EAGAIN, try to flush it first */
+    if (c->udp_backlog.dlen > 0) {
+        ssize_t n = sendto(c->udp_sock,
+                           c->udp_backlog.data + c->udp_backlog.rpos,
+                           c->udp_backlog.dlen - c->udp_backlog.rpos,
+                           MSG_DONTWAIT,
+                           &c->peer_addr.sa,
+                           (socklen_t)sizeof_sockaddr(&c->peer_addr));
+        if (n > 0) {
+            c->udp_backlog.rpos += (size_t)n;
+            if (c->udp_backlog.rpos >= c->udp_backlog.dlen) {
+                c->udp_backlog.rpos = 0;
+                c->udp_backlog.dlen = 0;
+                c->kcp_tx_pending = false;
+            }
+        } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            /* Hard error: drop this backlog packet */
+            c->udp_backlog.rpos = 0;
+            c->udp_backlog.dlen = 0;
+            c->kcp_tx_pending = false;
+        }
+    }
     ikcp_update(c->kcp, now_ms);
     return 0;
 }

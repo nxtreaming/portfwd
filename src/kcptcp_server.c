@@ -468,6 +468,7 @@ int main(int argc, char **argv) {
                 close(pos->svr_sock);
                 if (pos->request.data) free(pos->request.data);
                 if (pos->response.data) free(pos->response.data);
+                if (pos->udp_backlog.data) free(pos->udp_backlog.data);
                 list_del(&pos->list);
                 free(pos);
             }

@@ -485,6 +485,8 @@ int main(int argc, char **argv) {
                     free(pos->request.data);
                 if (pos->response.data)
                     free(pos->response.data);
+                if (pos->udp_backlog.data)
+                    free(pos->udp_backlog.data);
                 if (pos->cli_tag)
                     free(pos->cli_tag);
                 if (pos->udp_tag)
