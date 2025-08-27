@@ -303,14 +303,76 @@ int main(int argc, char **argv) {
                         ssize_t wn = send(c->cli_sock, ubuf, (size_t)got, MSG_NOSIGNAL);
                         if (wn < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                /* backpressure: drop for now */
+                                /* Backpressure: buffer and enable EPOLLOUT */
+                                size_t need = (size_t)got;
+                                size_t freecap = (c->response.capacity > c->response.dlen) ? (c->response.capacity - c->response.dlen) : 0;
+                                if (freecap < need) {
+                                    size_t ncap = c->response.capacity ? c->response.capacity * 2 : (size_t)65536;
+                                    if (ncap < c->response.dlen + need) ncap = c->response.dlen + need;
+                                    char *np = (char*)realloc(c->response.data, ncap);
+                                    if (!np) { c->state = S_CLOSING; break; }
+                                    c->response.data = np;
+                                    c->response.capacity = ncap;
+                                }
+                                memcpy(c->response.data + c->response.dlen, ubuf, (size_t)got);
+                                c->response.dlen += (size_t)got;
+                                struct epoll_event cev = (struct epoll_event){0};
+                                cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                                cev.data.ptr = c;
+                                (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
                                 break;
                             }
                             c->state = S_CLOSING;
                             break;
+                        } else if (wn < got) {
+                            /* Short write: buffer remaining and enable EPOLLOUT */
+                            size_t rem = (size_t)got - (size_t)wn;
+                            size_t freecap = (c->response.capacity > c->response.dlen) ? (c->response.capacity - c->response.dlen) : 0;
+                            if (freecap < rem) {
+                                size_t ncap = c->response.capacity ? c->response.capacity * 2 : (size_t)65536;
+                                if (ncap < c->response.dlen + rem) ncap = c->response.dlen + rem;
+                                char *np = (char*)realloc(c->response.data, ncap);
+                                if (!np) { c->state = S_CLOSING; break; }
+                                c->response.data = np;
+                                c->response.capacity = ncap;
+                            }
+                            memcpy(c->response.data + c->response.dlen, ubuf + wn, rem);
+                            c->response.dlen += rem;
+                            struct epoll_event cev = (struct epoll_event){0};
+                            cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                            cev.data.ptr = c;
+                            (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
+                            break;
                         }
                     }
                     c->last_active = time(NULL);
+                }
+            }
+
+            if (events[i].events & EPOLLOUT) {
+                /* Flush pending data to client */
+                while (c->response.rpos < c->response.dlen) {
+                    ssize_t wn = send(c->cli_sock,
+                                      c->response.data + c->response.rpos,
+                                      c->response.dlen - c->response.rpos,
+                                      MSG_NOSIGNAL);
+                    if (wn > 0) {
+                        c->response.rpos += (size_t)wn;
+                    } else if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        break;
+                    } else {
+                        c->state = S_CLOSING;
+                        break;
+                    }
+                }
+                if (c->response.rpos >= c->response.dlen) {
+                    c->response.rpos = 0;
+                    c->response.dlen = 0;
+                    /* Disable EPOLLOUT when drained */
+                    struct epoll_event cev = (struct epoll_event){0};
+                    cev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                    cev.data.ptr = c;
+                    (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
                 }
             }
 

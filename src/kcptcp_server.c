@@ -292,10 +292,45 @@ int main(int argc, char **argv) {
                         ssize_t wn = send(c->svr_sock, buf, (size_t)got, MSG_NOSIGNAL);
                         if (wn < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                /* drop for now */
+                                /* Backpressure: buffer and enable EPOLLOUT */
+                                size_t need = (size_t)got;
+                                size_t freecap = (c->request.capacity > c->request.dlen) ? (c->request.capacity - c->request.dlen) : 0;
+                                if (freecap < need) {
+                                    size_t ncap = c->request.capacity ? c->request.capacity * 2 : (size_t)65536;
+                                    if (ncap < c->request.dlen + need) ncap = c->request.dlen + need;
+                                    char *np = (char*)realloc(c->request.data, ncap);
+                                    if (!np) { c->state = S_CLOSING; break; }
+                                    c->request.data = np;
+                                    c->request.capacity = ncap;
+                                }
+                                memcpy(c->request.data + c->request.dlen, buf, (size_t)got);
+                                c->request.dlen += (size_t)got;
+                                struct epoll_event tev2 = (struct epoll_event){0};
+                                tev2.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                                tev2.data.ptr = c;
+                                (void)ep_add_or_mod(epfd, c->svr_sock, &tev2);
                                 break;
                             }
                             c->state = S_CLOSING;
+                            break;
+                        } else if (wn < got) {
+                            /* Short write: buffer remaining and enable EPOLLOUT */
+                            size_t rem = (size_t)got - (size_t)wn;
+                            size_t freecap = (c->request.capacity > c->request.dlen) ? (c->request.capacity - c->request.dlen) : 0;
+                            if (freecap < rem) {
+                                size_t ncap = c->request.capacity ? c->request.capacity * 2 : (size_t)65536;
+                                if (ncap < c->request.dlen + rem) ncap = c->request.dlen + rem;
+                                char *np = (char*)realloc(c->request.data, ncap);
+                                if (!np) { c->state = S_CLOSING; break; }
+                                c->request.data = np;
+                                c->request.capacity = ncap;
+                            }
+                            memcpy(c->request.data + c->request.dlen, buf + wn, rem);
+                            c->request.dlen += rem;
+                            struct epoll_event tev2 = (struct epoll_event){0};
+                            tev2.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                            tev2.data.ptr = c;
+                            (void)ep_add_or_mod(epfd, c->svr_sock, &tev2);
                             break;
                         }
                     }
@@ -316,6 +351,31 @@ int main(int argc, char **argv) {
                     c->state = S_FORWARDING;
                 } else {
                     c->state = S_CLOSING;
+                }
+            }
+            if ((events[i].events & EPOLLOUT) && c->state == S_FORWARDING) {
+                /* Flush pending request data to target TCP */
+                while (c->request.rpos < c->request.dlen) {
+                    ssize_t wn = send(c->svr_sock,
+                                      c->request.data + c->request.rpos,
+                                      c->request.dlen - c->request.rpos,
+                                      MSG_NOSIGNAL);
+                    if (wn > 0) {
+                        c->request.rpos += (size_t)wn;
+                    } else if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        break;
+                    } else {
+                        c->state = S_CLOSING;
+                        break;
+                    }
+                }
+                if (c->request.rpos >= c->request.dlen) {
+                    c->request.rpos = 0;
+                    c->request.dlen = 0;
+                    struct epoll_event tev2 = (struct epoll_event){0};
+                    tev2.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
+                    tev2.data.ptr = c;
+                    (void)ep_add_or_mod(epfd, c->svr_sock, &tev2);
                 }
             }
             if (events[i].events & EPOLLIN) {
