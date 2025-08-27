@@ -260,7 +260,6 @@ static struct proxy_conn *proxy_conn_get_or_create(
         P_LOG_ERR("malloc(conn): %s", strerror(errno));
         goto err;
     }
-    memset(conn, 0x0, sizeof(*conn));
     conn->svr_sock = svr_sock;
     conn->cli_addr = *cli_addr;
     INIT_LIST_HEAD(&conn->lru);
@@ -393,70 +392,84 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
 
 #ifdef __linux__
     if (c_msgs && s_msgs) {
-        int n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
-        if (n <= 0) {
-            if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-                P_LOG_WARN("recvmmsg(): %s", strerror(errno));
-            return;
-        }
-
-        struct send_batch {
-            int sock;
-            int msg_indices[UDP_PROXY_BATCH_SZ];
-            int count;
-        } batches[UDP_PROXY_BATCH_SZ];
-        int num_batches = 0;
-
-        for (int i = 0; i < n; i++) {
-            union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
-            if (!(conn = proxy_conn_get_or_create(cfg, sa, epfd)))
-                continue;
-            touch_proxy_conn(conn);
-
-            int batch_idx = -1;
-            for (int k = 0; k < num_batches; k++) {
-                if (batches[k].sock == conn->svr_sock) {
-                    batch_idx = k;
-                    break;
-                }
-            }
-            if (batch_idx == -1) {
-                batch_idx = num_batches++;
-                batches[batch_idx].sock = conn->svr_sock;
-                batches[batch_idx].count = 0;
-            }
-            batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
-        }
-
-        for (int i = 0; i < num_batches; i++) {
-            struct send_batch *b = &batches[i];
-            for (int k = 0; k < b->count; k++) {
-                int msg_idx = b->msg_indices[k];
-                s_iovs[k].iov_base = c_bufs[msg_idx];
-                s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
-                /* s_msgs already configured in init loop */
+        /* Drain multiple batches per epoll wake to reduce syscalls */
+        int iterations = 0;
+        const int max_iterations = 64; /* fairness cap per tick */
+        for (; iterations < max_iterations; iterations++) {
+            /* Ensure namelen is reset before each recvmmsg call */
+            for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+                c_msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
             }
 
-            /* Retry on partial send to avoid dropping remaining packets */
-            int remaining = b->count;
-            struct mmsghdr *msgp = s_msgs;
-            do {
-                int sent = sendmmsg(b->sock, msgp, remaining, 0);
-                if (sent < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
-                        /* Transient backpressure; give up remaining for now */
+            int n = recvmmsg(lsn_sock, c_msgs, UDP_PROXY_BATCH_SZ, 0, NULL);
+            if (n <= 0) {
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
+                    P_LOG_WARN("recvmmsg(): %s", strerror(errno));
+                break; /* no more to read now */
+            }
+
+            struct send_batch {
+                int sock;
+                int msg_indices[UDP_PROXY_BATCH_SZ];
+                int count;
+            } batches[UDP_PROXY_BATCH_SZ];
+            int num_batches = 0;
+
+            for (int i = 0; i < n; i++) {
+                union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
+                if (!(conn = proxy_conn_get_or_create(cfg, sa, epfd)))
+                    continue;
+                touch_proxy_conn(conn);
+
+                int batch_idx = -1;
+                for (int k = 0; k < num_batches; k++) {
+                    if (batches[k].sock == conn->svr_sock) {
+                        batch_idx = k;
                         break;
                     }
-                    P_LOG_WARN("sendmmsg(server): %s", strerror(errno));
-                    break;
                 }
-                if (sent == 0) {
-                    /* Shouldn't happen for non-blocking UDP, but avoid tight loop */
-                    break;
+                if (batch_idx == -1) {
+                    batch_idx = num_batches++;
+                    batches[batch_idx].sock = conn->svr_sock;
+                    batches[batch_idx].count = 0;
                 }
-                remaining -= sent;
-                msgp += sent;
-            } while (remaining > 0);
+                batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+            }
+
+            for (int i = 0; i < num_batches; i++) {
+                struct send_batch *b = &batches[i];
+                for (int k = 0; k < b->count; k++) {
+                    int msg_idx = b->msg_indices[k];
+                    s_iovs[k].iov_base = c_bufs[msg_idx];
+                    s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
+                    /* s_msgs already configured in init loop */
+                }
+
+                /* Retry on partial send to avoid dropping remaining packets */
+                int remaining = b->count;
+                struct mmsghdr *msgp = s_msgs;
+                do {
+                    int sent = sendmmsg(b->sock, msgp, remaining, 0);
+                    if (sent < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                            /* Transient backpressure; give up remaining for now */
+                            break;
+                        }
+                        P_LOG_WARN("sendmmsg(server): %s", strerror(errno));
+                        break;
+                    }
+                    if (sent == 0) {
+                        /* Shouldn't happen for non-blocking UDP, but avoid tight loop */
+                        break;
+                    }
+                    remaining -= sent;
+                    msgp += sent;
+                } while (remaining > 0);
+            }
+
+            /* If we read fewer than the batch, likely drained; stop early */
+            if (n < UDP_PROXY_BATCH_SZ)
+                break;
         }
         return;
     }
@@ -790,7 +803,19 @@ int main(int argc, char *argv[])
             s_addr2, ntohs(*port_of_sockaddr(&cfg.dst_addr)));
 
     /* Create epoll table. */
-    if ((epfd = epoll_create(2048)) < 0) {
+    /* Prefer epoll_create1 with CLOEXEC when available */
+#ifdef __linux__
+#ifdef EPOLL_CLOEXEC
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL))
+        epfd = epoll_create(2048);
+#else
+    epfd = epoll_create(2048);
+#endif
+#else
+    epfd = epoll_create(2048);
+#endif
+    if (epfd < 0) {
         P_LOG_ERR("epoll_create(): %s", strerror(errno));
         rc = 1;
         goto cleanup;
