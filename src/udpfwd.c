@@ -48,7 +48,7 @@
 #define FNV_OFFSET_BASIS_32 2166136261U
 
 #ifndef UDP_PROXY_MAX_CONNS
-#define UDP_PROXY_MAX_CONNS   8192
+#define UDP_PROXY_MAX_CONNS   4096
 #endif
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -878,33 +878,18 @@ int main(int argc, char *argv[])
     /* Initialize the connection table */
     g_conn_tbl_hash_size = cfg.conn_tbl_hash_size;
     /*
-     * Round up to the next power-of-two for faster hashing with bitmasking.
-     * Rationale:
-     *  - When size is 2^k, we can index buckets via: hash & (size - 1)
-     *    which is faster than modulus.
-     *  - This block first clamps to a sane min/max, then uses a classic
-     *    bit-twiddling trick to expand the highest set bit to all lower bits
-     *    and finally adds 1 to obtain the next power-of-two.
-     * Notes:
-     *  - Input must be > 0 (we enforce a minimum below).
-     *  - For 64-bit widths, add: v |= v >> 32.
+     * Respect the configured hash size (e.g., a prime like 4093 to reduce collisions).
+     * Only clamp to sane bounds; do NOT round to power-of-two here.
      */
     if (g_conn_tbl_hash_size < 64)
         g_conn_tbl_hash_size = 64;
     if (g_conn_tbl_hash_size > (1u << 20))
         g_conn_tbl_hash_size = (1u << 20);
-    /* bit-twiddling: round up to next power of two */
-    unsigned v = g_conn_tbl_hash_size - 1;
-
-    v |= v >> 1;
-    v |= v >> 2;
-    v |= v >> 4;
-    v |= v >> 8;
-    v |= v >> 16;
-    g_conn_tbl_hash_size = v + 1;
 
     /* Select bucket indexing strategy once to avoid per-call checks */
-    bucket_index_fun = is_power_of_two(g_conn_tbl_hash_size) ? proxy_conn_hash_bitwise : proxy_conn_hash_mod;
+    bucket_index_fun = is_power_of_two(g_conn_tbl_hash_size)
+                           ? proxy_conn_hash_bitwise  /* fast path for 2^k sizes */
+                           : proxy_conn_hash_mod;     /* general path for arbitrary sizes (e.g., primes) */
     assert(bucket_index_fun != NULL);
 
     conn_tbl_hbase = malloc(sizeof(struct list_head) * g_conn_tbl_hash_size);
