@@ -151,10 +151,75 @@ Notes:
 
 On Linux, `tcpfwd` opportunistically uses `splice()` with a non-blocking pipe to reduce copies and syscalls on the hot path. This is automatic when available, with graceful fallback to userspace buffering. No runtime flag is required.
 
+## KCP + AEAD Overview
+
+- Transport: KCP over UDP (for `kcptcp-client`/`kcptcp-server`).
+- AEAD: ChaCha20-Poly1305.
+- Each session derives a per-epoch 32-byte key and a 12-byte nonce base.
+- Nonces are 96-bit: top 96 bits from nonce base, low 32 bits from `send_seq`.
+
+## AEAD Rekeying
+
+Rekeying prevents nonce reuse by switching to a new epoch (key/nonce base) before the 32-bit sequence number can wrap.
+
+- Preconditions:
+  - PSK must be configured on both sides; a successful handshake establishes the initial session key.
+- Trigger:
+  - When `send_seq >= REKEY_SEQ_THRESHOLD` and no rekey is in progress, the sender initiates rekeying.
+- Protocol:
+  - REKEY_INIT: sent by the initiator under the current epoch key; associated data includes type and the sender’s current `send_seq`.
+  - REKEY_ACK: sent by the peer under the next epoch key with `seq=0` (in the next epoch namespace).
+- Epoch switch (both sides):
+  - After sending REKEY_ACK (responder) or receiving valid REKEY_ACK (initiator):
+    - `next_session_key` → `session_key`
+    - `next_nonce_base` → `nonce_base`
+    - `epoch++`
+    - `send_seq = 0`
+    - Reset anti-replay window
+- Timeout:
+  - If `rekey_in_progress` and `now >= rekey_deadline_ms` (elapsed ≥ `REKEY_TIMEOUT_MS`), close the connection to avoid stalling and potential nonce exhaustion.
+- Wraparound guard:
+  - If `send_seq == UINT32_MAX`, close the connection to prevent nonce reuse.
+- Anti-replay:
+  - 64-bit sliding window on receiver; drops too-old or duplicate sequences.
+
+### Logging (selected)
+
+- Rekey trigger (before encrypted data/FIN): `rekey trigger conv=<id> epoch=<cur>-><next> send_seq=<n> deadline=<ms>`
+- Received REKEY_INIT: `recv REKEY_INIT conv=<id> seq=<n>`
+- Received REKEY_ACK: `recv REKEY_ACK conv=<id>`
+- Epoch switch: `epoch switch conv=<id> -> epoch=<n>`
+- Wraparound guard: `send_seq wraparound guard hit, closing conv=<id>`
+- Timeout: `rekey timeout, closing conv=<id>`
+
+## Tests
+
+Standalone unit tests live in `src/tests/` (they do not affect the main build):
+
+- `test_aead`: verifies deterministic per-epoch key derivation and that different epochs yield different keys.
+- `test_replay`: verifies the anti-replay sliding window (accept, replay, too-old, window advance, near-wrap).
+
+Build example:
+
+```sh
+# build main objects first (e.g., aead.o) from src/
+make -C src
+
+# then build tests
+make -C src/tests
+```
+
+Run:
+
+```sh
+src/tests/test_aead
+src/tests/test_replay
+```
+
 ## Build
 
 ```sh
-make -C src
+ make -C src
 ```
 
 Override tunables with `CFLAGS` as shown in the examples above.
