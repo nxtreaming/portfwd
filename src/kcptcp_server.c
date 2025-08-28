@@ -653,34 +653,44 @@ int main(int argc, char **argv) {
                                 c->request.data = np;
                                 c->request.capacity = ncap;
                             }
-                                size_t need = (size_t)plen;
-                                size_t freecap =
-                                    (c->request.capacity > c->request.dlen)
-                                        ? (c->request.capacity -
-                                           c->request.dlen)
-                                        : 0;
-                                if (freecap < need) {
-                                    size_t ncap = c->request.capacity
-                                                      ? c->request.capacity * 2
-                                                      : (size_t)65536;
-                                    if (ncap < c->request.dlen + need)
-                                        ncap = c->request.dlen + need;
-                                    char *np =
-                                        (char *)realloc(c->request.data, ncap);
-                                    if (!np) {
-                                        c->state = S_CLOSING;
-                                        break;
-                                    }
-                                    c->request.data = np;
-                                    c->request.capacity = ncap;
+                            memcpy(c->request.data + c->request.dlen, payload,
+                                   (size_t)plen);
+                            c->request.dlen += (size_t)plen;
+                            (void)kcptcp_ep_register_tcp(epfd, c->svr_sock, c,
+                                                         true);
+                            break;
+                        }
+                        ssize_t wn = send(c->svr_sock, payload, (size_t)plen,
+                                          MSG_NOSIGNAL);
+                        if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                            /* Would block: buffer all and enable EPOLLOUT */
+                            size_t rem = (size_t)plen;
+                            size_t freecap =
+                                (c->request.capacity > c->request.dlen)
+                                    ? (c->request.capacity - c->request.dlen)
+                                    : 0;
+                            if (freecap < rem) {
+                                size_t ncap = c->request.capacity
+                                                  ? c->request.capacity * 2
+                                                  : (size_t)65536;
+                                if (ncap < c->request.dlen + rem)
+                                    ncap = c->request.dlen + rem;
+                                char *np =
+                                    (char *)realloc(c->request.data, ncap);
+                                if (!np) {
+                                    c->state = S_CLOSING;
+                                    break;
                                 }
-                                memcpy(c->request.data + c->request.dlen,
-                                       payload, (size_t)plen);
-                                c->request.dlen += (size_t)plen;
-                                (void)kcptcp_ep_register_tcp(epfd, c->svr_sock,
-                                                             c, true);
-                                break;
+                                c->request.data = np;
+                                c->request.capacity = ncap;
                             }
+                            memcpy(c->request.data + c->request.dlen, payload,
+                                   rem);
+                            c->request.dlen += rem;
+                            (void)kcptcp_ep_register_tcp(epfd, c->svr_sock, c,
+                                                         true);
+                            break;
+                        } else if (wn < 0) {
                             c->state = S_CLOSING;
                             break;
                         } else if (wn < plen) {
@@ -1008,7 +1018,8 @@ int main(int argc, char **argv) {
             }
 
             /* Timers and cleanup */
-            now = kcp_now_ms();
+            uint32_t now = kcp_now_ms();
+
             struct proxy_conn *pos, *tmp;
             list_for_each_entry_safe(pos, tmp, &conns, list) {
                 (void)kcp_update_flush(pos, now);
