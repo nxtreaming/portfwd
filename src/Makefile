@@ -21,12 +21,13 @@ udpfwd: udpfwd.o common.o $(NO_EPOLL_O)
 # KCP-based TCP-over-UDP binaries with AEAD support
 KCPOBJS = kcp_common.o 3rd/kcp/ikcp.o
 AEADOBJS = aead.o 3rd/chacha20poly1305/chacha20poly1305.o
+KCPTCPOBJS = kcptcp_common.o
 
-kcptcp-client: kcptcp_client.o $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o kcptcp-client kcptcp_client.o $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O) $(LDFLAGS)
+kcptcp-client: kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o kcptcp-client kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O) $(LDFLAGS)
 
-kcptcp-server: kcptcp_server.o kcp_map.o $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o kcptcp-server kcptcp_server.o kcp_map.o $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O) $(LDFLAGS)
+kcptcp-server: kcptcp_server.o kcptcp_common.o kcp_map.o $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o kcptcp-server kcptcp_server.o kcptcp_common.o kcp_map.o $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O) $(LDFLAGS)
 
 # Convenience aliases: allow underscored targets too
 .PHONY: kcptcp_client kcptcp_server
@@ -39,8 +40,11 @@ tcpfwd.o: tcpfwd.c common.h proxy_conn.h
 udpfwd.o: udpfwd.c common.h proxy_conn.h
 common.o: common.c common.h
 no-epoll.o: no-epoll.c no-epoll.h
-kcptcp_client.o: kcptcp_client.c common.h proxy_conn.h
-kcptcp_server.o: kcptcp_server.c common.h proxy_conn.h
+kcptcp_client.o: kcptcp_client.c common.h proxy_conn.h kcptcp_common.h
+kcptcp_server.o: kcptcp_server.c common.h proxy_conn.h kcptcp_common.h
+kctags:
+	@:
+kcptcp_common.o: kcptcp_common.c kcptcp_common.h proxy_conn.h common.h
 kcp_common.o: kcp_common.c kcp_common.h proxy_conn.h common.h
 kcp_map.o: kcp_map.c kcp_map.h proxy_conn.h common.h
 

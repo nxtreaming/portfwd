@@ -20,94 +20,10 @@
 #include "common.h"
 #include "proxy_conn.h"
 #include "kcp_common.h"
+#include "kcptcp_common.h"
 #include "aead.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
-
-/* Allow overriding stats logging interval via environment variable
- * PFWD_STATS_INTERVAL_MS */
-static inline uint32_t get_stats_interval_ms(void) {
-    static uint32_t cached = 0; /* 0 => uninitialized */
-    if (cached == 0) {
-        const char *s = getenv("PFWD_STATS_INTERVAL_MS");
-        long v = s ? strtol(s, NULL, 10) : 0;
-        if (v <= 0)
-            v = 5000; /* default 5s */
-        if (v < 100)
-            v = 100; /* clamp to sane minimum */
-        if (v > 600000)
-            v = 600000; /* clamp to 10 minutes */
-        cached = (uint32_t)v;
-    }
-    return cached;
-}
-
-/* Dump final totals at connection close if PFWD_STATS_DUMP is set to non-zero
- */
-static inline bool get_stats_dump_enabled(void) {
-    const char *s = getenv("PFWD_STATS_DUMP");
-    if (!s)
-        return false;
-    return !(s[0] == '0');
-}
-
-/* Enable/disable stats via PFWD_STATS_ENABLE (set to "0" to disable) */
-static inline bool get_stats_enabled(void) {
-    const char *s = getenv("PFWD_STATS_ENABLE");
-    if (!s)
-        return true; /* default enabled */
-    /* treat any leading '0' as false */
-    return !(s[0] == '0');
-}
-
-/* Anti-replay helpers (sliding window, 64 entries) */
-static inline int32_t seq_diff_u32(uint32_t a, uint32_t b) {
-    return (int32_t)(a - b);
-}
-static inline bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win,
-                                                uint64_t *p_mask) {
-    uint32_t win = *p_win;
-    uint64_t mask = *p_mask;
-    if (win == UINT32_MAX) { /* uninitialized */
-        *p_win = seq;
-        *p_mask = 1ULL; /* mark bit0 */
-        return true;
-    }
-    int32_t d = seq_diff_u32(seq, win);
-    if (d > 0) {
-        /* seq ahead of window; advance */
-        uint32_t shift = (d >= 64) ? 64u : (uint32_t)d;
-        mask = (shift >= 64) ? 0ULL : (mask << shift);
-        mask |= 1ULL; /* mark newest */
-        win = seq;
-        *p_win = win;
-        *p_mask = mask;
-        return true;
-    }
-    /* seq <= win */
-    int32_t behind = -d; /* how far behind win */
-    if (behind >= 64) {
-        /* too old */
-        return false;
-    }
-    uint64_t bit = 1ULL << behind;
-    if (mask & bit) {
-        /* replay */
-        return false;
-    }
-    mask |= bit;
-    *p_win = win;
-    *p_mask = mask;
-    return true;
-}
-
-/* Guard against send_seq wraparound; returns false on wrap */
-static inline bool aead_next_send_seq(struct proxy_conn *c, uint32_t *out_seq) {
-    if (c->send_seq == UINT32_MAX)
-        return false;
-    *out_seq = c->send_seq++;
-    return true;
-}
 
 static void print_usage(const char *prog) {
     P_LOG_INFO(
@@ -150,37 +66,6 @@ struct cfg_client {
     uint8_t psk[32];
 };
 
-static void set_sock_buffers_sz(int sockfd, int bytes) {
-    if (bytes <= 0)
-        return;
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
-}
-
-static int hex2nibble(char c) {
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
-static bool parse_psk_hex32(const char *hex, uint8_t out[32]) {
-    size_t n = strlen(hex);
-    if (n != 64)
-        return false;
-    for (size_t i = 0; i < 32; ++i) {
-        int hi = hex2nibble(hex[2 * i]);
-        int lo = hex2nibble(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0)
-            return false;
-        out[i] = (uint8_t)((hi << 4) | lo);
-    }
-    return true;
-}
-
 int main(int argc, char **argv) {
     int rc = 1;
     int epfd = -1, lsock = -1;
@@ -195,137 +80,44 @@ int main(int argc, char **argv) {
     int kcp_mtu = -1;
     int kcp_nd = -1, kcp_it = -1, kcp_rs = -1, kcp_nc = -1, kcp_snd = -1,
         kcp_rcv = -1;
-    int opt;
-    while ((opt = getopt(argc, argv, "dp:rR6S:M:A:I:X:C:w:W:NK:h")) != -1) {
-        switch (opt) {
-        case 'd':
-            cfg.daemonize = true;
-            break;
-        case 'p':
-            cfg.pidfile = optarg;
-            break;
-        case 'r':
-            cfg.reuse_addr = true;
-            break;
-        case 'R':
-            cfg.reuse_port = true;
-            break;
-        case '6':
-            cfg.v6only = true;
-            break;
-        case 'S': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -S value '%s'", optarg);
-            } else {
-                if (v < 4096)
-                    v = 4096;
-                if (v > (8 << 20))
-                    v = (8 << 20);
-                cfg.sockbuf_bytes = (int)v;
-            }
-            break;
-        }
-        case 'M': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -M value '%s'", optarg);
-            } else {
-                if (v < 576)
-                    v = 576;
-                if (v > 1500)
-                    v = 1500;
-                kcp_mtu = (int)v;
-            }
-            break;
-        }
-        case 'A': {
-            if (strcmp(optarg, "0") == 0)
-                kcp_nd = 0;
-            else if (strcmp(optarg, "1") == 0)
-                kcp_nd = 1;
-            else
-                P_LOG_WARN("invalid -A value '%s' (expect 0|1)", optarg);
-            break;
-        }
-        case 'I': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v <= 0)
-                P_LOG_WARN("invalid -I value '%s'", optarg);
-            else
-                kcp_it = (int)v;
-            break;
-        }
-        case 'X': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v < 0)
-                P_LOG_WARN("invalid -X value '%s'", optarg);
-            else
-                kcp_rs = (int)v;
-            break;
-        }
-        case 'C': {
-            if (strcmp(optarg, "0") == 0)
-                kcp_nc = 0;
-            else if (strcmp(optarg, "1") == 0)
-                kcp_nc = 1;
-            else
-                P_LOG_WARN("invalid -C value '%s' (expect 0|1)", optarg);
-            break;
-        }
-        case 'w': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v <= 0)
-                P_LOG_WARN("invalid -w value '%s'", optarg);
-            else
-                kcp_snd = (int)v;
-            break;
-        }
-        case 'W': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v <= 0)
-                P_LOG_WARN("invalid -W value '%s'", optarg);
-            else
-                kcp_rcv = (int)v;
-            break;
-        }
-        case 'N':
-            cfg.tcp_nodelay = true;
-            break;
-        case 'K': {
-            uint8_t key[32];
-            if (!parse_psk_hex32(optarg, key)) {
-                P_LOG_ERR("invalid -K PSK (expect 64 hex chars)");
-                return 2;
-            }
-            memcpy(cfg.psk, key, 32);
-            cfg.has_psk = true;
-            break;
-        }
-        case 'h':
-        default:
-            print_usage(argv[0]);
-            return (opt == 'h') ? 0 : 2;
-        }
+
+    struct kcptcp_common_cli opts;
+    int pos = 0;
+    if (!kcptcp_parse_common_opts(argc, argv, &opts, &pos, false)) {
+        print_usage(argv[0]);
+        return 2;
+    }
+    if (opts.show_help) {
+        print_usage(argv[0]);
+        return 0;
     }
 
-    if (optind + 2 != argc) {
+    /* Map common options to cfg and local KCP overrides */
+    cfg.pidfile = opts.pidfile;
+    cfg.daemonize = opts.daemonize;
+    cfg.reuse_addr = opts.reuse_addr;
+    cfg.reuse_port = opts.reuse_port;
+    cfg.v6only = opts.v6only;
+    cfg.sockbuf_bytes = opts.sockbuf_bytes;
+    cfg.tcp_nodelay = opts.tcp_nodelay;
+    cfg.has_psk = opts.has_psk;
+    if (opts.has_psk) memcpy(cfg.psk, opts.psk, 32);
+
+    kcp_mtu = opts.kcp_mtu;
+    kcp_nd = opts.kcp_nd; kcp_it = opts.kcp_it; kcp_rs = opts.kcp_rs;
+    kcp_nc = opts.kcp_nc; kcp_snd = opts.kcp_snd; kcp_rcv = opts.kcp_rcv;
+
+    if (pos + 2 != argc) {
         print_usage(argv[0]);
         return 2;
     }
 
-    if (get_sockaddr_inx_pair(argv[optind], &cfg.laddr, false) < 0) {
-        P_LOG_ERR("invalid local tcp addr: %s", argv[optind]);
+    if (get_sockaddr_inx_pair(argv[pos], &cfg.laddr, false) < 0) {
+        P_LOG_ERR("invalid local tcp addr: %s", argv[pos]);
         return 2;
     }
-    if (get_sockaddr_inx_pair(argv[optind + 1], &cfg.raddr, true) < 0) {
-        P_LOG_ERR("invalid remote udp addr: %s", argv[optind + 1]);
+    if (get_sockaddr_inx_pair(argv[pos + 1], &cfg.raddr, true) < 0) {
+        P_LOG_ERR("invalid remote udp addr: %s", argv[pos + 1]);
         return 2;
     }
 
@@ -348,44 +140,13 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    /* Create TCP listen socket */
-    lsock = socket(cfg.laddr.sa.sa_family, SOCK_STREAM, 0);
-    if (lsock < 0) {
-        P_LOG_ERR("socket(listen): %s", strerror(errno));
-        goto cleanup;
-    }
-    if (cfg.reuse_addr) {
-        int on = 1;
-        (void)setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
-    }
-#ifdef SO_REUSEPORT
-    if (cfg.reuse_port) {
-        int on = 1;
-        (void)setsockopt(lsock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
-    }
-#endif
-#ifdef IPV6_V6ONLY
-    if (cfg.v6only && cfg.laddr.sa.sa_family == AF_INET6) {
-        int on = 1;
-        (void)setsockopt(lsock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
-    }
-#endif
-    set_nonblock(lsock);
-    set_sock_buffers_sz(lsock, cfg.sockbuf_bytes);
-    if (bind(lsock, &cfg.laddr.sa, (socklen_t)sizeof_sockaddr(&cfg.laddr)) <
-        0) {
-        P_LOG_ERR("bind(listen): %s", strerror(errno));
-        goto cleanup;
-    }
-    if (listen(lsock, 128) < 0) {
-        P_LOG_ERR("listen: %s", strerror(errno));
-        goto cleanup;
-    }
+    /* Create TCP listen socket via shared helper */
+    lsock = kcptcp_setup_tcp_listener(&cfg.laddr, cfg.reuse_addr,
+                                      cfg.reuse_port, cfg.v6only,
+                                      cfg.sockbuf_bytes, 128);
+    if (lsock < 0) goto cleanup;
 
-    struct epoll_event ev = {0};
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP; /* level-trigger for listener */
-    ev.data.ptr = &magic_listener;             /* mark listener */
-    if (ep_add_or_mod(epfd, lsock, &ev) < 0) {
+    if (kcptcp_ep_register_listener(epfd, lsock, &magic_listener) < 0) {
         P_LOG_ERR("epoll_ctl add listen: %s", strerror(errno));
         goto cleanup;
     }
@@ -395,36 +156,13 @@ int main(int argc, char **argv) {
 
     struct kcp_opts kopts;
     kcp_opts_set_defaults(&kopts);
-    if (kcp_mtu > 0) {
-        kopts.mtu = kcp_mtu;
-    }
-    if (kcp_nd >= 0)
-        kopts.nodelay = kcp_nd;
-    if (kcp_it >= 0)
-        kopts.interval_ms = kcp_it;
-    if (kcp_rs >= 0)
-        kopts.resend = kcp_rs;
-    if (kcp_nc >= 0)
-        kopts.nc = kcp_nc;
-    if (kcp_snd >= 0)
-        kopts.sndwnd = kcp_snd;
-    if (kcp_rcv >= 0)
-        kopts.rcvwnd = kcp_rcv;
+    kcp_opts_apply_overrides(&kopts, kcp_mtu, kcp_nd, kcp_it, kcp_rs, kcp_nc,
+                             kcp_snd, kcp_rcv);
 
     /* Event loop: accept TCP, bridge via KCP over UDP */
     while (!g_state.terminate) {
         /* Compute dynamic timeout from all KCP connections */
-        int timeout_ms = 1000;
-        uint32_t now = kcp_now_ms();
-        struct proxy_conn *pc_it;
-        list_for_each_entry(pc_it, &conns, list) {
-            if (pc_it->kcp) {
-                uint32_t due = ikcp_check(pc_it->kcp, now);
-                int t = (int)((due > now) ? (due - now) : 0);
-                if (t < timeout_ms)
-                    timeout_ms = t;
-            }
-        }
+        int timeout_ms = kcptcp_compute_kcp_timeout_ms(&conns, 1000);
 
         struct epoll_event events[128];
         int nfds = epoll_wait(epfd, events, 128, timeout_ms);
@@ -450,25 +188,12 @@ int main(int argc, char **argv) {
                         P_LOG_ERR("accept: %s", strerror(errno));
                         break;
                     }
-                    set_nonblock(cs);
-                    /* Enable TCP keepalive */
-                    int yes = 1;
-                    (void)setsockopt(cs, SOL_SOCKET, SO_KEEPALIVE, &yes,
-                                     sizeof(yes));
-                    if (cfg.tcp_nodelay) {
-                        int one = 1;
-                        (void)setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, &one,
-                                         sizeof(one));
-                    }
-                    /* Create per-connection UDP socket */
-                    int us = socket(cfg.raddr.sa.sa_family,
-                                    SOCK_DGRAM | SOCK_NONBLOCK, 0);
-                    if (us < 0) {
-                        P_LOG_ERR("socket(udp): %s", strerror(errno));
-                        close(cs);
-                        continue;
-                    }
-                    set_sock_buffers_sz(us, cfg.sockbuf_bytes);
+                    kcptcp_tune_tcp_socket(cs, 0 /*no change*/, cfg.tcp_nodelay,
+                                          true /*keepalive*/);
+                    /* Create per-connection UDP socket via shared helper */
+                    int us = kcptcp_create_udp_socket(cfg.raddr.sa.sa_family,
+                                                     cfg.sockbuf_bytes);
+                    if (us < 0) { close(cs); continue; }
 
                     /* Allocate connection */
                     struct proxy_conn *c =
@@ -525,10 +250,7 @@ int main(int argc, char **argv) {
                     c->udp_tag = utag;
 
                     /* Register both fds */
-                    struct epoll_event cev = {0};
-                    cev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-                    cev.data.ptr = ctag; /* client TCP tag */
-                    if (ep_add_or_mod(epfd, cs, &cev) < 0) {
+                    if (kcptcp_ep_register_tcp(epfd, cs, ctag, false) < 0) {
                         P_LOG_ERR("epoll add cli: %s", strerror(errno));
                         ikcp_release(c->kcp);
                         close(cs);
@@ -538,10 +260,7 @@ int main(int argc, char **argv) {
                         free(c);
                         continue;
                     }
-                    struct epoll_event uev = {0};
-                    uev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-                    uev.data.ptr = utag; /* UDP tag */
-                    if (ep_add_or_mod(epfd, us, &uev) < 0) {
+                    if (kcptcp_ep_register_rw(epfd, us, utag, false) < 0) {
                         P_LOG_ERR("epoll add udp: %s", strerror(errno));
                         (void)ep_del(epfd, cs);
                         ikcp_release(c->kcp);
