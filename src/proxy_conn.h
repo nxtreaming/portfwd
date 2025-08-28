@@ -59,7 +59,9 @@ struct proxy_conn {
 
     /* KCP tunneling fields (used by kcptcp-* binaries) */
     struct IKCPCB *kcp; /* KCP control block */
-    uint32_t conv;      /* KCP conversation ID */
+    uint32_t conv;
+    uint32_t next_conv;
+    struct anti_replay_detector replay_detector;
     int udp_sock;       /* UDP socket for KCP transport (per-conn or shared) */
     union sockaddr_inx peer_addr; /* Remote UDP peer */
     bool use_kcp;                 /* Marks connection as using KCP path */

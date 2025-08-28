@@ -13,12 +13,10 @@
 #include "3rd/kcp/ikcp.h"
 #include "aead_protocol.h"
 
-#define REKEY_SEQ_THRESHOLD (UINT32_MAX - 10000)
-#define REKEY_TIMEOUT_MS 5000
 
 static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk);
 
-static int trigger_rekey_if_needed(struct proxy_conn *c, const uint8_t *psk, bool is_fin) {
+static int trigger_rekey_if_needed(struct proxy_conn *c, const uint8_t *psk) {
     if (!c->has_session_key || !psk || c->rekey_in_progress || c->send_seq < REKEY_SEQ_THRESHOLD) {
         return 0;
     }
@@ -150,7 +148,7 @@ int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len, con
         return ret;
     }
 
-    if (trigger_rekey_if_needed(c, psk, false) != 0) {
+        if (trigger_rekey_if_needed(c, psk) != 0) {
         return -1;
     }
 
@@ -177,7 +175,7 @@ int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk, bool has_ps
         return ikcp_send(c->kcp, (const char *)&fin, 1);
     }
 
-    if (trigger_rekey_if_needed(c, psk, true) != 0) {
+        if (trigger_rekey_if_needed(c, psk) != 0) {
         return -1;
     }
 

@@ -3,6 +3,8 @@
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "proxy_conn.h"
 #include "common.h"
+#include "kcptcp_common.h"
+#include "anti_replay.h"
 
 int derive_session_key_from_psk(const uint8_t psk[32],
                                 const uint8_t token16[16], uint32_t conv,
@@ -43,7 +45,7 @@ void aead_gen_control_packet(struct proxy_conn *c, unsigned char type, uint32_t 
     memcpy(out_pkt + 1, &seq, 4);
     ad[0] = type;
     memcpy(ad + 1, &seq, 4);
-    chacha20poly1305_encrypt(key, nonce, ad, 5, NULL, 0, out_pkt + 5);
+        chacha20poly1305_seal(key, nonce, ad, 5, NULL, 0, out_pkt + 5);
 }
 
 int aead_verify_packet(struct proxy_conn *c, uint8_t *data, int len, uint32_t *out_seq) {
@@ -93,6 +95,6 @@ void aead_seal_packet(struct proxy_conn *c, uint32_t seq, const uint8_t *payload
     ad[0] = KTP_EDATA;
     memcpy(ad + 1, &seq, 4);
 
-    chacha20poly1305_encrypt(c->session_key, c->nonce_base, ad, 5, payload, plen, out_pkt + 1 + 4 + plen);
+        chacha20poly1305_seal(c->session_key, c->nonce_base, ad, 5, payload, plen, out_pkt + 1 + 4 + plen);
     memcpy(out_pkt + 1 + 4, payload, plen);
 }

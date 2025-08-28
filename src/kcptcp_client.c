@@ -23,6 +23,7 @@
 #include "kcptcp_common.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
+#include "aead.h"
 #include "aead_protocol.h"
 
 struct cfg_client {
