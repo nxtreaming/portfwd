@@ -42,7 +42,7 @@ static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk) {
     
     uint8_t ad[5];
     unsigned char pkt[1 + 4 + 16];
-    aead_gen_control_packet(c, KTP_REKEY_INIT, seq, c->session_key, nonce, ad, pkt);
+    aead_gen_control_packet(KTP_REKEY_INIT, seq, c->session_key, nonce, ad, pkt);
 
     if (ikcp_send(c->kcp, (const char *)pkt, sizeof(pkt)) < 0) {
         return -1;
@@ -104,8 +104,8 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data, int l
             unsigned char ack_pkt[1 + 4 + 16];
             uint8_t ack_nonce[12];
             uint8_t ack_ad[5];
-            memcpy(ack_nonce, c->next_nonce_base, 12);
-            aead_gen_control_packet(c, KTP_REKEY_ACK, 0, c->next_session_key, ack_nonce, ack_ad, ack_pkt);
+            memcpy(ack_nonce, c->nonce_base, 12);
+            aead_gen_control_packet(KTP_REKEY_ACK, seq, c->session_key, ack_nonce, ack_ad, ack_pkt);
             ikcp_send(c->kcp, (const char *)ack_pkt, sizeof(ack_pkt));
 
             // Switch to next epoch immediately
