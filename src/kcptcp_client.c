@@ -21,11 +21,10 @@
 #include "proxy_conn.h"
 #include "kcp_common.h"
 #include "kcptcp_common.h"
-#include "aead.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
+#include "aead_protocol.h"
 
-/* ---------------- Client event handlers (extracted) ---------------- */
 struct cfg_client {
     union sockaddr_inx laddr; /* TCP listen */
     union sockaddr_inx raddr; /* UDP remote */
@@ -146,264 +145,17 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             /* Flush any buffered request data */
             if (c->request.dlen > c->request.rpos) {
                 size_t remain = c->request.dlen - c->request.rpos;
-                size_t off = c->request.rpos;
-                while (remain > 0) {
-                    size_t chunk = remain;
-                    if (chunk > sizeof(ubuf) - 1)
-                        chunk = sizeof(ubuf) - 1;
-                    unsigned char *db = (unsigned char *)ubuf;
-                    /* Rekey trigger before sending data */
-                    if (ctx->cfg->has_psk && c->has_session_key &&
-                        !c->rekey_in_progress &&
-                        c->send_seq >= REKEY_SEQ_THRESHOLD) {
-                        c->next_epoch = c->epoch + 1;
-                        if (derive_session_key_epoch(
-                                (const uint8_t *)ctx->cfg->psk, c->hs_token,
-                                c->conv, c->next_epoch, c->next_session_key) !=
-                            0) {
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                        memcpy(c->next_nonce_base, c->next_session_key, 12);
-                        c->rekey_in_progress = true;
-                        c->rekey_deadline_ms =
-                            kcp_now_ms() + REKEY_TIMEOUT_MS;
-                        P_LOG_INFO(
-                            "rekey trigger conv=%u epoch=%u->%u send_seq=%u deadline=%" PRIu64 " (cli)",
-                            c->conv, c->epoch, c->next_epoch, c->send_seq,
-                            c->rekey_deadline_ms);
-                        /* Send REKEY_INIT under current key */
-                        uint8_t nonceI[12];
-                        memcpy(nonceI, c->nonce_base, 12);
-                        uint32_t seqI;
-                        if (!aead_next_send_seq(c, &seqI)) {
-                            P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (cli)",
-                                      c->conv);
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                        nonceI[8] = (uint8_t)seqI;
-                        nonceI[9] = (uint8_t)(seqI >> 8);
-                        nonceI[10] = (uint8_t)(seqI >> 16);
-                        nonceI[11] = (uint8_t)(seqI >> 24);
-                        uint8_t adI[5];
-                        adI[0] = (uint8_t)KTP_REKEY_INIT;
-                        adI[1] = (uint8_t)seqI;
-                        adI[2] = (uint8_t)(seqI >> 8);
-                        adI[3] = (uint8_t)(seqI >> 16);
-                        adI[4] = (uint8_t)(seqI >> 24);
-                        unsigned char pktI[1 + 4 + 16];
-                        pktI[0] = (unsigned char)KTP_REKEY_INIT;
-                        pktI[1] = adI[1];
-                        pktI[2] = adI[2];
-                        pktI[3] = adI[3];
-                        pktI[4] = adI[4];
-                        uint8_t tagI[16];
-                        chacha20poly1305_seal(c->session_key, nonceI, adI,
-                                              sizeof(adI), NULL, 0, NULL,
-                                              tagI);
-                        memcpy(pktI + 1 + 4, tagI, 16);
-                        (void)ikcp_send(c->kcp, (const char *)pktI,
-                                        (int)sizeof(pktI));
-                    }
-                    if (c->has_session_key) {
-                        /* Rekey trigger before sending data */
-                        if (ctx->cfg->has_psk && !c->rekey_in_progress &&
-                            c->send_seq >= REKEY_SEQ_THRESHOLD) {
-                            c->next_epoch = c->epoch + 1;
-                            if (derive_session_key_epoch(
-                                    (const uint8_t *)ctx->cfg->psk,
-                                    c->hs_token, c->conv, c->next_epoch,
-                                    c->next_session_key) != 0) {
-                                c->state = S_CLOSING;
-                                break;
-                            }
-                            memcpy(c->next_nonce_base, c->next_session_key,
-                                   12);
-                            c->rekey_in_progress = true;
-                            c->rekey_deadline_ms =
-                                kcp_now_ms() + REKEY_TIMEOUT_MS;
-                            P_LOG_INFO(
-                                "rekey trigger conv=%u epoch=%u->%u send_seq=%u deadline=%" PRIu64 " (cli)",
-                                c->conv, c->epoch, c->next_epoch, c->send_seq,
-                                c->rekey_deadline_ms);
-                            /* Send REKEY_INIT under current key */
-                            uint8_t nonceI[12];
-                            memcpy(nonceI, c->nonce_base, 12);
-                            uint32_t seqI;
-                            if (!aead_next_send_seq(c, &seqI)) {
-                                P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (cli)",
-                                          c->conv);
-                                c->state = S_CLOSING;
-                                break;
-                            }
-                            nonceI[8] = (uint8_t)seqI;
-                            nonceI[9] = (uint8_t)(seqI >> 8);
-                            nonceI[10] = (uint8_t)(seqI >> 16);
-                            nonceI[11] = (uint8_t)(seqI >> 24);
-                            uint8_t adI[5];
-                            adI[0] = (uint8_t)KTP_REKEY_INIT;
-                            adI[1] = (uint8_t)seqI;
-                            adI[2] = (uint8_t)(seqI >> 8);
-                            adI[3] = (uint8_t)(seqI >> 16);
-                            adI[4] = (uint8_t)(seqI >> 24);
-                            unsigned char pktI[1 + 4 + 16];
-                            pktI[0] = (unsigned char)KTP_REKEY_INIT;
-                            pktI[1] = adI[1];
-                            pktI[2] = adI[2];
-                            pktI[3] = adI[3];
-                            pktI[4] = adI[4];
-                            uint8_t tagI[16];
-                            chacha20poly1305_seal(c->session_key, nonceI, adI,
-                                                  sizeof(adI), NULL, 0, NULL,
-                                                  tagI);
-                            memcpy(pktI + 1 + 4, tagI, 16);
-                            (void)ikcp_send(c->kcp, (const char *)pktI,
-                                            (int)sizeof(pktI));
-                        }
-                        /* [type][seq(4)][ct][tag(16)] */
-                        uint8_t nonce[12];
-                        memcpy(nonce, c->nonce_base, 12);
-                        uint32_t seq;
-                        if (!aead_next_send_seq(c, &seq)) {
-                            P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (cli)",
-                                      c->conv);
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                        nonce[8] = (uint8_t)(seq);
-                        nonce[9] = (uint8_t)(seq >> 8);
-                        nonce[10] = (uint8_t)(seq >> 16);
-                        nonce[11] = (uint8_t)(seq >> 24);
-                        uint8_t ad[5];
-                        ad[0] = (uint8_t)KTP_EDATA;
-                        ad[1] = (uint8_t)seq;
-                        ad[2] = (uint8_t)(seq >> 8);
-                        ad[3] = (uint8_t)(seq >> 16);
-                        ad[4] = (uint8_t)(seq >> 24);
-                        db[0] = (unsigned char)KTP_EDATA;
-                        db[1] = ad[1];
-                        db[2] = ad[2];
-                        db[3] = ad[3];
-                        db[4] = ad[4];
-                        chacha20poly1305_seal(c->session_key, nonce, ad,
-                                              sizeof(ad),
-                                              (const uint8_t *)(c->request.data +
-                                                                off),
-                                              chunk, db + 1 + 4,
-                                              db + 1 + 4 + chunk);
-                        int sn = ikcp_send(c->kcp, (const char *)db,
-                                           (int)(1 + 4 + chunk + 16));
-                        if (sn < 0) {
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                    } else {
-                        db[0] = (unsigned char)KTP_DATA;
-                        memcpy(db + 1, c->request.data + off, chunk);
-                        int sn =
-                            ikcp_send(c->kcp, (const char *)db,
-                                      (int)(chunk + 1));
-                        if (sn < 0) {
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                    }
-                    off += chunk;
-                    remain -= chunk;
+                if (aead_protocol_send_data(c, c->request.data + c->request.rpos, remain, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+                    c->state = S_CLOSING;
+                    break;
                 }
                 c->request.rpos = c->request.dlen; /* consumed */
             }
             /* If TCP already EOF, send FIN now */
             if (c->cli_in_eof) {
-                if (c->has_session_key) {
-                    /* Rekey trigger before sending encrypted FIN */
-                    if (ctx->cfg->has_psk && !c->rekey_in_progress &&
-                        c->send_seq >= REKEY_SEQ_THRESHOLD) {
-                        c->next_epoch = c->epoch + 1;
-                        if (derive_session_key_epoch((const uint8_t *)ctx->cfg->psk,
-                                                    c->hs_token, c->conv,
-                                                    c->next_epoch,
-                                                    c->next_session_key) != 0) {
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                        memcpy(c->next_nonce_base, c->next_session_key, 12);
-                        c->rekey_in_progress = true;
-                        c->rekey_deadline_ms =
-                            kcp_now_ms() + REKEY_TIMEOUT_MS;
-                        P_LOG_INFO(
-                            "rekey trigger (EFIN) conv=%u epoch=%u->%u send_seq=%u deadline=%" PRIu64 " (cli)",
-                            c->conv, c->epoch, c->next_epoch, c->send_seq,
-                            c->rekey_deadline_ms);
-                        /* Send REKEY_INIT under current key */
-                        uint8_t nonceI[12];
-                        memcpy(nonceI, c->nonce_base, 12);
-                        uint32_t seqI;
-                        if (!aead_next_send_seq(c, &seqI)) {
-                            P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (cli)",
-                                      c->conv);
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                        nonceI[8] = (uint8_t)seqI;
-                        nonceI[9] = (uint8_t)(seqI >> 8);
-                        nonceI[10] = (uint8_t)(seqI >> 16);
-                        nonceI[11] = (uint8_t)(seqI >> 24);
-                        uint8_t adI[5];
-                        adI[0] = (uint8_t)KTP_REKEY_INIT;
-                        adI[1] = (uint8_t)seqI;
-                        adI[2] = (uint8_t)(seqI >> 8);
-                        adI[3] = (uint8_t)(seqI >> 16);
-                        adI[4] = (uint8_t)(seqI >> 24);
-                        unsigned char pktI[1 + 4 + 16];
-                        pktI[0] = (unsigned char)KTP_REKEY_INIT;
-                        pktI[1] = adI[1];
-                        pktI[2] = adI[2];
-                        pktI[3] = adI[3];
-                        pktI[4] = adI[4];
-                        uint8_t tagI[16];
-                        chacha20poly1305_seal(c->session_key, nonceI, adI,
-                                              sizeof(adI), NULL, 0, NULL,
-                                              tagI);
-                        memcpy(pktI + 1 + 4, tagI, 16);
-                        (void)ikcp_send(c->kcp, (const char *)pktI,
-                                        (int)sizeof(pktI));
-                    }
-                    uint8_t nonce[12];
-                    memcpy(nonce, c->nonce_base, 12);
-                    uint32_t seq;
-                    if (!aead_next_send_seq(c, &seq)) {
-                        P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (cli)",
-                                  c->conv);
-                        c->state = S_CLOSING;
-                        break;
-                    }
-                    nonce[8] = (uint8_t)seq;
-                    nonce[9] = (uint8_t)(seq >> 8);
-                    nonce[10] = (uint8_t)(seq >> 16);
-                    nonce[11] = (uint8_t)(seq >> 24);
-                    uint8_t ad[5];
-                    ad[0] = (uint8_t)KTP_EFIN;
-                    ad[1] = (uint8_t)seq;
-                    ad[2] = (uint8_t)(seq >> 8);
-                    ad[3] = (uint8_t)(seq >> 16);
-                    ad[4] = (uint8_t)(seq >> 24);
-                    unsigned char pkt[1 + 4 + 16];
-                    pkt[0] = (unsigned char)KTP_EFIN;
-                    pkt[1] = ad[1];
-                    pkt[2] = ad[2];
-                    pkt[3] = ad[3];
-                    pkt[4] = ad[4];
-                    uint8_t tag[16];
-                    chacha20poly1305_seal(c->session_key, nonce, ad,
-                                          sizeof(ad), NULL, 0, NULL, tag);
-                    memcpy(pkt + 1 + 4, tag, 16);
-                    (void)ikcp_send(c->kcp, (const char *)pkt,
-                                    (int)sizeof(pkt));
-                } else {
-                    unsigned char fin = (unsigned char)KTP_FIN;
-                    (void)ikcp_send(c->kcp, (const char *)&fin, 1);
+                if (aead_protocol_send_fin(c, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+                    c->state = S_CLOSING;
+                    break;
                 }
             }
             continue;
@@ -426,263 +178,29 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             int got = ikcp_recv(c->kcp, ubuf, peek);
             if (got <= 0)
                 break;
-            /* Stats: each ikcp_recv yields one KCP RX message */
             c->kcp_rx_msgs++;
-            if (got < 1)
-                continue;
-            unsigned char t = (unsigned char)ubuf[0];
-            /* Rekey control handling */
-            if (t == KTP_REKEY_INIT && c->has_session_key) {
-                if (got < (int)(1 + 4 + 16))
-                    continue;
-                uint32_t seq = (uint32_t)((uint8_t)ubuf[1] |
-                                          ((uint8_t)ubuf[2] << 8) |
-                                          ((uint8_t)ubuf[3] << 16) |
-                                          ((uint8_t)ubuf[4] << 24));
-                /* Tentative anti-replay */
-                uint32_t win_tmp = c->recv_win;
-                uint64_t mask_tmp = c->recv_win_mask;
-                if (!aead_replay_check_and_update(seq, &win_tmp, &mask_tmp)) {
-                    P_LOG_WARN("drop replay/old REKEY_INIT seq=%u (cli)", seq);
-                    continue;
-                }
-                uint8_t nonce[12];
-                memcpy(nonce, c->nonce_base, 12);
-                nonce[8] = (uint8_t)seq;
-                nonce[9] = (uint8_t)(seq >> 8);
-                nonce[10] = (uint8_t)(seq >> 16);
-                nonce[11] = (uint8_t)(seq >> 24);
-                uint8_t ad[5];
-                ad[0] = (uint8_t)KTP_REKEY_INIT;
-                ad[1] = (uint8_t)seq;
-                ad[2] = (uint8_t)(seq >> 8);
-                ad[3] = (uint8_t)(seq >> 16);
-                ad[4] = (uint8_t)(seq >> 24);
-                if (chacha20poly1305_open(c->session_key, nonce, ad,
-                                          sizeof(ad), NULL, 0,
-                                          (const uint8_t *)(ubuf + 1 + 4),
-                                          (uint8_t *)ubuf) != 0) {
-                    P_LOG_ERR("REKEY_INIT tag verify failed (cli)");
-                    c->state = S_CLOSING;
-                    break;
-                }
-                /* Commit anti-replay */
-                c->recv_win = win_tmp;
-                c->recv_win_mask = mask_tmp;
-                P_LOG_INFO("recv REKEY_INIT conv=%u seq=%u (cli)", c->conv, seq);
-                if (!ctx->cfg->has_psk) {
-                    c->state = S_CLOSING;
-                    break;
-                }
-                /* Prepare next key if not already */
-                if (!c->rekey_in_progress) {
-                    c->next_epoch = c->epoch + 1;
-                    if (derive_session_key_epoch((const uint8_t *)ctx->cfg->psk,
-                                                c->hs_token, c->conv,
-                                                c->next_epoch,
-                                                c->next_session_key) != 0) {
-                        c->state = S_CLOSING;
-                        break;
-                    }
-                    memcpy(c->next_nonce_base, c->next_session_key, 12);
-                    c->rekey_in_progress = true;
-                }
-                /* Send REKEY_ACK sealed with NEXT key, seq=0 (next epoch namespace) */
-                {
-                    unsigned char pkt[1 + 4 + 16];
-                    pkt[0] = (unsigned char)KTP_REKEY_ACK;
-                    pkt[1] = 0;
-                    pkt[2] = 0;
-                    pkt[3] = 0;
-                    pkt[4] = 0;
-                    uint8_t nonce2[12];
-                    memcpy(nonce2, c->next_nonce_base, 12);
-                    /* seq 0 -> nonce low bytes all zero */
-                    uint8_t ad2[5];
-                    ad2[0] = (uint8_t)KTP_REKEY_ACK;
-                    ad2[1] = 0;
-                    ad2[2] = 0;
-                    ad2[3] = 0;
-                    ad2[4] = 0;
-                    uint8_t tag[16];
-                    chacha20poly1305_seal(c->next_session_key, nonce2, ad2,
-                                          sizeof(ad2), NULL, 0, NULL, tag);
-                    memcpy(pkt + 1 + 4, tag, 16);
-                    (void)ikcp_send(c->kcp, (const char *)pkt,
-                                    (int)sizeof(pkt));
-                }
-                /* Switch to next epoch immediately */
-                memcpy(c->session_key, c->next_session_key, 32);
-                memcpy(c->nonce_base, c->next_nonce_base, 12);
-                c->epoch = c->next_epoch;
-                c->send_seq = 0;
-                c->recv_win = UINT32_MAX;
-                c->recv_win_mask = 0ULL;
-                c->rekey_in_progress = false;
-                P_LOG_INFO("epoch switch conv=%u -> epoch=%u (cli)", c->conv,
-                           c->epoch);
-                continue;
-            }
-            if (t == KTP_REKEY_ACK && c->has_session_key &&
-                c->rekey_in_progress) {
-                if (got < (int)(1 + 4 + 16))
-                    continue;
-                /* verify with next key, seq must be 0 */
-                uint32_t seq = (uint32_t)((uint8_t)ubuf[1] |
-                                          ((uint8_t)ubuf[2] << 8) |
-                                          ((uint8_t)ubuf[3] << 16) |
-                                          ((uint8_t)ubuf[4] << 24));
-                if (seq != 0) {
-                    P_LOG_ERR("REKEY_ACK seq!=0 (cli)");
-                    c->state = S_CLOSING;
-                    break;
-                }
-                uint8_t nonce2[12];
-                memcpy(nonce2, c->next_nonce_base, 12);
-                uint8_t ad2[5];
-                ad2[0] = (uint8_t)KTP_REKEY_ACK;
-                ad2[1] = 0;
-                ad2[2] = 0;
-                ad2[3] = 0;
-                ad2[4] = 0;
-                if (chacha20poly1305_open(c->next_session_key, nonce2, ad2,
-                                          sizeof(ad2), NULL, 0,
-                                          (const uint8_t *)(ubuf + 1 + 4),
-                                          (uint8_t *)ubuf) != 0) {
-                    P_LOG_ERR("REKEY_ACK tag verify failed (cli)");
-                    c->state = S_CLOSING;
-                    break;
-                }
-                P_LOG_INFO("recv REKEY_ACK conv=%u (cli)", c->conv);
-                /* Switch epoch */
-                memcpy(c->session_key, c->next_session_key, 32);
-                memcpy(c->nonce_base, c->next_nonce_base, 12);
-                c->epoch = c->next_epoch;
-                c->send_seq = 0;
-                c->recv_win = UINT32_MAX;
-                c->recv_win_mask = 0ULL;
-                c->rekey_in_progress = false;
-                P_LOG_INFO("epoch switch conv=%u -> epoch=%u (cli)", c->conv,
-                           c->epoch);
-                continue;
-            }
-            if (c->has_session_key && (t == KTP_DATA || t == KTP_FIN)) {
-                /* Encrypted session must not receive plaintext types */
-                P_LOG_ERR("plaintext pkt type in encrypted session (cli)");
+
+            char *payload = NULL;
+            int plen = 0;
+            int res = aead_protocol_handle_incoming_packet(c, ubuf, got, ctx->cfg->psk, ctx->cfg->has_psk, &payload, &plen);
+
+            if (res < 0) { // Error
                 c->state = S_CLOSING;
                 break;
             }
-            if (t == KTP_EFIN && c->has_session_key) {
-                if (got < (int)(1 + 4 + 16))
-                    continue;
-                uint32_t seq = (uint32_t)((uint8_t)ubuf[1] |
-                                          ((uint8_t)ubuf[2] << 8) |
-                                          ((uint8_t)ubuf[3] << 16) |
-                                          ((uint8_t)ubuf[4] << 24));
-                /* Anti-replay window check (tentative) */
-                uint32_t win_tmp = c->recv_win;
-                uint64_t mask_tmp = c->recv_win_mask;
-                if (!aead_replay_check_and_update(seq, &win_tmp, &mask_tmp)) {
-                    P_LOG_WARN("drop replay/old EFIN seq=%u (cli)", seq);
-                    continue;
-                }
-                uint8_t nonce[12];
-                memcpy(nonce, c->nonce_base, 12);
-                nonce[8] = (uint8_t)seq;
-                nonce[9] = (uint8_t)(seq >> 8);
-                nonce[10] = (uint8_t)(seq >> 16);
-                nonce[11] = (uint8_t)(seq >> 24);
-                uint8_t ad[5];
-                ad[0] = (uint8_t)KTP_EFIN;
-                ad[1] = (uint8_t)seq;
-                ad[2] = (uint8_t)(seq >> 8);
-                ad[3] = (uint8_t)(seq >> 16);
-                ad[4] = (uint8_t)(seq >> 24);
-                if (chacha20poly1305_open(c->session_key, nonce, ad,
-                                          sizeof(ad), NULL, 0,
-                                          (const uint8_t *)(ubuf + 1 + 4),
-                                          (uint8_t *)ubuf) != 0) {
-                    P_LOG_ERR("EFIN tag verify failed");
-                    c->state = S_CLOSING;
-                    break;
-                }
-                /* Commit anti-replay window advance */
-                c->recv_win = win_tmp;
-                c->recv_win_mask = mask_tmp;
-                /* treat as FIN */
-                c->svr_in_eof = true;
-                if (!c->svr2cli_shutdown &&
-                    c->response.dlen == c->response.rpos) {
+            if (res > 0) { // Control packet handled
+                if (c->svr_in_eof && !c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
                     shutdown(c->cli_sock, SHUT_WR);
                     c->svr2cli_shutdown = true;
                 }
                 continue;
             }
-            if (t == KTP_FIN) {
-                /* Peer half-closing server->client: record and possibly shutdown write after drain */
-                c->svr_in_eof = true;
-                /* Try to shutdown write if nothing pending */
-                if (!c->svr2cli_shutdown &&
-                    c->response.dlen == c->response.rpos) {
-                    shutdown(c->cli_sock, SHUT_WR);
-                    c->svr2cli_shutdown = true;
-                }
+
+            if (!payload || plen <= 0) {
                 continue;
             }
-            /* Data (plain or encrypted) */
-            char *payload = NULL;
-            int plen = 0;
-            if (t == KTP_EDATA && c->has_session_key) {
-                if (got < (int)(1 + 4 + 16))
-                    continue;
-                uint32_t seq = (uint32_t)((uint8_t)ubuf[1] |
-                                          ((uint8_t)ubuf[2] << 8) |
-                                          ((uint8_t)ubuf[3] << 16) |
-                                          ((uint8_t)ubuf[4] << 24));
-                /* Anti-replay window check (tentative) */
-                uint32_t win_tmp = c->recv_win;
-                uint64_t mask_tmp = c->recv_win_mask;
-                if (!aead_replay_check_and_update(seq, &win_tmp, &mask_tmp)) {
-                    P_LOG_WARN("drop replay/old EDATA seq=%u (cli)", seq);
-                    continue;
-                }
-                uint8_t nonce[12];
-                memcpy(nonce, c->nonce_base, 12);
-                nonce[8] = (uint8_t)seq;
-                nonce[9] = (uint8_t)(seq >> 8);
-                nonce[10] = (uint8_t)(seq >> 16);
-                nonce[11] = (uint8_t)(seq >> 24);
-                uint8_t ad[5];
-                ad[0] = (uint8_t)KTP_EDATA;
-                ad[1] = (uint8_t)seq;
-                ad[2] = (uint8_t)(seq >> 8);
-                ad[3] = (uint8_t)(seq >> 16);
-                ad[4] = (uint8_t)(seq >> 24);
-                int ctlen = got - (int)(1 + 4 + 16);
-                if (ctlen < 0)
-                    continue;
-                if (chacha20poly1305_open(c->session_key, nonce, ad,
-                                          sizeof(ad),
-                                          (const uint8_t *)(ubuf + 1 + 4),
-                                          (size_t)ctlen,
-                                          (const uint8_t *)(ubuf + 1 + 4 + ctlen),
-                                          (uint8_t *)ubuf) != 0) {
-                    P_LOG_ERR("EDATA tag verify failed");
-                    c->state = S_CLOSING;
-                    break;
-                }
-                /* Commit anti-replay window advance */
-                c->recv_win = win_tmp;
-                c->recv_win_mask = mask_tmp;
-                payload = ubuf;
-                plen = ctlen;
-            } else {
-                payload = ubuf + 1;
-                plen = got - 1;
-            }
-            /* Stats: count KCP RX payload bytes */
-            if (plen > 0)
-                c->kcp_rx_bytes += (uint64_t)plen;
+
+            c->kcp_rx_bytes += (uint64_t)plen;
             ssize_t wn = send(c->cli_sock, payload, (size_t)plen, MSG_NOSIGNAL);
             if (wn < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {

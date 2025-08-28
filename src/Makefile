@@ -20,7 +20,7 @@ udpfwd: udpfwd.o common.o $(NO_EPOLL_O)
 
 # KCP-based TCP-over-UDP binaries with AEAD support
 KCPOBJS = kcp_common.o 3rd/kcp/ikcp.o
-AEADOBJS = aead.o 3rd/chacha20poly1305/chacha20poly1305.o
+AEADOBJS = aead_protocol.o aead.o 3rd/chacha20poly1305/chacha20poly1305.o
 KCPTCPOBJS = kcptcp_common.o
 
 kcptcp-client: kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) common.o $(NO_EPOLL_O)
@@ -49,6 +49,9 @@ kcp_common.o: kcp_common.c kcp_common.h proxy_conn.h common.h
 kcp_map.o: kcp_map.c kcp_map.h proxy_conn.h common.h
 
 # AEAD and vendor chacha20poly1305
+aead_protocol.o: aead_protocol.c aead_protocol.h proxy_conn.h kcptcp_common.h aead.h
+	$(CC) $(CFLAGS) -c -o aead_protocol.o aead_protocol.c
+
 aead.o: aead.c aead.h 3rd/chacha20poly1305/chacha20poly1305.h
 	$(CC) $(CFLAGS) -c -o aead.o aead.c
 3rd/chacha20poly1305/chacha20poly1305.o: 3rd/chacha20poly1305/chacha20poly1305.c 3rd/chacha20poly1305/chacha20poly1305.h
