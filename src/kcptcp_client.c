@@ -453,7 +453,7 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
                 memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
                 c->request.dlen += (size_t)rn;
             } else {
-                int sn = aead_protocol_send_data(c, tbuf, rn, cfg->psk, cfg->has_psk);
+                int sn = aead_protocol_send_data(c, tbuf, rn, ctx->cfg->psk, ctx->cfg->has_psk);
                 if (sn < 0) {
                     c->state = S_CLOSING;
                     break;
@@ -463,7 +463,7 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
         if (rn == 0) {
             /* TCP EOF: on handshake pending, defer FIN until ready */
             if (c->kcp_ready) {
-                (void)aead_protocol_send_fin(c, cfg->psk, cfg->has_psk);
+                (void)aead_protocol_send_fin(c, ctx->cfg->psk, ctx->cfg->has_psk);
             }
             c->cli_in_eof = true;
             struct epoll_event cev = (struct epoll_event){0};
