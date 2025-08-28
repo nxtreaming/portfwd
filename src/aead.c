@@ -87,6 +87,13 @@ int aead_verify_ack_packet(struct proxy_conn *c, uint8_t *data, int len) {
     return 0;
 }
 
+void aead_epoch_switch(struct proxy_conn *c) {
+    memcpy(c->session_key, c->next_session_key, 32);
+    memcpy(c->nonce_base, c->next_nonce_base, 12);
+    c->epoch = c->next_epoch;
+    c->rekey_in_progress = false;
+}
+
 void aead_seal_packet(struct proxy_conn *c, uint32_t seq, const uint8_t *payload, size_t plen, uint8_t *out_pkt) {
     out_pkt[0] = KTP_EDATA;
     memcpy(out_pkt + 1, &seq, 4);
