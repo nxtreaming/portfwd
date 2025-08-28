@@ -449,6 +449,7 @@ int main(int argc, char **argv) {
                             }
                             /* Commit anti-replay */
                             c->recv_win = win_tmp; c->recv_win_mask = mask_tmp;
+                            P_LOG_INFO("recv REKEY_INIT conv=%u seq=%u (svr)", c->conv, seq);
                             if (!cfg.has_psk) { c->state = S_CLOSING; break; }
                             /* Prepare next key if not already */
                             if (!c->rekey_in_progress) {
@@ -476,6 +477,7 @@ int main(int argc, char **argv) {
                             c->send_seq = 0;
                             c->recv_win = UINT32_MAX; c->recv_win_mask = 0ULL;
                             c->rekey_in_progress = false;
+                            P_LOG_INFO("epoch switch conv=%u -> epoch=%u (svr)", c->conv, c->epoch);
                             continue;
                         }
                         if (t == KTP_REKEY_ACK && c->has_session_key && c->rekey_in_progress) {
@@ -488,6 +490,7 @@ int main(int argc, char **argv) {
                                 P_LOG_ERR("REKEY_ACK tag verify failed (svr)");
                                 c->state = S_CLOSING; break;
                             }
+                            P_LOG_INFO("recv REKEY_ACK conv=%u (svr)", c->conv);
                             /* Switch epoch */
                             memcpy(c->session_key, c->next_session_key, 32);
                             memcpy(c->nonce_base, c->next_nonce_base, 12);
@@ -495,6 +498,7 @@ int main(int argc, char **argv) {
                             c->send_seq = 0;
                             c->recv_win = UINT32_MAX; c->recv_win_mask = 0ULL;
                             c->rekey_in_progress = false;
+                            P_LOG_INFO("epoch switch conv=%u -> epoch=%u (svr)", c->conv, c->epoch);
                             continue;
                         }
                         if (c->has_session_key && (t == KTP_DATA || t == KTP_FIN)) {
@@ -686,8 +690,28 @@ int main(int argc, char **argv) {
                     int sn = 0;
                     if (c->has_session_key) {
                         unsigned char hdrbuf[1 + 4 + sizeof(sbuf) + 16];
+                        /* Rekey trigger before sending encrypted data */
+                        if (c->has_session_key && cfg.has_psk && !c->rekey_in_progress && c->send_seq >= REKEY_SEQ_THRESHOLD) {
+                            c->next_epoch = c->epoch + 1;
+                            if (derive_session_key_epoch((const uint8_t*)cfg.psk, c->hs_token, c->conv, c->next_epoch, c->next_session_key) != 0) { c->state = S_CLOSING; break; }
+                            memcpy(c->next_nonce_base, c->next_session_key, 12);
+                            c->rekey_in_progress = true;
+                            c->rekey_deadline_ms = kcp_now_ms() + REKEY_TIMEOUT_MS;
+                            P_LOG_INFO("rekey trigger conv=%u epoch=%u->%u send_seq=%u deadline=%u (svr)", c->conv, c->epoch, c->next_epoch, c->send_seq, c->rekey_deadline_ms);
+                            /* Send REKEY_INIT under current key */
+                            uint8_t nonceI[12]; memcpy(nonceI, c->nonce_base, 12);
+                            uint32_t seqI; if (!aead_next_send_seq(c, &seqI)) { P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (svr)", c->conv); c->state = S_CLOSING; break; }
+                            nonceI[8]=(uint8_t)seqI; nonceI[9]=(uint8_t)(seqI>>8); nonceI[10]=(uint8_t)(seqI>>16); nonceI[11]=(uint8_t)(seqI>>24);
+                            uint8_t adI[5]; adI[0]=(uint8_t)KTP_REKEY_INIT; adI[1]=(uint8_t)seqI; adI[2]=(uint8_t)(seqI>>8); adI[3]=(uint8_t)(seqI>>16); adI[4]=(uint8_t)(seqI>>24);
+                            unsigned char pktI[1 + 4 + 16];
+                            pktI[0] = (unsigned char)KTP_REKEY_INIT;
+                            pktI[1] = adI[1]; pktI[2] = adI[2]; pktI[3] = adI[3]; pktI[4] = adI[4];
+                            uint8_t tagI[16]; chacha20poly1305_seal(c->session_key, nonceI, adI, sizeof(adI), NULL, 0, NULL, tagI);
+                            memcpy(pktI + 1 + 4, tagI, 16);
+                            (void)ikcp_send(c->kcp, (const char*)pktI, (int)sizeof(pktI));
+                        }
                         uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
-                        uint32_t seq; if (!aead_next_send_seq(c, &seq)) { c->state = S_CLOSING; break; }
+                        uint32_t seq; if (!aead_next_send_seq(c, &seq)) { P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (svr)", c->conv); c->state = S_CLOSING; break; }
                         nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
                         uint8_t ad[5]; ad[0]=(uint8_t)KTP_EDATA; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
                         hdrbuf[0] = (unsigned char)KTP_EDATA;
@@ -709,8 +733,28 @@ int main(int argc, char **argv) {
                 if (rn == 0) {
                     /* TCP target sent EOF: send FIN/EFIN over KCP, stop further reads, allow pending KCP to flush */
                     if (c->has_session_key) {
+                        /* Rekey trigger before sending encrypted FIN */
+                        if (c->has_session_key && cfg.has_psk && !c->rekey_in_progress && c->send_seq >= REKEY_SEQ_THRESHOLD) {
+                            c->next_epoch = c->epoch + 1;
+                            if (derive_session_key_epoch((const uint8_t*)cfg.psk, c->hs_token, c->conv, c->next_epoch, c->next_session_key) != 0) { c->state = S_CLOSING; break; }
+                            memcpy(c->next_nonce_base, c->next_session_key, 12);
+                            c->rekey_in_progress = true;
+                            c->rekey_deadline_ms = kcp_now_ms() + REKEY_TIMEOUT_MS;
+                            P_LOG_INFO("rekey trigger (EFIN) conv=%u epoch=%u->%u send_seq=%u deadline=%u (svr)", c->conv, c->epoch, c->next_epoch, c->send_seq, c->rekey_deadline_ms);
+                            /* Send REKEY_INIT under current key */
+                            uint8_t nonceI[12]; memcpy(nonceI, c->nonce_base, 12);
+                            uint32_t seqI; if (!aead_next_send_seq(c, &seqI)) { P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (svr)", c->conv); c->state = S_CLOSING; break; }
+                            nonceI[8]=(uint8_t)seqI; nonceI[9]=(uint8_t)(seqI>>8); nonceI[10]=(uint8_t)(seqI>>16); nonceI[11]=(uint8_t)(seqI>>24);
+                            uint8_t adI[5]; adI[0]=(uint8_t)KTP_REKEY_INIT; adI[1]=(uint8_t)seqI; adI[2]=(uint8_t)(seqI>>8); adI[3]=(uint8_t)(seqI>>16); adI[4]=(uint8_t)(seqI>>24);
+                            unsigned char pktI[1 + 4 + 16];
+                            pktI[0] = (unsigned char)KTP_REKEY_INIT;
+                            pktI[1] = adI[1]; pktI[2] = adI[2]; pktI[3] = adI[3]; pktI[4] = adI[4];
+                            uint8_t tagI[16]; chacha20poly1305_seal(c->session_key, nonceI, adI, sizeof(adI), NULL, 0, NULL, tagI);
+                            memcpy(pktI + 1 + 4, tagI, 16);
+                            (void)ikcp_send(c->kcp, (const char*)pktI, (int)sizeof(pktI));
+                        }
                         uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
-                        uint32_t seq; if (!aead_next_send_seq(c, &seq)) { c->state = S_CLOSING; }
+                        uint32_t seq; if (!aead_next_send_seq(c, &seq)) { P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (svr)", c->conv); c->state = S_CLOSING; }
                         nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
                         uint8_t ad[5]; ad[0]=(uint8_t)KTP_EFIN; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
                         unsigned char pkt[1 + 4 + 16];
@@ -755,6 +799,13 @@ int main(int argc, char **argv) {
             if (pos->state != S_CLOSING && pos->last_active && (ct - pos->last_active) > IDLE_TO) {
                 P_LOG_INFO("idle timeout, conv=%u", pos->conv);
                 pos->state = S_CLOSING;
+            }
+            /* Rekey timeout enforcement */
+            if (pos->state != S_CLOSING && pos->has_session_key && pos->rekey_in_progress) {
+                if (now >= pos->rekey_deadline_ms) {
+                    P_LOG_ERR("rekey timeout, closing conv=%u (svr)", pos->conv);
+                    pos->state = S_CLOSING;
+                }
             }
             if (pos->state == S_CLOSING) {
                 (void)ep_del(epfd, pos->svr_sock);
