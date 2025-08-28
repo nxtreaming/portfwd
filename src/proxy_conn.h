@@ -96,6 +96,27 @@ struct proxy_conn {
     uint8_t next_nonce_base[12];  /* base for next epoch; usually first 12 bytes of next_session_key */
     uint32_t next_epoch;          /* typically epoch+1 */
     uint64_t rekey_deadline_ms;   /* absolute deadline (kcp_now_ms) to receive/switch, else close */
+    
+    /* Runtime statistics (Phase 4): throughput, RTT snapshots, counters */
+    uint64_t tcp_rx_bytes;        /* bytes read from TCP (ingress from client or to server) */
+    uint64_t tcp_tx_bytes;        /* bytes written to TCP (egress to client or to server) */
+    uint64_t udp_rx_bytes;        /* bytes received from UDP peer */
+    uint64_t udp_tx_bytes;        /* bytes sent over UDP to peer */
+    uint64_t kcp_tx_msgs;         /* number of ikcp_send() messages we attempted */
+    uint64_t kcp_rx_msgs;         /* number of messages drained via ikcp_recv() */
+    uint64_t kcp_tx_bytes;        /* application payload bytes passed into KCP */
+    uint64_t kcp_rx_bytes;        /* application payload bytes received from KCP */
+    uint32_t rekeys_initiated;    /* count of REKEY_INIT we triggered */
+    uint32_t rekeys_completed;    /* count of successful epoch switches */
+    uint64_t last_stat_ms;        /* last time we printed stats */
+    /* Last-snapshot deltas for periodic logging */
+    uint64_t last_tcp_rx_bytes;
+    uint64_t last_tcp_tx_bytes;
+    uint64_t last_kcp_tx_bytes;
+    uint64_t last_kcp_rx_bytes;
+    uint32_t last_kcp_xmit;       /* snapshot of kcp->xmit for retrans/xmit deltas */
+    uint32_t last_rekeys_initiated;
+    uint32_t last_rekeys_completed;
 };
 
 /* Epoll event tag to disambiguate fd source */

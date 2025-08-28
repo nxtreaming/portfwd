@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,6 +17,63 @@
 
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int s){ (void)s; g_stop = 1; }
+
+/* Find maximum floating value after key, tolerant to following text like " Mbps" */
+static double find_max_double(const char* buf, size_t len, const char* key) {
+    if (!buf || !key) return 0.0;
+    size_t klen = strlen(key);
+    if (klen == 0 || len < klen) return 0.0;
+    double maxv = 0.0;
+    size_t i = 0;
+    char tmp[64];
+    while (i + klen < len) {
+        if (memcmp(buf + i, key, klen) == 0) {
+            size_t j = i + klen;
+            // copy up to next non-number char window
+            size_t t = 0;
+            // allow optional sign, digits, dot
+            while (j < len && t + 1 < sizeof(tmp)) {
+                char c = buf[j];
+                if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') {
+                    tmp[t++] = c; j++;
+                } else {
+                    break;
+                }
+            }
+            tmp[t] = '\0';
+            if (t > 0) {
+                double v = strtod(tmp, NULL);
+                if (v > maxv) maxv = v;
+            }
+            i = j;
+        } else {
+            i++;
+        }
+    }
+    return maxv;
+}
+
+/* Find the maximum numeric value appearing after a given key pattern, e.g., key="rekey i=" */
+static unsigned find_max_counter(const char* buf, size_t len, const char* key) {
+    if (!buf || !key) return 0u;
+    size_t klen = strlen(key);
+    if (klen == 0 || len < klen) return 0u;
+    unsigned maxv = 0u;
+    size_t i = 0;
+    while (i + klen <= len) {
+        if (memcmp(buf + i, key, klen) == 0) {
+            size_t j = i + klen;
+            // parse unsigned integer digits
+            unsigned v = 0u; bool any = false;
+            while (j < len && isdigit((unsigned char)buf[j])) { any = true; v = v*10u + (unsigned)(buf[j]-'0'); j++; }
+            if (any && v > maxv) maxv = v;
+            i = j;
+        } else {
+            i++;
+        }
+    }
+    return maxv;
+}
 
 // forward declarations for functions used before definition
 static void msleep(int ms);
@@ -72,6 +130,19 @@ static void die(const char* fmt, ...) {
     fputc('\n', stderr); exit(1);
 }
 
+/* Return true if needle appears as a contiguous substring within the first len bytes of buf */
+static bool contains(const char* buf, size_t len, const char* needle) {
+    if (!buf || !needle) return false;
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return true;
+    if (len < nlen) return false;
+    const size_t last = len - nlen;
+    for (size_t i = 0; i <= last; ++i) {
+        if (memcmp(buf + i, needle, nlen) == 0) return true;
+    }
+    return false;
+}
+
 static pid_t spawn(char* const argv[]) {
     pid_t pid = fork();
     if (pid < 0) die("fork failed: %s", strerror(errno));
@@ -115,6 +186,11 @@ int main(int argc, char** argv){
     size_t pause_at_mb = (argc >= 5) ? (size_t)strtoul(argv[4], NULL, 10) : (send_mb/2 ? send_mb/2 : 1);
 
     signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
+
+    // Make stats logs more responsive for tests and ensure enabled
+    setenv("PFWD_STATS_INTERVAL_MS", "1000", 1); // 1s interval
+    setenv("PFWD_STATS_ENABLE", "1", 1);
+    setenv("PFWD_STATS_DUMP", "1", 1);
 
     // Launch tcp_echo 127.0.0.1:2323
     char* echo_argv[] = { (char*)"./tcp_echo", (char*)"127.0.0.1", (char*)"2323", NULL };
@@ -219,6 +295,32 @@ out:
         if (!contains(cli_log, cli_len, "epoch switch")) ok = false;
         if (!contains(srv_log, srv_len, "recv REKEY_INIT")) ok = false;
         if (!contains(srv_log, srv_len, "epoch switch")) ok = false;
+        // Ensure at least one periodic stats log line is emitted by either side
+        bool has_stats_cli = contains(cli_log, cli_len, "stats conv=");
+        bool has_stats_srv = contains(srv_log, srv_len, "stats conv=");
+        if (!has_stats_cli && !has_stats_srv) ok = false;
+        // Ensure at least one final totals line is emitted by either side
+        bool has_total_cli = contains(cli_log, cli_len, "stats total conv=");
+        bool has_total_srv = contains(srv_log, srv_len, "stats total conv=");
+        if (!has_total_cli && !has_total_srv) ok = false;
+        // Validate throughput counters (expect some positive traffic)
+        double tcp_in = find_max_double(cli_log, cli_len, "TCP in=");
+        if (tcp_in <= 0.0) tcp_in = find_max_double(srv_log, srv_len, "TCP in=");
+        double kcp_out = find_max_double(cli_log, cli_len, "KCP payload out=");
+        if (kcp_out <= 0.0) kcp_out = find_max_double(srv_log, srv_len, "KCP payload out=");
+        if (tcp_in <= 0.0 && kcp_out <= 0.0) ok = false;
+        // Verify rekey counter deltas observed in stats logs (expect >=1 initiated and completed)
+        unsigned i_max = find_max_counter(cli_log, cli_len, "rekey i=");
+        if (i_max == 0u) {
+            unsigned i_max_srv = find_max_counter(srv_log, srv_len, "rekey i=");
+            i_max = i_max_srv;
+        }
+        unsigned c_max = find_max_counter(cli_log, cli_len, "rekey c=");
+        if (c_max == 0u) {
+            unsigned c_max_srv = find_max_counter(srv_log, srv_len, "rekey c=");
+            c_max = c_max_srv;
+        }
+        if (i_max == 0u || c_max == 0u) ok = false;
         if (!ok) die("missing expected rekey logs (trigger/ACK/epoch) in client/server output");
         fprintf(stderr, "[it] completed echo %zu/%zu bytes OK and rekey logs verified\n", recvd, total);
     }

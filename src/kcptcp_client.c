@@ -14,12 +14,44 @@
 #include <stdbool.h>
 #include <time.h>
 #include <stddef.h>
+#if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
+#include <netinet/tcp.h>
+#endif
 #include "common.h"
 #include "proxy_conn.h"
 #include "kcp_common.h"
 #include "aead.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
+
+/* Allow overriding stats logging interval via environment variable PFWD_STATS_INTERVAL_MS */
+static inline uint32_t get_stats_interval_ms(void) {
+    static uint32_t cached = 0; /* 0 => uninitialized */
+    if (cached == 0) {
+        const char *s = getenv("PFWD_STATS_INTERVAL_MS");
+        long v = s ? strtol(s, NULL, 10) : 0;
+        if (v <= 0) v = 5000; /* default 5s */
+        if (v < 100) v = 100; /* clamp to sane minimum */
+        if (v > 600000) v = 600000; /* clamp to 10 minutes */
+        cached = (uint32_t)v;
+    }
+    return cached;
+}
+
+/* Dump final totals at connection close if PFWD_STATS_DUMP is set to non-zero */
+static inline bool get_stats_dump_enabled(void) {
+    const char *s = getenv("PFWD_STATS_DUMP");
+    if (!s) return false;
+    return !(s[0] == '0');
+}
+
+/* Enable/disable stats via PFWD_STATS_ENABLE (set to "0" to disable) */
+static inline bool get_stats_enabled(void) {
+    const char *s = getenv("PFWD_STATS_ENABLE");
+    if (!s) return true; /* default enabled */
+    /* treat any leading '0' as false */
+    return !(s[0] == '0');
+}
 
 /* Anti-replay helpers (sliding window, 64 entries) */
 static inline int32_t seq_diff_u32(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
@@ -64,7 +96,7 @@ static inline bool aead_next_send_seq(struct proxy_conn *c, uint32_t *out_seq) {
 
 static void print_usage(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <local_tcp_addr:port> <remote_udp_addr:port>", prog);
-    P_LOG_INFO("Options (subset; KCP tunables to be added):");
+    P_LOG_INFO("Options:");
     P_LOG_INFO("  -d                 run in background (daemonize)");
     P_LOG_INFO("  -p <pidfile>       write PID to file");
     P_LOG_INFO("  -r                 set SO_REUSEADDR on listener socket");
@@ -72,6 +104,13 @@ static void print_usage(const char *prog) {
     P_LOG_INFO("  -6                 for IPv6 listener, set IPV6_V6ONLY");
     P_LOG_INFO("  -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)");
     P_LOG_INFO("  -M <mtu>           KCP MTU (default 1350; lower if frequent fragmentation)");
+    P_LOG_INFO("  -A <0|1>           KCP nodelay (default 1)");
+    P_LOG_INFO("  -I <ms>            KCP interval in ms (default 10)");
+    P_LOG_INFO("  -X <n>             KCP fast resend (default 2)");
+    P_LOG_INFO("  -C <0|1>           KCP no congestion control (default 1)");
+    P_LOG_INFO("  -w <sndwnd>        KCP send window in packets (default 1024)");
+    P_LOG_INFO("  -W <rcvwnd>        KCP recv window in packets (default 1024)");
+    P_LOG_INFO("  -N                 enable TCP_NODELAY on client sockets");
     P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305)");
     P_LOG_INFO("  -h                 show help");
 }
@@ -85,6 +124,7 @@ struct cfg_client {
     bool reuse_port;
     bool v6only;
     int sockbuf_bytes;
+    bool tcp_nodelay;
     bool has_psk;
     uint8_t psk[32];
 };
@@ -126,8 +166,9 @@ int main(int argc, char **argv) {
     cfg.reuse_addr = true;
 
     int kcp_mtu = -1;
+    int kcp_nd = -1, kcp_it = -1, kcp_rs = -1, kcp_nc = -1, kcp_snd = -1, kcp_rcv = -1;
     int opt;
-    while ((opt = getopt(argc, argv, "dp:rR6S:M:K:h")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:rR6S:M:A:I:X:C:w:W:NK:h")) != -1) {
         switch (opt) {
         case 'd':
             cfg.daemonize = true;
@@ -168,6 +209,45 @@ int main(int argc, char **argv) {
             }
             break;
         }
+        case 'A': {
+            if (strcmp(optarg, "0") == 0) kcp_nd = 0;
+            else if (strcmp(optarg, "1") == 0) kcp_nd = 1;
+            else P_LOG_WARN("invalid -A value '%s' (expect 0|1)", optarg);
+            break;
+        }
+        case 'I': {
+            char *end = NULL; long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) P_LOG_WARN("invalid -I value '%s'", optarg);
+            else kcp_it = (int)v;
+            break;
+        }
+        case 'X': {
+            char *end = NULL; long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v < 0) P_LOG_WARN("invalid -X value '%s'", optarg);
+            else kcp_rs = (int)v;
+            break;
+        }
+        case 'C': {
+            if (strcmp(optarg, "0") == 0) kcp_nc = 0;
+            else if (strcmp(optarg, "1") == 0) kcp_nc = 1;
+            else P_LOG_WARN("invalid -C value '%s' (expect 0|1)", optarg);
+            break;
+        }
+        case 'w': {
+            char *end = NULL; long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) P_LOG_WARN("invalid -w value '%s'", optarg);
+            else kcp_snd = (int)v;
+            break;
+        }
+        case 'W': {
+            char *end = NULL; long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) P_LOG_WARN("invalid -W value '%s'", optarg);
+            else kcp_rcv = (int)v;
+            break;
+        }
+        case 'N':
+            cfg.tcp_nodelay = true;
+            break;
         case 'K': {
             uint8_t key[32];
             if (!parse_psk_hex32(optarg, key)) {
@@ -266,6 +346,12 @@ int main(int argc, char **argv) {
     if (kcp_mtu > 0) {
         kopts.mtu = kcp_mtu;
     }
+    if (kcp_nd >= 0) kopts.nodelay = kcp_nd;
+    if (kcp_it >= 0) kopts.interval_ms = kcp_it;
+    if (kcp_rs >= 0) kopts.resend = kcp_rs;
+    if (kcp_nc >= 0) kopts.nc = kcp_nc;
+    if (kcp_snd >= 0) kopts.sndwnd = kcp_snd;
+    if (kcp_rcv >= 0) kopts.rcvwnd = kcp_rcv;
 
     /* Event loop: accept TCP, bridge via KCP over UDP */
     while (!g_state.terminate) {
@@ -306,6 +392,10 @@ int main(int argc, char **argv) {
                     /* Enable TCP keepalive */
                     int yes = 1;
                     (void)setsockopt(cs, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+                    if (cfg.tcp_nodelay) {
+                        int one = 1;
+                        (void)setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    }
                     /* Create per-connection UDP socket */
                     int us = socket(cfg.raddr.sa.sa_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
                     if (us < 0) {
@@ -416,6 +506,8 @@ int main(int argc, char **argv) {
                     if (rn == 0) {
                         break;
                     }
+                    /* Stats: count UDP RX bytes */
+                    c->udp_rx_bytes += (uint64_t)rn;
                     /* Validate UDP source address matches expected peer */
                     union sockaddr_inx ra;
                     memset(&ra, 0, sizeof(ra));
@@ -603,6 +695,8 @@ int main(int argc, char **argv) {
                         int got = ikcp_recv(c->kcp, ubuf, peek);
                         if (got <= 0)
                             break;
+                        /* Stats: each ikcp_recv yields one KCP RX message */
+                        c->kcp_rx_msgs++;
                         if (got < 1) continue;
                         unsigned char t = (unsigned char)ubuf[0];
                         /* Rekey control handling */
@@ -746,6 +840,8 @@ int main(int argc, char **argv) {
                         } else {
                             payload = ubuf + 1; plen = got - 1;
                         }
+                        /* Stats: count KCP RX payload bytes */
+                        if (plen > 0) c->kcp_rx_bytes += (uint64_t)plen;
                         ssize_t wn = send(c->cli_sock, payload, (size_t)plen, MSG_NOSIGNAL);
                         if (wn < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -790,6 +886,8 @@ int main(int argc, char **argv) {
                             (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
                             break;
                         }
+                        /* Stats: count TCP TX bytes to client */
+                        if (wn > 0) c->tcp_tx_bytes += (uint64_t)wn;
                     }
                     c->last_active = time(NULL);
                 }
@@ -810,6 +908,8 @@ int main(int argc, char **argv) {
                                       MSG_NOSIGNAL);
                     if (wn > 0) {
                         c->response.rpos += (size_t)wn;
+                        /* Stats: count TCP TX bytes during flush */
+                        c->tcp_tx_bytes += (uint64_t)wn;
                     } else if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                         break;
                     } else {
@@ -838,6 +938,8 @@ int main(int argc, char **argv) {
                 char tbuf[64 * 1024];
                 ssize_t rn;
                 while ((rn = recv(c->cli_sock, tbuf, sizeof(tbuf), 0)) > 0) {
+                    /* Stats: count TCP RX bytes from client */
+                    c->tcp_rx_bytes += (uint64_t)rn;
                     if (!c->kcp_ready) {
                         /* buffer until KCP ready */
                         size_t need = (size_t)rn;
@@ -864,6 +966,9 @@ int main(int argc, char **argv) {
                             chacha20poly1305_seal(c->session_key, nonce, ad, sizeof(ad), (const uint8_t*)tbuf, (size_t)rn, hdrbuf + 1 + 4, hdrbuf + 1 + 4 + rn);
                             int sn = ikcp_send(c->kcp, (const char*)hdrbuf, (int)(1 + 4 + rn + 16));
                             if (sn < 0) { c->state = S_CLOSING; break; }
+                            /* Stats: DATA via KCP (encrypted) */
+                            c->kcp_tx_msgs++;
+                            c->kcp_tx_bytes += (uint64_t)rn;
                         } else {
                             /* Wrap as DATA with 1-byte header */
                             unsigned char hdrbuf[1 + sizeof(tbuf)];
@@ -871,6 +976,9 @@ int main(int argc, char **argv) {
                             memcpy(hdrbuf + 1, tbuf, (size_t)rn);
                             int sn = ikcp_send(c->kcp, (const char*)hdrbuf, (int)(rn + 1));
                             if (sn < 0) { c->state = S_CLOSING; break; }
+                            /* Stats: DATA via KCP (plain) */
+                            c->kcp_tx_msgs++;
+                            c->kcp_tx_bytes += (uint64_t)rn;
                         }
                     }
                 }
@@ -889,9 +997,13 @@ int main(int argc, char **argv) {
                             chacha20poly1305_seal(c->session_key, nonce, ad, sizeof(ad), NULL, 0, NULL, tag);
                             memcpy(pkt + 1 + 4, tag, 16);
                             (void)ikcp_send(c->kcp, (const char*)pkt, (int)sizeof(pkt));
+                            /* Stats: FIN over KCP (encrypted) */
+                            c->kcp_tx_msgs++;
                         } else {
                             unsigned char fin = (unsigned char)KTP_FIN;
                             (void)ikcp_send(c->kcp, (const char*)&fin, 1);
+                            /* Stats: FIN over KCP (plain) */
+                            c->kcp_tx_msgs++;
                         }
                     }
                     c->cli_in_eof = true;
@@ -910,6 +1022,48 @@ int main(int argc, char **argv) {
         struct proxy_conn *pos, *tmp;
         list_for_each_entry_safe(pos, tmp, &conns, list) {
             if (pos->kcp) (void)kcp_update_flush(pos, now);
+            /* Periodic runtime stats logging (~5s, configurable) */
+            if (pos->kcp && get_stats_enabled()) {
+                uint64_t now_ms = now;
+                if (pos->last_stat_ms == 0) {
+                    pos->last_stat_ms = now_ms;
+                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
+                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
+                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
+                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
+                    pos->last_kcp_xmit = pos->kcp->xmit;
+                    pos->last_rekeys_initiated = pos->rekeys_initiated;
+                    pos->last_rekeys_completed = pos->rekeys_completed;
+                } else if (now_ms - pos->last_stat_ms >= get_stats_interval_ms()) {
+                    uint64_t dt = now_ms - pos->last_stat_ms;
+                    uint64_t d_tcp_rx = pos->tcp_rx_bytes - pos->last_tcp_rx_bytes;
+                    uint64_t d_tcp_tx = pos->tcp_tx_bytes - pos->last_tcp_tx_bytes;
+                    uint64_t d_kcp_tx = pos->kcp_tx_bytes - pos->last_kcp_tx_bytes;
+                    uint64_t d_kcp_rx = pos->kcp_rx_bytes - pos->last_kcp_rx_bytes;
+                    uint32_t d_xmit = pos->kcp->xmit - pos->last_kcp_xmit;
+                    uint32_t d_rekey_i = pos->rekeys_initiated - pos->last_rekeys_initiated;
+                    uint32_t d_rekey_c = pos->rekeys_completed - pos->last_rekeys_completed;
+                    double sec = (double)dt / 1000.0;
+                    double tcp_in_mbps = sec > 0 ? (double)d_tcp_rx * 8.0 / (sec * 1e6) : 0.0;
+                    double tcp_out_mbps = sec > 0 ? (double)d_tcp_tx * 8.0 / (sec * 1e6) : 0.0;
+                    double kcp_in_mbps = sec > 0 ? (double)d_kcp_rx * 8.0 / (sec * 1e6) : 0.0;
+                    double kcp_out_mbps = sec > 0 ? (double)d_kcp_tx * 8.0 / (sec * 1e6) : 0.0;
+                    P_LOG_INFO("stats conv=%u: TCP in=%.3f Mbps out=%.3f Mbps | KCP payload in=%.3f Mbps out=%.3f Mbps | KCP xmit_delta=%u RTT=%dms | rekey i=%u c=%u",
+                               pos->conv,
+                               tcp_in_mbps, tcp_out_mbps,
+                               kcp_in_mbps, kcp_out_mbps,
+                               d_xmit, pos->kcp->rx_srtt,
+                               d_rekey_i, d_rekey_c);
+                    pos->last_stat_ms = now_ms;
+                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
+                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
+                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
+                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
+                    pos->last_kcp_xmit = pos->kcp->xmit;
+                    pos->last_rekeys_initiated = pos->rekeys_initiated;
+                    pos->last_rekeys_completed = pos->rekeys_completed;
+                }
+            }
             /* If we received FIN earlier and output buffer has drained, shutdown(WRITE) */
             if (pos->svr_in_eof && !pos->svr2cli_shutdown && pos->response.dlen == pos->response.rpos) {
                 shutdown(pos->cli_sock, SHUT_WR);
@@ -939,6 +1093,20 @@ int main(int argc, char **argv) {
                 }
             }
             if (pos->state == S_CLOSING) {
+                if (get_stats_dump_enabled()) {
+                    P_LOG_INFO("stats total conv=%u: tcp_rx=%llu tcp_tx=%llu udp_rx=%llu udp_tx=%llu kcp_rx_msgs=%llu kcp_tx_msgs=%llu kcp_rx_bytes=%llu kcp_tx_bytes=%llu rekeys_i=%u rekeys_c=%u",
+                               pos->conv,
+                               (unsigned long long)pos->tcp_rx_bytes,
+                               (unsigned long long)pos->tcp_tx_bytes,
+                               (unsigned long long)pos->udp_rx_bytes,
+                               (unsigned long long)pos->udp_tx_bytes,
+                               (unsigned long long)pos->kcp_rx_msgs,
+                               (unsigned long long)pos->kcp_tx_msgs,
+                               (unsigned long long)pos->kcp_rx_bytes,
+                               (unsigned long long)pos->kcp_tx_bytes,
+                               pos->rekeys_initiated,
+                               pos->rekeys_completed);
+                }
                 (void)ep_del(epfd, pos->cli_sock);
                 (void)ep_del(epfd, pos->udp_sock);
                 if (pos->kcp)

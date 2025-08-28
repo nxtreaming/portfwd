@@ -47,6 +47,9 @@ static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *use
         }
         return -1;
     }
+    if (n > 0) {
+        pc->udp_tx_bytes += (uint64_t)n;
+    }
     return (int)n;
 }
 
@@ -109,6 +112,7 @@ int kcp_update_flush(struct proxy_conn *c, uint32_t now_ms) {
                            (socklen_t)sizeof_sockaddr(&c->peer_addr));
         if (n > 0) {
             c->udp_backlog.rpos += (size_t)n;
+            c->udp_tx_bytes += (uint64_t)n;
             if (c->udp_backlog.rpos >= c->udp_backlog.dlen) {
                 c->udp_backlog.rpos = 0;
                 c->udp_backlog.dlen = 0;
