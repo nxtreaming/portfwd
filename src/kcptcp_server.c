@@ -22,6 +22,7 @@
 #include "kcp_common.h"
 #include "kcptcp_common.h"
 #include "kcp_map.h"
+#include "aead.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "aead_protocol.h"
