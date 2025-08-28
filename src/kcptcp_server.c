@@ -697,7 +697,7 @@ int main(int argc, char **argv) {
                             memcpy(c->next_nonce_base, c->next_session_key, 12);
                             c->rekey_in_progress = true;
                             c->rekey_deadline_ms = kcp_now_ms() + REKEY_TIMEOUT_MS;
-                            P_LOG_INFO("rekey trigger conv=%u epoch=%u->%u send_seq=%u deadline=%u (svr)", c->conv, c->epoch, c->next_epoch, c->send_seq, c->rekey_deadline_ms);
+                            P_LOG_INFO("rekey trigger conv=%u epoch=%u->%u send_seq=%u deadline=%" PRIu64 " (svr)", c->conv, c->epoch, c->next_epoch, c->send_seq, c->rekey_deadline_ms);
                             /* Send REKEY_INIT under current key */
                             uint8_t nonceI[12]; memcpy(nonceI, c->nonce_base, 12);
                             uint32_t seqI; if (!aead_next_send_seq(c, &seqI)) { P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (svr)", c->conv); c->state = S_CLOSING; break; }
@@ -740,7 +740,7 @@ int main(int argc, char **argv) {
                             memcpy(c->next_nonce_base, c->next_session_key, 12);
                             c->rekey_in_progress = true;
                             c->rekey_deadline_ms = kcp_now_ms() + REKEY_TIMEOUT_MS;
-                            P_LOG_INFO("rekey trigger (EFIN) conv=%u epoch=%u->%u send_seq=%u deadline=%u (svr)", c->conv, c->epoch, c->next_epoch, c->send_seq, c->rekey_deadline_ms);
+                            P_LOG_INFO("rekey trigger (EFIN) conv=%u epoch=%u->%u send_seq=%u deadline=%" PRIu64 " (svr)", c->conv, c->epoch, c->next_epoch, c->send_seq, c->rekey_deadline_ms);
                             /* Send REKEY_INIT under current key */
                             uint8_t nonceI[12]; memcpy(nonceI, c->nonce_base, 12);
                             uint32_t seqI; if (!aead_next_send_seq(c, &seqI)) { P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u (svr)", c->conv); c->state = S_CLOSING; break; }
