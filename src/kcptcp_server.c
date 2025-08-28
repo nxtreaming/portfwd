@@ -18,6 +18,8 @@
 #include "proxy_conn.h"
 #include "kcp_common.h"
 #include "kcp_map.h"
+#include "aead.h"
+#include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 
 static void print_usage(const char *prog) {
@@ -30,6 +32,7 @@ static void print_usage(const char *prog) {
     P_LOG_INFO("  -6                 for IPv6 listener, set IPV6_V6ONLY");
     P_LOG_INFO("  -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)");
     P_LOG_INFO("  -M <mtu>           KCP MTU (default 1350; lower if frequent fragmentation)");
+    P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305)");
     P_LOG_INFO("  -h                 show help");
 }
 
@@ -42,12 +45,33 @@ struct cfg_server {
     bool reuse_port;
     bool v6only;
     int sockbuf_bytes;
+    bool has_psk;
+    uint8_t psk[32];
 };
 
 static void set_sock_buffers_sz(int sockfd, int bytes) {
     if (bytes <= 0) return;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
+}
+
+static int hex2nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static bool parse_psk_hex32(const char *hex, uint8_t out[32]) {
+    size_t n = strlen(hex);
+    if (n != 64) return false;
+    for (size_t i = 0; i < 32; ++i) {
+        int hi = hex2nibble(hex[2*i]);
+        int lo = hex2nibble(hex[2*i+1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (uint8_t)((hi << 4) | lo);
+    }
+    return true;
 }
 
 int main(int argc, char **argv) {
@@ -65,7 +89,7 @@ int main(int argc, char **argv) {
 
     int kcp_mtu = -1;
     int opt;
-    while ((opt = getopt(argc, argv, "dp:rR6S:M:h")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:rR6S:M:K:h")) != -1) {
         switch (opt) {
         case 'd':
             cfg.daemonize = true;
@@ -104,6 +128,16 @@ int main(int argc, char **argv) {
                 if (v > 1500) v = 1500;
                 kcp_mtu = (int)v;
             }
+            break;
+        }
+        case 'K': {
+            uint8_t key[32];
+            if (!parse_psk_hex32(optarg, key)) {
+                P_LOG_ERR("invalid -K PSK (expect 64 hex chars)");
+                return 2;
+            }
+            memcpy(cfg.psk, key, 32);
+            cfg.has_psk = true;
             break;
         }
         case 'h':
@@ -238,11 +272,6 @@ int main(int argc, char **argv) {
                     }
                     if (rn == 0)
                         break;
-                    /* Basic sanity: KCP header is 24 bytes */
-                    if (rn < 24) {
-                        P_LOG_WARN("drop short UDP pkt len=%zd", rn);
-                        continue;
-                    }
                     /* Build union sockaddr_inx from rss */
                     union sockaddr_inx ra;
                     memset(&ra, 0, sizeof(ra));
@@ -254,71 +283,103 @@ int main(int argc, char **argv) {
                         P_LOG_WARN("drop UDP from unknown family=%d", (int)rss.ss_family);
                         continue;
                     }
-                    /* Extract conv and route */
-                    uint32_t conv = ikcp_getconv(buf);
-                    struct proxy_conn *c = kcp_map_get(&cmap, conv);
-                    if (c && !is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
-                        P_LOG_WARN("drop UDP conv=%u from unexpected %s (expected %s)",
-                                   conv, sockaddr_to_string(&ra), sockaddr_to_string(&c->peer_addr));
-                        continue;
-                    }
-                    if (!c) {
-                        /* New connection: create TCP to target */
+                    /* Handshake first: if this is HELLO, allocate conv and respond */
+                    if (rn >= 2 && (unsigned char)buf[0] == (unsigned char)KTP_HS_HELLO && (unsigned char)buf[1] == (unsigned char)KCP_HS_VER) {
+                        if (rn < 2 + 16) {
+                            P_LOG_WARN("HELLO too short len=%zd", rn);
+                            continue;
+                        }
+                        /* Create TCP to target */
                         int ts = socket(cfg.taddr.sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
-                        if (ts < 0) {
-                            P_LOG_ERR("socket(tcp): %s", strerror(errno));
-                            continue;
-                        }
+                        if (ts < 0) { P_LOG_ERR("socket(tcp): %s", strerror(errno)); continue; }
                         (void)set_sock_buffers_sz(ts, cfg.sockbuf_bytes);
-                        /* Enable TCP keepalive */
-                        int yes = 1;
-                        (void)setsockopt(ts, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+                        int yes = 1; (void)setsockopt(ts, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
                         int cr = connect(ts, &cfg.taddr.sa, (socklen_t)sizeof_sockaddr(&cfg.taddr));
-                        if (cr < 0 && errno != EINPROGRESS) {
-                            P_LOG_ERR("connect: %s", strerror(errno));
-                            close(ts);
-                            continue;
+                        if (cr < 0 && errno != EINPROGRESS) { P_LOG_ERR("connect: %s", strerror(errno)); close(ts); continue; }
+
+                        struct proxy_conn *nc = (struct proxy_conn*)calloc(1, sizeof(*nc));
+                        if (!nc) { P_LOG_ERR("calloc conn"); close(ts); continue; }
+                        INIT_LIST_HEAD(&nc->list);
+                        nc->state = S_SERVER_CONNECTING;
+                        nc->svr_sock = ts;
+                        nc->udp_sock = usock;
+                        nc->peer_addr = ra;
+                        memcpy(nc->hs_token, buf + 2, 16);
+                        nc->last_active = time(NULL);
+                        /* Allocate unique conv */
+                        static uint32_t next_conv = 1u;
+                        uint32_t conv_try;
+                        do {
+                            conv_try = next_conv++;
+                        } while (kcp_map_get(&cmap, conv_try) != NULL);
+                        nc->conv = conv_try;
+
+                        /* Derive session key if PSK provided */
+                        if (cfg.has_psk) {
+                            if (derive_session_key_from_psk((const uint8_t*)cfg.psk, nc->hs_token, nc->conv, nc->session_key) == 0) {
+                                nc->has_session_key = true;
+                                /* Initialize AEAD nonce base and counters */
+                                memcpy(nc->nonce_base, nc->session_key, 12);
+                                nc->send_seq = 0;
+                                nc->recv_seq = 0;
+                            } else {
+                                P_LOG_ERR("session key derivation failed");
+                                close(ts);
+                                free(nc);
+                                continue;
+                            }
                         }
 
-                        c = (struct proxy_conn*)calloc(1, sizeof(*c));
-                        if (!c) {
-                            P_LOG_ERR("calloc conn");
-                            close(ts);
-                            continue;
-                        }
-                        INIT_LIST_HEAD(&c->list);
-                        c->state = S_SERVER_CONNECTING;
-                        c->svr_sock = ts;
-                        c->udp_sock = usock; /* shared */
-                        c->peer_addr = ra;   /* client udp addr */
-                        c->conv = conv;
-                        c->last_active = time(NULL);
-                        c->next_ka_ms = now + 30000; /* schedule first heartbeat in 30s */
-
-                        if (kcp_setup_conn(c, usock, &ra, conv, &kopts) != 0) {
+                        if (kcp_setup_conn(nc, usock, &ra, nc->conv, &kopts) != 0) {
                             P_LOG_ERR("kcp_setup_conn failed");
                             close(ts);
-                            free(c);
+                            free(nc);
                             continue;
                         }
 
                         /* Register TCP server socket */
-                        struct epoll_event tev = {0};
+                        struct epoll_event tev = (struct epoll_event){0};
                         tev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
-                        tev.data.ptr = c;
+                        tev.data.ptr = nc;
                         if (ep_add_or_mod(epfd, ts, &tev) < 0) {
                             P_LOG_ERR("epoll add tcp: %s", strerror(errno));
-                            ikcp_release(c->kcp);
+                            ikcp_release(nc->kcp);
                             close(ts);
-                            free(c);
+                            free(nc);
                             continue;
                         }
+                        list_add_tail(&nc->list, &conns);
+                        (void)kcp_map_put(&cmap, nc->conv, nc);
 
-                        list_add_tail(&c->list, &conns);
-                        (void)kcp_map_put(&cmap, conv, c);
-                        P_LOG_INFO("new conv=%u from %s", conv, sockaddr_to_string(&ra));
+                        /* Send ACCEPT: [type=ACCEPT][ver][conv(4)][token(16)] */
+                        unsigned char abuf[1 + 1 + 4 + 16];
+                        abuf[0] = (unsigned char)KTP_HS_ACCEPT;
+                        abuf[1] = (unsigned char)KCP_HS_VER;
+                        abuf[2] = (unsigned char)((nc->conv >> 24) & 0xff);
+                        abuf[3] = (unsigned char)((nc->conv >> 16) & 0xff);
+                        abuf[4] = (unsigned char)((nc->conv >> 8) & 0xff);
+                        abuf[5] = (unsigned char)(nc->conv & 0xff);
+                        memcpy(abuf + 6, nc->hs_token, 16);
+                        (void)sendto(usock, abuf, sizeof(abuf), MSG_DONTWAIT, &nc->peer_addr.sa, (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                        P_LOG_INFO("accept conv=%u for %s", nc->conv, sockaddr_to_string(&ra));
+                        continue;
                     }
 
+                    /* Otherwise expect KCP packet for existing conv */
+                    if (rn < 24) {
+                        P_LOG_WARN("drop non-handshake short UDP pkt len=%zd", rn);
+                        continue;
+                    }
+                    uint32_t conv = ikcp_getconv(buf);
+                    struct proxy_conn *c = kcp_map_get(&cmap, conv);
+                    if (!c) {
+                        P_LOG_WARN("drop UDP for unknown conv=%u from %s", conv, sockaddr_to_string(&ra));
+                        continue;
+                    }
+                    if (!is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
+                        P_LOG_WARN("drop UDP conv=%u from unexpected %s (expected %s)", conv, sockaddr_to_string(&ra), sockaddr_to_string(&c->peer_addr));
+                        continue;
+                    }
                     /* Feed KCP */
                     (void)ikcp_input(c->kcp, buf, (long)rn);
                     /* Drain to TCP (KCP -> target TCP) */
@@ -333,8 +394,22 @@ int main(int argc, char **argv) {
                             break;
                         if (got < 1) continue;
                         unsigned char t = (unsigned char)buf[0];
-                        if (t == KTP_KA) {
-                            /* ignore */
+                        if (t == KTP_EFIN && c->has_session_key) {
+                            if (got < (int)(1 + 4 + 16)) continue;
+                            uint32_t seq = (uint32_t)((uint8_t)buf[1] | ((uint8_t)buf[2] << 8) | ((uint8_t)buf[3] << 16) | ((uint8_t)buf[4] << 24));
+                            uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
+                            nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
+                            uint8_t ad[5]; ad[0]=(uint8_t)KTP_EFIN; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
+                            if (chacha20poly1305_open(c->session_key, nonce, ad, sizeof(ad), NULL, 0, (const uint8_t*)(buf + 1 + 4), (uint8_t*)buf) != 0) {
+                                P_LOG_ERR("EFIN tag verify failed (svr)");
+                                c->state = S_CLOSING; break;
+                            }
+                            /* treat as FIN */
+                            c->cli_in_eof = true;
+                            if (!c->cli2svr_shutdown && c->request.rpos == c->request.dlen) {
+                                shutdown(c->svr_sock, SHUT_WR);
+                                c->cli2svr_shutdown = true;
+                            }
                             continue;
                         }
                         if (t == KTP_FIN) {
@@ -346,9 +421,25 @@ int main(int argc, char **argv) {
                             }
                             continue;
                         }
-                        /* Data payload */
-                        char *payload = buf + 1;
-                        int plen = got - 1;
+                        /* Data payload (plain or encrypted) */
+                        char *payload = NULL;
+                        int plen = 0;
+                        if (t == KTP_EDATA && c->has_session_key) {
+                            if (got < (int)(1 + 4 + 16)) continue;
+                            uint32_t seq = (uint32_t)((uint8_t)buf[1] | ((uint8_t)buf[2] << 8) | ((uint8_t)buf[3] << 16) | ((uint8_t)buf[4] << 24));
+                            uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
+                            nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
+                            uint8_t ad[5]; ad[0]=(uint8_t)KTP_EDATA; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
+                            int ctlen = got - (int)(1 + 4 + 16);
+                            if (ctlen < 0) continue;
+                            if (chacha20poly1305_open(c->session_key, nonce, ad, sizeof(ad), (const uint8_t*)(buf + 1 + 4), (size_t)ctlen, (const uint8_t*)(buf + 1 + 4 + ctlen), (uint8_t*)buf) != 0) {
+                                P_LOG_ERR("EDATA tag verify failed (svr)");
+                                c->state = S_CLOSING; break;
+                            }
+                            payload = buf; plen = ctlen;
+                        } else {
+                            payload = buf + 1; plen = got - 1;
+                        }
                         /* If TCP connect not completed, buffer instead of sending */
                         if (c->state != S_FORWARDING) {
                             size_t need = (size_t)plen;
@@ -468,11 +559,24 @@ int main(int argc, char **argv) {
                 char sbuf[64 * 1024];
                 ssize_t rn;
                 while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) > 0) {
-                    /* Wrap as DATA */
-                    unsigned char hdrbuf[1 + sizeof(sbuf)];
-                    hdrbuf[0] = (unsigned char)KTP_DATA;
-                    memcpy(hdrbuf + 1, sbuf, (size_t)rn);
-                    int sn = ikcp_send(c->kcp, (const char*)hdrbuf, (int)(rn + 1));
+                    /* Wrap as DATA (encrypt if session key) */
+                    int sn = 0;
+                    if (c->has_session_key) {
+                        unsigned char hdrbuf[1 + 4 + sizeof(sbuf) + 16];
+                        uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
+                        uint32_t seq = c->send_seq++;
+                        nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
+                        uint8_t ad[5]; ad[0]=(uint8_t)KTP_EDATA; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
+                        hdrbuf[0] = (unsigned char)KTP_EDATA;
+                        hdrbuf[1] = ad[1]; hdrbuf[2] = ad[2]; hdrbuf[3] = ad[3]; hdrbuf[4] = ad[4];
+                        chacha20poly1305_seal(c->session_key, nonce, ad, sizeof(ad), (const uint8_t*)sbuf, (size_t)rn, hdrbuf + 1 + 4, hdrbuf + 1 + 4 + rn);
+                        sn = ikcp_send(c->kcp, (const char*)hdrbuf, (int)(1 + 4 + rn + 16));
+                    } else {
+                        unsigned char hdrbuf[1 + sizeof(sbuf)];
+                        hdrbuf[0] = (unsigned char)KTP_DATA;
+                        memcpy(hdrbuf + 1, sbuf, (size_t)rn);
+                        sn = ikcp_send(c->kcp, (const char*)hdrbuf, (int)(rn + 1));
+                    }
                     if (sn < 0) {
                         c->state = S_CLOSING;
                         break;
@@ -480,9 +584,23 @@ int main(int argc, char **argv) {
                     c->last_active = time(NULL);
                 }
                 if (rn == 0) {
-                    /* TCP target sent EOF: send FIN over KCP, stop further reads, allow pending KCP to flush */
-                    unsigned char fin = (unsigned char)KTP_FIN;
-                    (void)ikcp_send(c->kcp, (const char*)&fin, 1);
+                    /* TCP target sent EOF: send FIN/EFIN over KCP, stop further reads, allow pending KCP to flush */
+                    if (c->has_session_key) {
+                        uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
+                        uint32_t seq = c->send_seq++;
+                        nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
+                        uint8_t ad[5]; ad[0]=(uint8_t)KTP_EFIN; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
+                        unsigned char pkt[1 + 4 + 16];
+                        pkt[0] = (unsigned char)KTP_EFIN;
+                        pkt[1] = ad[1]; pkt[2] = ad[2]; pkt[3] = ad[3]; pkt[4] = ad[4];
+                        uint8_t tag[16];
+                        chacha20poly1305_seal(c->session_key, nonce, ad, sizeof(ad), NULL, 0, NULL, tag);
+                        memcpy(pkt + 1 + 4, tag, 16);
+                        (void)ikcp_send(c->kcp, (const char*)pkt, (int)sizeof(pkt));
+                    } else {
+                        unsigned char fin = (unsigned char)KTP_FIN;
+                        (void)ikcp_send(c->kcp, (const char*)&fin, 1);
+                    }
                     c->svr_in_eof = true;
                     struct epoll_event tev2 = (struct epoll_event){0};
                     tev2.events = EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP; /* disable EPOLLIN */
@@ -507,12 +625,6 @@ int main(int argc, char **argv) {
                 if (tcp_buf_empty && kcp_unsent == 0 && udp_backlog_empty) {
                     pos->state = S_CLOSING;
                 }
-            }
-            /* Heartbeat over KCP every 30s to keep NAT/paths warm */
-            if (pos->state != S_CLOSING && pos->kcp && pos->next_ka_ms && (int32_t)(now - pos->next_ka_ms) >= 0) {
-                unsigned char ka = (unsigned char)KTP_KA;
-                (void)ikcp_send(pos->kcp, (const char*)&ka, 1);
-                pos->next_ka_ms = now + 30000;
             }
             /* Idle timeout (e.g., 180s) */
             time_t ct = time(NULL);

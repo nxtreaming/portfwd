@@ -48,8 +48,18 @@ int kcp_update_flush(struct proxy_conn *c, uint32_t now_ms);
 enum kcp_tun_type {
     KTP_DATA = 0x00,
     KTP_FIN  = 0x01,
-    KTP_KA   = 0x02
+    KTP_KA   = 0x02,
+    /* Encrypted variants (ChaCha20-Poly1305) */
+    KTP_EDATA = 0x20, /* [type][seq(4)][ciphertext][tag(16)] */
+    KTP_EFIN  = 0x21, /* [type][seq(4)][tag(16)] */
+    /* Handshake control (outer, non-KCP) */
+    KTP_HS_HELLO  = 0x10,
+    KTP_HS_ACCEPT = 0x11,
+    KTP_HS_REJECT = 0x12,
+    KTP_HS_RESUME = 0x13
 };
+
+#define KCP_HS_VER 0x01
 
 #ifdef __cplusplus
 }

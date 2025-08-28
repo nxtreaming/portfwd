@@ -65,6 +65,9 @@ struct proxy_conn {
     bool use_kcp;                  /* Marks connection as using KCP path */
     bool kcp_tx_pending;           /* Pending KCP flush due to EAGAIN/backpressure */
     struct buffer_info udp_backlog;/* Pending UDP datagram to retry sendto() */
+    /* Handshake */
+    unsigned char hs_token[16];    /* 128-bit token echoed by server in ACCEPT */
+    bool kcp_ready;                /* becomes true after ACCEPT and ikcp_create */
 
     /* Epoll tagging (client side): distinguish TCP vs UDP events */
     struct ep_tag *cli_tag;        /* tag for client TCP fd */
@@ -72,6 +75,13 @@ struct proxy_conn {
 
     /* Keepalive scheduling */
     uint32_t next_ka_ms;           /* next time to send heartbeat over KCP */
+
+    /* AEAD session key (Phase 2): derived from PSK + token + conv */
+    bool has_session_key;
+    uint8_t session_key[32];
+    uint8_t nonce_base[12];   /* 12-byte base; per-direction seq fills low 4 bytes */
+    uint32_t send_seq;        /* increment per outbound KCP packet carrying DATA/FIN */
+    uint32_t recv_seq;        /* increment per inbound KCP packet carrying DATA/FIN */
 };
 
 /* Epoll event tag to disambiguate fd source */
