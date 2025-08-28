@@ -1207,7 +1207,7 @@ int main(int argc, char **argv) {
         }
 
         /* KCP timer updates and GC */
-        now = kcp_now_ms();
+        uint32_t now = kcp_now_ms();
         struct proxy_conn *pos, *tmp;
         list_for_each_entry_safe(pos, tmp, &conns, list) {
             if (pos->kcp)
