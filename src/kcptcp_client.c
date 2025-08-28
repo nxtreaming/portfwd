@@ -21,10 +21,11 @@
 #include "proxy_conn.h"
 #include "kcp_common.h"
 #include "kcptcp_common.h"
+#include "aead_protocol.h"
+#include "anti_replay.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "aead.h"
-#include "aead_protocol.h"
 
 struct cfg_client {
     union sockaddr_inx laddr; /* TCP listen */
@@ -123,6 +124,8 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                     /* Initialize nonce base and counters */
                     memcpy(c->nonce_base, c->session_key, 12);
                     c->send_seq = 0;
+                    /* Initialize anti-replay detector */
+                    anti_replay_init(&c->replay_detector);
                     c->recv_seq = 0;
                     c->recv_win = UINT32_MAX; /* uninitialized */
                     c->recv_win_mask = 0ULL;
@@ -146,7 +149,7 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             /* Flush any buffered request data */
             if (c->request.dlen > c->request.rpos) {
                 size_t remain = c->request.dlen - c->request.rpos;
-                if (aead_protocol_send_data(c, c->request.data + c->request.rpos, remain, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+                if (aead_protocol_send_data(c, c->request.data + c->request.rpos, (int)remain, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
                     c->state = S_CLOSING;
                     break;
                 }
@@ -450,100 +453,17 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
                 memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
                 c->request.dlen += (size_t)rn;
             } else {
-                if (c->has_session_key) {
-                    unsigned char hdrbuf[1 + 4 + sizeof(tbuf) + 16];
-                    uint8_t nonce[12];
-                    memcpy(nonce, c->nonce_base, 12);
-                    uint32_t seq;
-                    if (!aead_next_send_seq(c, &seq)) {
-                        c->state = S_CLOSING;
-                        break;
-                    }
-                    nonce[8] = (uint8_t)seq;
-                    nonce[9] = (uint8_t)(seq >> 8);
-                    nonce[10] = (uint8_t)(seq >> 16);
-                    nonce[11] = (uint8_t)(seq >> 24);
-                    uint8_t ad[5];
-                    ad[0] = (uint8_t)KTP_EDATA;
-                    ad[1] = (uint8_t)seq;
-                    ad[2] = (uint8_t)(seq >> 8);
-                    ad[3] = (uint8_t)(seq >> 16);
-                    ad[4] = (uint8_t)(seq >> 24);
-                    hdrbuf[0] = (unsigned char)KTP_EDATA;
-                    hdrbuf[1] = ad[1];
-                    hdrbuf[2] = ad[2];
-                    hdrbuf[3] = ad[3];
-                    hdrbuf[4] = ad[4];
-                    chacha20poly1305_seal(
-                        c->session_key, nonce, ad, sizeof(ad),
-                        (const uint8_t *)tbuf, (size_t)rn, hdrbuf + 1 + 4,
-                        hdrbuf + 1 + 4 + rn);
-                    int sn = ikcp_send(c->kcp, (const char *)hdrbuf,
-                                       (int)(1 + 4 + rn + 16));
-                    if (sn < 0) {
-                        c->state = S_CLOSING;
-                        break;
-                    }
-                    /* Stats: DATA via KCP (encrypted) */
-                    c->kcp_tx_msgs++;
-                    c->kcp_tx_bytes += (uint64_t)rn;
-                } else {
-                    /* Wrap as DATA with 1-byte header */
-                    unsigned char hdrbuf[1 + sizeof(tbuf)];
-                    hdrbuf[0] = (unsigned char)KTP_DATA;
-                    memcpy(hdrbuf + 1, tbuf, (size_t)rn);
-                    int sn = ikcp_send(c->kcp, (const char *)hdrbuf,
-                                       (int)(rn + 1));
-                    if (sn < 0) {
-                        c->state = S_CLOSING;
-                        break;
-                    }
-                    /* Stats: DATA via KCP (plain) */
-                    c->kcp_tx_msgs++;
-                    c->kcp_tx_bytes += (uint64_t)rn;
+                int sn = aead_protocol_send_data(c, tbuf, rn, cfg->psk, cfg->has_psk);
+                if (sn < 0) {
+                    c->state = S_CLOSING;
+                    break;
                 }
             }
         }
         if (rn == 0) {
             /* TCP EOF: on handshake pending, defer FIN until ready */
             if (c->kcp_ready) {
-                if (c->has_session_key) {
-                    uint8_t nonce[12];
-                    memcpy(nonce, c->nonce_base, 12);
-                    uint32_t seq;
-                    if (!aead_next_send_seq(c, &seq)) {
-                        c->state = S_CLOSING;
-                    }
-                    nonce[8] = (uint8_t)seq;
-                    nonce[9] = (uint8_t)(seq >> 8);
-                    nonce[10] = (uint8_t)(seq >> 16);
-                    nonce[11] = (uint8_t)(seq >> 24);
-                    uint8_t ad[5];
-                    ad[0] = (uint8_t)KTP_EFIN;
-                    ad[1] = (uint8_t)seq;
-                    ad[2] = (uint8_t)(seq >> 8);
-                    ad[3] = (uint8_t)(seq >> 16);
-                    ad[4] = (uint8_t)(seq >> 24);
-                    unsigned char pkt[1 + 4 + 16];
-                    pkt[0] = (unsigned char)KTP_EFIN;
-                    pkt[1] = ad[1];
-                    pkt[2] = ad[2];
-                    pkt[3] = ad[3];
-                    pkt[4] = ad[4];
-                    uint8_t tag[16];
-                    chacha20poly1305_seal(c->session_key, nonce, ad,
-                                          sizeof(ad), NULL, 0, NULL, tag);
-                    memcpy(pkt + 1 + 4, tag, 16);
-                    (void)ikcp_send(c->kcp, (const char *)pkt,
-                                    (int)sizeof(pkt));
-                    /* Stats: FIN over KCP (encrypted) */
-                    c->kcp_tx_msgs++;
-                } else {
-                    unsigned char fin = (unsigned char)KTP_FIN;
-                    (void)ikcp_send(c->kcp, (const char *)&fin, 1);
-                    /* Stats: FIN over KCP (plain) */
-                    c->kcp_tx_msgs++;
-                }
+                (void)aead_protocol_send_fin(c, cfg->psk, cfg->has_psk);
             }
             c->cli_in_eof = true;
             struct epoll_event cev = (struct epoll_event){0};

@@ -23,6 +23,7 @@
 #include "kcptcp_common.h"
 #include "kcp_map.h"
 #include "aead.h"
+#include "anti_replay.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "aead_protocol.h"
@@ -274,6 +275,8 @@ int main(int argc, char **argv) {
                                 /* Initialize AEAD nonce base and counters */
                                 memcpy(nc->nonce_base, nc->session_key, 12);
                                 nc->send_seq = 0;
+                                /* Initialize anti-replay detector */
+                                anti_replay_init(&nc->replay_detector);
                                 nc->recv_seq = 0;
                                 nc->recv_win = UINT32_MAX; /* uninitialized */
                                 nc->recv_win_mask = 0ULL;
@@ -537,7 +540,7 @@ int main(int argc, char **argv) {
                     while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) >
                            0) {
                         c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
-                        if (aead_protocol_send_data(c, sbuf, (size_t)rn, cfg.psk, cfg.has_psk) < 0) {
+                        if (aead_protocol_send_data(c, sbuf, rn, cfg.psk, cfg.has_psk) < 0) {
                             c->state = S_CLOSING;
                             break;
                         }

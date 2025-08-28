@@ -13,7 +13,6 @@
 #include "3rd/kcp/ikcp.h"
 #include "aead_protocol.h"
 
-
 static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk);
 
 static int trigger_rekey_if_needed(struct proxy_conn *c, const uint8_t *psk) {
@@ -32,8 +31,6 @@ static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk) {
     c->rekey_in_progress = true;
     c->rekey_deadline_ms = kcp_now_ms() + REKEY_TIMEOUT_MS;
 
-    uint8_t nonce[12];
-    memcpy(nonce, c->nonce_base, 12);
     uint32_t seq;
     if (!aead_next_send_seq(c, &seq)) {
         P_LOG_ERR("send_seq wraparound guard hit, closing conv=%u", c->conv);
@@ -42,11 +39,12 @@ static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk) {
     
     uint8_t ad[5];
     unsigned char pkt[1 + 4 + 16];
-    aead_gen_control_packet(KTP_REKEY_INIT, seq, c->session_key, nonce, ad, pkt);
+    aead_gen_control_packet(KTP_REKEY_INIT, seq, c->session_key, c->nonce_base, ad, pkt);
 
     if (ikcp_send(c->kcp, (const char *)pkt, sizeof(pkt)) < 0) {
         return -1;
     }
+    c->rekeys_initiated++;
     return 0;
 }
 
@@ -102,30 +100,26 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data, int l
             }
 
             unsigned char ack_pkt[1 + 4 + 16];
-            uint8_t ack_nonce[12];
             uint8_t ack_ad[5];
-            memcpy(ack_nonce, c->nonce_base, 12);
-            aead_gen_control_packet(KTP_REKEY_ACK, seq, c->session_key, ack_nonce, ack_ad, ack_pkt);
+            aead_gen_control_packet(KTP_REKEY_ACK, seq, c->next_session_key, c->next_nonce_base, ack_ad, ack_pkt);
             ikcp_send(c->kcp, (const char *)ack_pkt, sizeof(ack_pkt));
 
             // Switch to next epoch immediately
             aead_epoch_switch(c);
+            c->rekeys_completed++;
             P_LOG_INFO("epoch switch conv=%u -> epoch=%u", c->conv, c->epoch);
             return 1;
         }
 
         case KTP_REKEY_ACK: {
             if (!c->rekey_in_progress) return 1; // Ignore spurious ACK
-            if (seq != 0) {
-                P_LOG_ERR("REKEY_ACK seq!=0");
-                return -1;
-            }
             int verified_ack = aead_verify_ack_packet(c, (uint8_t*)data, len);
             if (verified_ack < 0) {
                  P_LOG_ERR("REKEY_ACK tag verify failed");
                  return -1;
             }
             aead_epoch_switch(c);
+            c->rekeys_completed++;
             P_LOG_INFO("epoch switch conv=%u -> epoch=%u", c->conv, c->epoch);
             return 1;
         }
@@ -165,6 +159,10 @@ int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len, con
     aead_seal_packet(c, seq, (const uint8_t*)data, len, (uint8_t*)buf);
 
     int ret = ikcp_send(c->kcp, buf, pkt_len);
+    if (ret >= 0) {
+        c->kcp_tx_msgs++;
+        c->kcp_tx_bytes += (uint64_t)len;
+    }
     free(buf);
     return ret;
 }
@@ -185,10 +183,12 @@ int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk, bool has_ps
     }
 
     uint8_t pkt[1 + 4 + 16];
-    uint8_t nonce[12];
     uint8_t ad[5];
-    memcpy(nonce, c->nonce_base, 12);
-    aead_gen_control_packet(KTP_EFIN, seq, c->session_key, nonce, ad, pkt);
+    aead_gen_control_packet(KTP_EFIN, seq, c->session_key, c->nonce_base, ad, pkt);
     
-    return ikcp_send(c->kcp, (const char *)pkt, sizeof(pkt));
+    int ret = ikcp_send(c->kcp, (const char *)pkt, sizeof(pkt));
+    if (ret >= 0) {
+        c->kcp_tx_msgs++;
+    }
+    return ret;
 }

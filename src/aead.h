@@ -18,7 +18,7 @@ int derive_session_key_from_psk(const uint8_t psk[32],
 
 struct proxy_conn;
 
-void aead_gen_control_packet(unsigned char type, uint32_t seq, const uint8_t *key, const uint8_t *nonce, uint8_t *ad, uint8_t *out_pkt);
+void aead_gen_control_packet(unsigned char type, uint32_t seq, const uint8_t *key, const uint8_t *nonce_base, uint8_t *ad, uint8_t *out_pkt);
 int aead_verify_packet(struct proxy_conn *c, uint8_t *data, int len, uint32_t *out_seq);
 int aead_verify_ack_packet(struct proxy_conn *c, uint8_t *data, int len);
 void aead_seal_packet(struct proxy_conn *c, uint32_t seq, const uint8_t *payload, size_t plen, uint8_t *out_pkt);
