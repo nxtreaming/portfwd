@@ -21,13 +21,13 @@
 #include "proxy_conn.h"
 #include "kcp_common.h"
 #include "kcptcp_common.h"
-#include "kcp_common.h"
+#include "kcp_map.h"
 #include "aead_protocol.h"
+#include "aead.h"
 #include "anti_replay.h"
 #include "buffer_limits.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
-#include "aead_protocol.h"
 
 static void print_usage(const char *prog) {
     P_LOG_INFO(
