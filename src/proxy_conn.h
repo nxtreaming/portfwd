@@ -2,6 +2,7 @@
 #define __PORTFWD_PROXY_CONN_H__
 
 #include "list.h"
+#include "anti_replay.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
