@@ -36,6 +36,44 @@ User-space TCP/UDP port forwarding services
       -p <pidfile>       write PID to file
       -h                 show help
 
+### kcptcp-client (TCP over KCP/UDP client)
+
+    kcptcp-client [options] <local_tcp_addr:port> <remote_udp_addr:port>
+
+    Options:
+      -d                 run in background (daemonize)
+      -p <pidfile>       write PID to file
+      -r                 set SO_REUSEADDR on listener socket
+      -R                 set SO_REUSEPORT on listener socket
+      -6                 for IPv6 listener, set IPV6_V6ONLY
+      -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)
+      -M <mtu>           KCP MTU (default 1350; tune to avoid IP fragmentation)
+      -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305); enables encryption
+      -h                 show help
+
+  Notes:
+  - Listens on a local TCP address and forwards streams over UDP using KCP.
+  - AEAD encryption is enabled only when `-K` is provided on both client and server.
+
+### kcptcp-server (KCP/UDP to TCP server)
+
+    kcptcp-server [options] <local_udp_addr:port> <target_tcp_addr:port>
+
+    Options:
+      -d                 run in background (daemonize)
+      -p <pidfile>       write PID to file
+      -r                 set SO_REUSEADDR on listener socket
+      -R                 set SO_REUSEPORT on listener socket
+      -6                 for IPv6 listener, set IPV6_V6ONLY
+      -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)
+      -M <mtu>           KCP MTU (default 1350; tune to avoid IP fragmentation)
+      -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305); enables encryption
+      -h                 show help
+
+  Notes:
+  - Listens on a UDP address, accepts KCP sessions, and bridges to a target TCP service.
+  - AEAD requires the same `-K` PSK as the client for handshakes to succeed.
+
 ## Examples
 
 ##### Map local TCP port 1022 to 192.168.1.77:22
@@ -53,6 +91,27 @@ User-space TCP/UDP port forwarding services
 
     udpfwd [::]:1701 localhost:1701         # add IPv6 support for a local L2TP service
     tcpfwd 0.0.0.0:80 [2001:db8:3::2]:80    # enable IPv4 access for an IPv6-only web service
+
+##### KCP TCP tunneling (encrypted)
+
+Server (on host with SSH at 127.0.0.1:22):
+
+```sh
+kcptcp-server 0.0.0.0:4000 127.0.0.1:22 -K 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+```
+
+Client (on your local machine):
+
+```sh
+kcptcp-client 127.0.0.1:2022 server.example.com:4000 -K 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+ssh -p 2022 localhost
+```
+
+Notes:
+
+- The `-K` PSK must be the same 32-byte value (64 hex chars) on both sides.
+- If you observe IP fragmentation, try `-M 1200` on both client and server.
+- Without `-K`, traffic is not encrypted; use `-K` to enable ChaCha20-Poly1305.
 
 ## Signals, PID files, and graceful shutdown
 
