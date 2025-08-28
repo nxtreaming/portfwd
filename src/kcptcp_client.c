@@ -28,6 +28,7 @@ static void print_usage(const char *prog) {
     P_LOG_INFO("  -R                 set SO_REUSEPORT on listener socket");
     P_LOG_INFO("  -6                 for IPv6 listener, set IPV6_V6ONLY");
     P_LOG_INFO("  -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)");
+    P_LOG_INFO("  -M <mtu>           KCP MTU (default 1350; lower if frequent fragmentation)");
     P_LOG_INFO("  -h                 show help");
 }
 
@@ -59,8 +60,9 @@ int main(int argc, char **argv) {
     memset(&cfg, 0, sizeof(cfg));
     cfg.reuse_addr = true;
 
+    int kcp_mtu = -1;
     int opt;
-    while ((opt = getopt(argc, argv, "dp:rR6S:h")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:rR6S:M:h")) != -1) {
         switch (opt) {
         case 'd':
             cfg.daemonize = true;
@@ -86,6 +88,18 @@ int main(int argc, char **argv) {
                 if (v < 4096) v = 4096;
                 if (v > (8<<20)) v = (8<<20);
                 cfg.sockbuf_bytes = (int)v;
+            }
+            break;
+        }
+        case 'M': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v <= 0) {
+                P_LOG_WARN("invalid -M value '%s'", optarg);
+            } else {
+                if (v < 576) v = 576;
+                if (v > 1500) v = 1500;
+                kcp_mtu = (int)v;
             }
             break;
         }
@@ -174,6 +188,9 @@ int main(int argc, char **argv) {
 
     struct kcp_opts kopts;
     kcp_opts_set_defaults(&kopts);
+    if (kcp_mtu > 0) {
+        kopts.mtu = kcp_mtu;
+    }
 
     /* Event loop: accept TCP, bridge via KCP over UDP */
     while (!g_state.terminate) {

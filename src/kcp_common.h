@@ -29,7 +29,7 @@ static inline void kcp_opts_set_defaults(struct kcp_opts *o) {
     o->interval_ms = 10;
     o->resend = 2;
     o->nc = 1;
-    o->mtu = 1400;
+    o->mtu = 1350; /* Safer default to avoid IP fragmentation on common paths */
     o->sndwnd = 1024;
     o->rcvwnd = 1024;
 }
