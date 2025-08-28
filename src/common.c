@@ -55,7 +55,9 @@ int write_pidfile(const char *filepath) {
 
     if (flock(g_state.pidfile_fd, LOCK_EX | LOCK_NB) < 0) {
         if (errno == EWOULDBLOCK) {
-            P_LOG_ERR("pidfile %s exists and is locked, another instance running?", filepath);
+            P_LOG_ERR(
+                "pidfile %s exists and is locked, another instance running?",
+                filepath);
         } else {
             P_LOG_ERR("flock(%s): %s", filepath, strerror(errno));
         }
@@ -175,7 +177,8 @@ size_t sizeof_sockaddr(const union sockaddr_inx *addr) {
     return sizeof(struct sockaddr_in);
 }
 
-bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b) {
+bool is_sockaddr_inx_equal(const union sockaddr_inx *a,
+                           const union sockaddr_inx *b) {
     if (a->sa.sa_family != b->sa.sa_family)
         return false;
     if (*port_of_sockaddr(a) != *port_of_sockaddr(b))
@@ -184,12 +187,14 @@ bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx
         return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr;
     } else if (a->sa.sa_family == AF_INET6) {
         return a->sin6.sin6_scope_id == b->sin6.sin6_scope_id &&
-               memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr, sizeof(struct in6_addr)) == 0;
+               memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr,
+                      sizeof(struct in6_addr)) == 0;
     }
     return false;
 }
 
-int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp) {
+int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa,
+                          bool is_udp) {
     char s_addr[256];
     char *host = NULL, *port = NULL;
     struct addrinfo hints, *result = NULL;
@@ -206,7 +211,8 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
         host = s_addr + 1;
         *bracket = '\0';
         port = last_colon + 1;
-    } else if (last_colon != NULL && (bracket == NULL || last_colon > bracket)) {
+    } else if (last_colon != NULL &&
+               (bracket == NULL || last_colon > bracket)) {
         /* IPv4 or hostname format: host:port */
         host = s_addr;
         *last_colon = '\0';
@@ -231,7 +237,8 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 
     rc = getaddrinfo(host, port, &hints, &result);
     if (rc != 0) {
-        P_LOG_ERR("getaddrinfo(%s:%s): %s", host ? host : "<any>", port, gai_strerror(rc));
+        P_LOG_ERR("getaddrinfo(%s:%s): %s", host ? host : "<any>", port,
+                  gai_strerror(rc));
         return -EHOSTUNREACH;
     }
 
@@ -247,7 +254,8 @@ void epoll_close_comp(int epfd) {
 
 const char *sockaddr_to_string(const union sockaddr_inx *addr) {
     static char buf[128];
-    if (!addr) return "(null)";
+    if (!addr)
+        return "(null)";
     void *a = addr_of_sockaddr(addr);
     unsigned short port = ntohs(*port_of_sockaddr(addr));
     char ip[96];

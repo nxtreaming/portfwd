@@ -1,0 +1,44 @@
+# .clang-format — K&R / 1TBS style
+BasedOnStyle: LLVM
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 80
+
+# Braces on the same line as statements/functions
+BreakBeforeBraces: Attach
+
+# Keep control-flow bodies on their own lines (classic K&R look)
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+
+# Spacing
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+SpacesInSquareBrackets: false
+SpaceAfterCStyleCast: false
+
+# Pointer/reference style: char *p;
+DerivePointerAlignment: false
+PointerAlignment: Right
+ReferenceAlignment: Right
+
+# Switch/case: labels not indented; statements inside are indented
+IndentCaseLabels: false
+
+# Line breaking preferences
+BreakBeforeBinaryOperators: None
+ContinuationIndentWidth: 4
+AlignAfterOpenBracket: Align
+
+# Preprocessor & includes
+IndentPPDirectives: None
+SortIncludes: false
+IncludeBlocks: Preserve
+
+# Misc
+KeepEmptyLinesAtTheStartOfBlocks: false
+IndentGotoLabels: false

@@ -29,15 +29,16 @@
 
 /* Tunables for throughput */
 #ifndef TCP_PROXY_USERBUF_CAP
-#define TCP_PROXY_USERBUF_CAP   (64 * 1024)
+#define TCP_PROXY_USERBUF_CAP (64 * 1024)
 #endif
 #ifndef TCP_PROXY_SOCKBUF_CAP
-#define TCP_PROXY_SOCKBUF_CAP   (256 * 1024)
+#define TCP_PROXY_SOCKBUF_CAP (256 * 1024)
 #endif
 
-/* Backpressure watermark: when opposite TX backlog exceeds this, limit further reads */
+/* Backpressure watermark: when opposite TX backlog exceeds this, limit further
+ * reads */
 #ifndef TCP_PROXY_BACKPRESSURE_WM
-#define TCP_PROXY_BACKPRESSURE_WM   (TCP_PROXY_USERBUF_CAP * 3 / 4)
+#define TCP_PROXY_BACKPRESSURE_WM (TCP_PROXY_USERBUF_CAP * 3 / 4)
 #endif
 
 /* TCP Keepalive defaults (Linux specific tunables guarded at runtime) */
@@ -55,8 +56,8 @@
 #define TCP_PROXY_CONN_POOL_SIZE 4096
 
 #define EV_MAGIC_LISTENER 0xdeadbeefU
-#define EV_MAGIC_CLIENT   0xfeedfaceU
-#define EV_MAGIC_SERVER   0xbaadcafeU
+#define EV_MAGIC_CLIENT 0xfeedfaceU
+#define EV_MAGIC_SERVER 0xbaadcafeU
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -91,17 +92,15 @@ static int g_backpressure_wm = TCP_PROXY_BACKPRESSURE_WM;
 
 /* Forward declaration */
 static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
-    struct epoll_event *ev);
+                             struct epoll_event *ev);
 
-static void set_sock_buffers(int sockfd)
-{
+static void set_sock_buffers(int sockfd) {
     int sz = g_sockbuf_cap_runtime;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
 }
 
-static void set_keepalive(int sockfd)
-{
+static void set_keepalive(int sockfd) {
     int on = 1;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
 #ifdef __linux__
@@ -114,8 +113,7 @@ static void set_keepalive(int sockfd)
 #endif
 }
 
-static void set_tcp_nodelay(int sockfd)
-{
+static void set_tcp_nodelay(int sockfd) {
     int on = 1;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
         P_LOG_WARN("setsockopt(TCP_NODELAY): %s", strerror(errno));
@@ -124,11 +122,12 @@ static void set_tcp_nodelay(int sockfd)
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static int init_conn_pool(void)
-{
-    g_conn_pool.capacity = (g_conn_pool_capacity > 0) ? g_conn_pool_capacity : TCP_PROXY_CONN_POOL_SIZE;
-    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) *
-                                     (size_t)g_conn_pool.capacity);
+static int init_conn_pool(void) {
+    g_conn_pool.capacity = (g_conn_pool_capacity > 0)
+                               ? g_conn_pool_capacity
+                               : TCP_PROXY_CONN_POOL_SIZE;
+    g_conn_pool.connections =
+        malloc(sizeof(struct proxy_conn) * (size_t)g_conn_pool.capacity);
     if (!g_conn_pool.connections) {
         P_LOG_ERR("Failed to allocate connection pool");
         return -1;
@@ -141,12 +140,12 @@ static int init_conn_pool(void)
         g_conn_pool.freelist = conn;
     }
     g_conn_pool.used_count = 0;
-    P_LOG_INFO("Connection pool initialized with %d connections", g_conn_pool.capacity);
+    P_LOG_INFO("Connection pool initialized with %d connections",
+               g_conn_pool.capacity);
     return 0;
 }
 
-static void destroy_conn_pool(void)
-{
+static void destroy_conn_pool(void) {
     if (g_conn_pool.connections) {
         free(g_conn_pool.connections);
         g_conn_pool.connections = NULL;
@@ -157,8 +156,7 @@ static void destroy_conn_pool(void)
     }
 }
 
-static inline struct proxy_conn *alloc_proxy_conn(void)
-{
+static inline struct proxy_conn *alloc_proxy_conn(void) {
     struct proxy_conn *conn;
 
     if (!g_conn_pool.freelist) {
@@ -185,9 +183,9 @@ static inline struct proxy_conn *alloc_proxy_conn(void)
     return conn;
 }
 
-static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *events,
-        int *nfds, int epfd)
-{
+static void release_proxy_conn(struct proxy_conn *conn,
+                               struct epoll_event *events, int *nfds,
+                               int epfd) {
     int i;
 
     /*
@@ -206,12 +204,14 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
     if (epfd >= 0) {
         if (conn->cli_sock >= 0) {
             if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL) < 0) {
-                P_LOG_WARN("epoll_ctl(DEL, cli_sock=%d): %s", conn->cli_sock, strerror(errno));
+                P_LOG_WARN("epoll_ctl(DEL, cli_sock=%d): %s", conn->cli_sock,
+                           strerror(errno));
             }
         }
         if (conn->svr_sock >= 0) {
             if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0) {
-                P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock, strerror(errno));
+                P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock,
+                           strerror(errno));
             }
         }
     }
@@ -219,25 +219,30 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
 #ifdef __linux__
     if (conn->use_splice) {
         if (close(conn->splice_pipe[0]) < 0) {
-            P_LOG_WARN("close(splice_pipe[0]=%d): %s", conn->splice_pipe[0], strerror(errno));
+            P_LOG_WARN("close(splice_pipe[0]=%d): %s", conn->splice_pipe[0],
+                       strerror(errno));
         }
         if (close(conn->splice_pipe[1]) < 0) {
-            P_LOG_WARN("close(splice_pipe[1]=%d): %s", conn->splice_pipe[1], strerror(errno));
+            P_LOG_WARN("close(splice_pipe[1]=%d): %s", conn->splice_pipe[1],
+                       strerror(errno));
         }
     }
 #endif
     if (conn->cli_sock >= 0) {
         if (close(conn->cli_sock) < 0) {
-            P_LOG_WARN("close(cli_sock=%d): %s", conn->cli_sock, strerror(errno));
+            P_LOG_WARN("close(cli_sock=%d): %s", conn->cli_sock,
+                       strerror(errno));
         }
     }
     if (conn->svr_sock != -1) {
         if (close(conn->svr_sock) < 0) {
-            P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock, strerror(errno));
+            P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock,
+                       strerror(errno));
         }
     }
 
-    /* Free user buffers to avoid leaks, since alloc_proxy_conn() zeroes pointers */
+    /* Free user buffers to avoid leaks, since alloc_proxy_conn() zeroes
+     * pointers */
     if (conn->request.data) {
         free(conn->request.data);
         conn->request.data = NULL;
@@ -263,8 +268,7 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
  * current state (e.g., connecting, forwarding) and buffer status to ensure
  * correct I/O notifications.
  */
-static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
-{
+static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     struct epoll_event ev_cli, ev_svr;
 
     ev_cli.events = 0;
@@ -279,20 +283,23 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
         ev_cli.events |= EPOLLIN | EPOLLOUT;
         ev_svr.events |= EPOLLIN | EPOLLOUT;
     } else {
-        switch(conn->state) {
+        switch (conn->state) {
         case S_SERVER_CONNECTING:
             /* Wait for the server connection to establish. */
-            if (conn->request.dlen < conn->request.capacity && conn->request.dlen < (size_t)g_backpressure_wm)
+            if (conn->request.dlen < conn->request.capacity &&
+                conn->request.dlen < (size_t)g_backpressure_wm)
                 ev_cli.events |= EPOLLIN; /* for detecting client close */
             ev_svr.events |= EPOLLOUT;
             break;
         case S_FORWARDING:
             /* Enable reads only when below backpressure watermark */
-            if (conn->request.dlen < conn->request.capacity && conn->request.dlen < (size_t)g_backpressure_wm)
+            if (conn->request.dlen < conn->request.capacity &&
+                conn->request.dlen < (size_t)g_backpressure_wm)
                 ev_cli.events |= EPOLLIN;
             if (conn->response.dlen > 0)
                 ev_cli.events |= EPOLLOUT;
-            if (conn->response.dlen < conn->response.capacity && conn->response.dlen < (size_t)g_backpressure_wm)
+            if (conn->response.dlen < conn->response.capacity &&
+                conn->response.dlen < (size_t)g_backpressure_wm)
                 ev_svr.events |= EPOLLIN;
             if (conn->request.dlen > 0)
                 ev_svr.events |= EPOLLOUT;
@@ -309,8 +316,9 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd)
     ep_add_or_mod(epfd, conn->svr_sock, &ev_svr);
 }
 
-static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, const union sockaddr_inx *cli_addr)
-{
+static struct proxy_conn *
+create_proxy_conn(struct config *cfg, int cli_sock,
+                  const union sockaddr_inx *cli_addr) {
     struct proxy_conn *conn = NULL;
     char s_addr1[50] = "", s_addr2[50] = "";
 
@@ -338,9 +346,9 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
          * It relies on getsockopt(SO_ORIGINAL_DST) to find the original
          * destination address before redirection.
          *
-         * It then performs direct integer arithmetic on the destination IP address
-         * based on the difference between the original destination port and the
-         * listener port.
+         * It then performs direct integer arithmetic on the destination IP
+         * address based on the difference between the original destination port
+         * and the listener port.
          *
          * This is NOT a general-purpose load balancing or NAT mechanism.
          *
@@ -361,11 +369,13 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
 
         memset(&loc_addr, 0x0, sizeof(loc_addr));
         memset(&orig_dst, 0x0, sizeof(orig_dst));
-        if (getsockname(conn->cli_sock, (struct sockaddr *)&loc_addr, &loc_alen)) {
+        if (getsockname(conn->cli_sock, (struct sockaddr *)&loc_addr,
+                        &loc_alen)) {
             P_LOG_ERR("getsockname(): %s.", strerror(errno));
             goto err;
         }
-        if (getsockopt(conn->cli_sock, SOL_IP, SO_ORIGINAL_DST, &orig_dst, &orig_alen)) {
+        if (getsockopt(conn->cli_sock, SOL_IP, SO_ORIGINAL_DST, &orig_dst,
+                       &orig_alen)) {
             P_LOG_ERR("getsockopt(SO_ORIGINAL_DST): %s.", strerror(errno));
             goto err;
         }
@@ -375,12 +385,14 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
         } else {
             addr_pos = (uint32_t *)&conn->svr_addr.sin6.sin6_addr.s6_addr32[3];
         }
-        port_offset = (int)(ntohs(*port_of_sockaddr(&orig_dst)) - ntohs(*port_of_sockaddr(&loc_addr)));
+        port_offset = (int)(ntohs(*port_of_sockaddr(&orig_dst)) -
+                            ntohs(*port_of_sockaddr(&loc_addr)));
 
         base = ntohl(*addr_pos);
         sum = (int64_t)base + (int64_t)(int32_t)port_offset;
         if (sum < 0 || sum > UINT32_MAX) {
-            P_LOG_ERR("base address adjustment overflows: base=%u, off=%d", base, port_offset);
+            P_LOG_ERR("base address adjustment overflows: base=%u, off=%d",
+                      base, port_offset);
             goto err;
         }
 
@@ -389,15 +401,16 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
 #endif
 
     inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-            s_addr1, sizeof(s_addr1));
+              s_addr1, sizeof(s_addr1));
     inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
-            s_addr2, sizeof(s_addr2));
-    P_LOG_INFO("New connection [%s]:%d -> [%s]:%d",
-            s_addr1, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-            s_addr2, ntohs(*port_of_sockaddr(&conn->svr_addr)));
+              s_addr2, sizeof(s_addr2));
+    P_LOG_INFO("New connection [%s]:%d -> [%s]:%d", s_addr1,
+               ntohs(*port_of_sockaddr(&conn->cli_addr)), s_addr2,
+               ntohs(*port_of_sockaddr(&conn->svr_addr)));
 
     /* Initiate the connection to server right now. */
-    if ((conn->svr_sock = socket(conn->svr_addr.sa.sa_family, SOCK_STREAM, 0)) < 0) {
+    if ((conn->svr_sock = socket(conn->svr_addr.sa.sa_family, SOCK_STREAM, 0)) <
+        0) {
         P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
         goto err;
     }
@@ -421,7 +434,7 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
     conn->response.rpos = 0;
 
     if (connect(conn->svr_sock, (struct sockaddr *)&conn->svr_addr,
-            sizeof_sockaddr(&conn->svr_addr)) == 0) {
+                sizeof_sockaddr(&conn->svr_addr)) == 0) {
         /* Connected, ready for data forwarding immediately. */
         conn->state = S_FORWARDING;
         /* Set up splice (Linux) */
@@ -453,22 +466,21 @@ static struct proxy_conn *create_proxy_conn(struct config *cfg, int cli_sock, co
         return conn;
     } else {
         /* Error occurs, drop the session. */
-        P_LOG_WARN("Connection to [%s]:%d failed: %s",
-                s_addr2, ntohs(*port_of_sockaddr(&conn->svr_addr)),
-                strerror(errno));
+        P_LOG_WARN("Connection to [%s]:%d failed: %s", s_addr2,
+                   ntohs(*port_of_sockaddr(&conn->svr_addr)), strerror(errno));
         goto err;
     }
 
 err:
-    /* On error, the connection is released here. The caller doesn't need to do anything. */
+    /* On error, the connection is released here. The caller doesn't need to do
+     * anything. */
     if (conn)
         release_proxy_conn(conn, NULL, 0, -1);
     return NULL;
 }
 
 static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
-        struct epoll_event *ev)
-{
+                                    struct epoll_event *ev) {
     char s_addr[50] = "";
 
     if (efd == conn->svr_sock) {
@@ -476,12 +488,15 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
         int err = 0;
         socklen_t errlen = sizeof(err);
 
-        if (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err) {
-            inet_ntop(conn->svr_addr.sa.sa_family, addr_of_sockaddr(&conn->svr_addr),
-                    s_addr, sizeof(s_addr));
-            P_LOG_WARN("Connection to [%s]:%d failed: %s",
-                    s_addr, ntohs(*port_of_sockaddr(&conn->svr_addr)),
-                    strerror(err ? err : errno));
+        if (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &errlen) <
+                0 ||
+            err) {
+            inet_ntop(conn->svr_addr.sa.sa_family,
+                      addr_of_sockaddr(&conn->svr_addr), s_addr,
+                      sizeof(s_addr));
+            P_LOG_WARN("Connection to [%s]:%d failed: %s", s_addr,
+                       ntohs(*port_of_sockaddr(&conn->svr_addr)),
+                       strerror(err ? err : errno));
             conn->state = S_CLOSING;
             return 0;
         }
@@ -499,21 +514,25 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
         int rc;
 
         for (;;) {
-            rc = recv(efd , rxb->data + rxb->dlen, rxb->capacity - rxb->dlen, 0);
+            rc = recv(efd, rxb->data + rxb->dlen, rxb->capacity - rxb->dlen, 0);
             if (rc == 0) {
-                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                        s_addr, sizeof(s_addr));
+                inet_ntop(conn->cli_addr.sa.sa_family,
+                          addr_of_sockaddr(&conn->cli_addr), s_addr,
+                          sizeof(s_addr));
                 P_LOG_INFO("Connection [%s]:%d closed during server handshake",
-                        s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
+                           s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
                 conn->state = S_CLOSING;
                 return 0;
             } else if (rc < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     break; /* drained for now */
-                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                        s_addr, sizeof(s_addr));
-                P_LOG_INFO("Connection [%s]:%d error during server handshake: %s",
-                        s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), strerror(errno));
+                inet_ntop(conn->cli_addr.sa.sa_family,
+                          addr_of_sockaddr(&conn->cli_addr), s_addr,
+                          sizeof(s_addr));
+                P_LOG_INFO(
+                    "Connection [%s]:%d error during server handshake: %s",
+                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                    strerror(errno));
                 conn->state = S_CLOSING;
                 return 0;
             }
@@ -526,8 +545,8 @@ static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
 }
 
 #ifdef __linux__
-static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event *ev)
-{
+static int handle_forwarding_splice(struct proxy_conn *conn,
+                                    struct epoll_event *ev) {
     int src_fd, dst_fd;
     int *pipe_fds;
     ssize_t n_in, n_out;
@@ -549,7 +568,8 @@ static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event 
 
         if (to_write == 0) {
             /* Pipe is empty, read from source */
-            n_in = splice(src_fd, NULL, pipe_fds[1], NULL, 65536, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+            n_in = splice(src_fd, NULL, pipe_fds[1], NULL, 65536,
+                          SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
             if (n_in == 0) {
                 if (src_fd == conn->cli_sock)
                     conn->cli_in_eof = true;
@@ -560,7 +580,8 @@ static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event 
             if (n_in < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK)
                     break; /* Drained */
-                P_LOG_ERR("splice(in) from fd %d failed: %s", src_fd, strerror(errno));
+                P_LOG_ERR("splice(in) from fd %d failed: %s", src_fd,
+                          strerror(errno));
                 conn->state = S_CLOSING;
                 return 0;
             }
@@ -568,14 +589,16 @@ static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event 
         }
 
         /* Write to destination */
-        n_out = splice(pipe_fds[0], NULL, dst_fd, NULL, to_write, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+        n_out = splice(pipe_fds[0], NULL, dst_fd, NULL, to_write,
+                       SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
         if (n_out < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* Can't write, so data is now pending */
                 conn->splice_pending = to_write;
                 break;
             }
-            P_LOG_ERR("splice(out) to fd %d failed: %s", dst_fd, strerror(errno));
+            P_LOG_ERR("splice(out) to fd %d failed: %s", dst_fd,
+                      strerror(errno));
             conn->state = S_CLOSING;
             return 0;
         }
@@ -595,8 +618,7 @@ static int handle_forwarding_splice(struct proxy_conn *conn, struct epoll_event 
 #endif
 
 static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
-        struct epoll_event *ev)
-{
+                             struct epoll_event *ev) {
     char s_addr[50] = "";
 
     (void)efd;
@@ -625,11 +647,15 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     }
 
     if (ev->events & EPOLLIN) {
-        int sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
-        struct buffer_info *buf = (ev->data.ptr == &conn->magic_client) ? &conn->request : &conn->response;
+        int sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock
+                                                         : conn->svr_sock;
+        struct buffer_info *buf = (ev->data.ptr == &conn->magic_client)
+                                      ? &conn->request
+                                      : &conn->response;
         ssize_t rc;
         while (buf->dlen < buf->capacity) {
-            rc = recv(sock, buf->data + buf->dlen, buf->capacity - buf->dlen, 0);
+            rc =
+                recv(sock, buf->data + buf->dlen, buf->capacity - buf->dlen, 0);
             if (rc == 0) {
                 if (sock == conn->cli_sock)
                     conn->cli_in_eof = true;
@@ -647,8 +673,11 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     }
 
     if (ev->events & EPOLLOUT) {
-        int sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock : conn->svr_sock;
-        struct buffer_info *buf = (ev->data.ptr == &conn->magic_client) ? &conn->response : &conn->request;
+        int sock = (ev->data.ptr == &conn->magic_client) ? conn->cli_sock
+                                                         : conn->svr_sock;
+        struct buffer_info *buf = (ev->data.ptr == &conn->magic_client)
+                                      ? &conn->response
+                                      : &conn->request;
         ssize_t rc;
         if (buf->dlen > buf->rpos) {
             rc = send(sock, buf->data + buf->rpos, buf->dlen - buf->rpos, 0);
@@ -665,12 +694,13 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
         }
     }
 
-
-    if (conn->cli_in_eof && !conn->cli2svr_shutdown && conn->request.rpos >= conn->request.dlen) {
+    if (conn->cli_in_eof && !conn->cli2svr_shutdown &&
+        conn->request.rpos >= conn->request.dlen) {
         shutdown(conn->svr_sock, SHUT_WR);
         conn->cli2svr_shutdown = true;
     }
-    if (conn->svr_in_eof && !conn->svr2cli_shutdown && conn->response.rpos >= conn->response.dlen) {
+    if (conn->svr_in_eof && !conn->svr2cli_shutdown &&
+        conn->response.rpos >= conn->response.dlen) {
         shutdown(conn->cli_sock, SHUT_WR);
         conn->svr2cli_shutdown = true;
     }
@@ -684,23 +714,27 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
     return 0;
 
 err:
-    inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr), s_addr, sizeof(s_addr));
-    P_LOG_INFO("Connection [%s]:%d closed", s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
+    inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+              s_addr, sizeof(s_addr));
+    P_LOG_INFO("Connection [%s]:%d closed", s_addr,
+               ntohs(*port_of_sockaddr(&conn->cli_addr)));
     conn->state = S_CLOSING;
     return 0;
 }
 
-static void handle_new_connection(int listen_sock, int epfd, struct config *cfg)
-{
+static void handle_new_connection(int listen_sock, int epfd,
+                                  struct config *cfg) {
     for (;;) {
         union sockaddr_inx cli_addr;
         socklen_t cli_alen = sizeof(cli_addr);
         int cli_sock;
 #ifdef __linux__
-        cli_sock = accept4(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+        cli_sock = accept4(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen,
+                           SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (cli_sock < 0 && (errno == ENOSYS || errno == EINVAL)) {
             /* Fallback if accept4 not supported */
-            cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+            cli_sock =
+                accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
         }
 #else
         cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
@@ -723,8 +757,7 @@ static void handle_new_connection(int listen_sock, int epfd, struct config *cfg)
     }
 }
 
-static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
-{
+static int proxy_loop(int epfd, int listen_sock, struct config *cfg) {
     struct epoll_event events[512];
 
     while (!g_state.terminate) {
@@ -788,27 +821,42 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg)
     return 0;
 }
 
-static void show_help(const char *prog)
-{
+static void show_help(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <src_addr> <dst_addr>", prog);
-    P_LOG_INFO("  <src_addr>, <dst_addr>    -- IPv4/IPv6 address with port, e.g. 127.0.0.1:8080, [::1]:8080");
+    P_LOG_INFO("  <src_addr>, <dst_addr>    -- IPv4/IPv6 address with port, "
+               "e.g. 127.0.0.1:8080, [::1]:8080");
     P_LOG_INFO("  -d, --daemonize           -- detach and run in background");
     P_LOG_INFO("  -p, --pidfile <path>      -- create PID file at <path>");
-    P_LOG_INFO("  -b, --base-addr-mode      -- use src_addr as base for dst_addr (for load balancing)");
-    P_LOG_INFO("  -r, --reuse-addr          -- set SO_REUSEADDR on listener socket");
-    P_LOG_INFO("  -R, --reuse-port          -- set SO_REUSEPORT on listener socket");
-    P_LOG_INFO("  -6, --v6only              -- set IPV6_V6ONLY on listener socket");
-    P_LOG_INFO("  -C <pool_size>            -- connection pool size (default: %d)", TCP_PROXY_CONN_POOL_SIZE);
-    P_LOG_INFO("  -U <userbuf_bytes>        -- per-direction user buffer size (default: %d)", TCP_PROXY_USERBUF_CAP);
-    P_LOG_INFO("  -S <sockbuf_bytes>        -- SO_RCVBUF/SO_SNDBUF size (default: %d)", TCP_PROXY_SOCKBUF_CAP);
-    P_LOG_INFO("  -I <ka_idle>              -- TCP keepalive idle seconds (default: %d)", TCP_PROXY_KEEPALIVE_IDLE);
-    P_LOG_INFO("  -N <ka_intvl>             -- TCP keepalive interval seconds (default: %d)", TCP_PROXY_KEEPALIVE_INTVL);
-    P_LOG_INFO("  -K <ka_cnt>               -- TCP keepalive probe count (default: %d)", TCP_PROXY_KEEPALIVE_CNT);
+    P_LOG_INFO("  -b, --base-addr-mode      -- use src_addr as base for "
+               "dst_addr (for load balancing)");
+    P_LOG_INFO(
+        "  -r, --reuse-addr          -- set SO_REUSEADDR on listener socket");
+    P_LOG_INFO(
+        "  -R, --reuse-port          -- set SO_REUSEPORT on listener socket");
+    P_LOG_INFO(
+        "  -6, --v6only              -- set IPV6_V6ONLY on listener socket");
+    P_LOG_INFO(
+        "  -C <pool_size>            -- connection pool size (default: %d)",
+        TCP_PROXY_CONN_POOL_SIZE);
+    P_LOG_INFO("  -U <userbuf_bytes>        -- per-direction user buffer size "
+               "(default: %d)",
+               TCP_PROXY_USERBUF_CAP);
+    P_LOG_INFO(
+        "  -S <sockbuf_bytes>        -- SO_RCVBUF/SO_SNDBUF size (default: %d)",
+        TCP_PROXY_SOCKBUF_CAP);
+    P_LOG_INFO("  -I <ka_idle>              -- TCP keepalive idle seconds "
+               "(default: %d)",
+               TCP_PROXY_KEEPALIVE_IDLE);
+    P_LOG_INFO("  -N <ka_intvl>             -- TCP keepalive interval seconds "
+               "(default: %d)",
+               TCP_PROXY_KEEPALIVE_INTVL);
+    P_LOG_INFO("  -K <ka_cnt>               -- TCP keepalive probe count "
+               "(default: %d)",
+               TCP_PROXY_KEEPALIVE_CNT);
     P_LOG_INFO("  -h, --help                -- show this help");
 }
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char *argv[]) {
     int rc = 1;
     struct config cfg;
     int listen_sock = -1, epfd = -1;
@@ -842,12 +890,13 @@ int main(int argc, char *argv[])
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -C value '%s', keeping default %d", optarg, g_conn_pool_capacity);
+                P_LOG_WARN("invalid -C value '%s', keeping default %d", optarg,
+                           g_conn_pool_capacity);
             } else {
                 if (v < 64)
                     v = 64;
-                if (v > (1<<20))
-                    v = (1<<20);
+                if (v > (1 << 20))
+                    v = (1 << 20);
                 g_conn_pool_capacity = (int)v;
             }
             break;
@@ -856,12 +905,13 @@ int main(int argc, char *argv[])
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -U value '%s', keeping default %d", optarg, g_userbuf_cap_runtime);
+                P_LOG_WARN("invalid -U value '%s', keeping default %d", optarg,
+                           g_userbuf_cap_runtime);
             } else {
                 if (v < 4096)
                     v = 4096; /* min 4KB */
-                if (v > (8<<20))
-                    v = (8<<20); /* max 8MB */
+                if (v > (8 << 20))
+                    v = (8 << 20); /* max 8MB */
                 g_userbuf_cap_runtime = (int)v;
             }
             break;
@@ -870,12 +920,13 @@ int main(int argc, char *argv[])
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -S value '%s', keeping default %d", optarg, g_sockbuf_cap_runtime);
+                P_LOG_WARN("invalid -S value '%s', keeping default %d", optarg,
+                           g_sockbuf_cap_runtime);
             } else {
                 if (v < 4096)
                     v = 4096;
-                if (v > (8<<20))
-                    v = (8<<20);
+                if (v > (8 << 20))
+                    v = (8 << 20);
                 g_sockbuf_cap_runtime = (int)v;
             }
             break;
@@ -884,7 +935,8 @@ int main(int argc, char *argv[])
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -I value '%s', keeping default %d", optarg, g_ka_idle);
+                P_LOG_WARN("invalid -I value '%s', keeping default %d", optarg,
+                           g_ka_idle);
             } else {
                 if (v < 10)
                     v = 10;
@@ -898,7 +950,8 @@ int main(int argc, char *argv[])
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -N value '%s', keeping default %d", optarg, g_ka_intvl);
+                P_LOG_WARN("invalid -N value '%s', keeping default %d", optarg,
+                           g_ka_intvl);
             } else {
                 if (v < 5)
                     v = 5;
@@ -912,7 +965,8 @@ int main(int argc, char *argv[])
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v <= 0) {
-                P_LOG_WARN("invalid -K value '%s', keeping default %d", optarg, g_ka_cnt);
+                P_LOG_WARN("invalid -K value '%s', keeping default %d", optarg,
+                           g_ka_cnt);
             } else {
                 if (v < 1)
                     v = 1;
@@ -976,26 +1030,34 @@ int main(int argc, char *argv[])
 
     if (cfg.reuse_addr) {
         int on = 1;
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
-            P_LOG_WARN("setsockopt(SO_REUSEADDR): %s (continuing without reuseaddr)", strerror(errno));
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) <
+            0) {
+            P_LOG_WARN(
+                "setsockopt(SO_REUSEADDR): %s (continuing without reuseaddr)",
+                strerror(errno));
         }
     }
 
 #ifdef SO_REUSEPORT
     if (cfg.reuse_port) {
         int on = 1;
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
-            P_LOG_WARN("setsockopt(SO_REUSEPORT): %s (continuing without reuseport)", strerror(errno));
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) <
+            0) {
+            P_LOG_WARN(
+                "setsockopt(SO_REUSEPORT): %s (continuing without reuseport)",
+                strerror(errno));
         }
     }
 #endif
 
     if (cfg.src_addr.sa.sa_family == AF_INET6 && cfg.v6only) {
         int on = 1;
-        (void)setsockopt(listen_sock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+        (void)setsockopt(listen_sock, IPPROTO_IPV6, IPV6_V6ONLY, &on,
+                         sizeof(on));
     }
 
-    if (bind(listen_sock, &cfg.src_addr.sa, sizeof_sockaddr(&cfg.src_addr)) < 0) {
+    if (bind(listen_sock, &cfg.src_addr.sa, sizeof_sockaddr(&cfg.src_addr)) <
+        0) {
         P_LOG_ERR("bind(): %s", strerror(errno));
         goto cleanup;
     }
@@ -1023,7 +1085,8 @@ int main(int argc, char *argv[])
     struct epoll_event ev;
     ev.events = EPOLLIN;
 #ifdef EPOLLEXCLUSIVE
-    /* Reduce thundering herd with multiple processes listening on the same socket */
+    /* Reduce thundering herd with multiple processes listening on the same
+     * socket */
     ev.events |= EPOLLEXCLUSIVE;
 #endif
     ev.data.ptr = &magic_listener;
@@ -1039,7 +1102,8 @@ int main(int argc, char *argv[])
 cleanup:
     if (listen_sock >= 0) {
         if (close(listen_sock) < 0) {
-            P_LOG_WARN("close(listen_sock=%d): %s", listen_sock, strerror(errno));
+            P_LOG_WARN("close(listen_sock=%d): %s", listen_sock,
+                       strerror(errno));
         }
     }
     if (epfd >= 0) {
