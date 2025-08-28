@@ -26,7 +26,20 @@
 #include "3rd/kcp/ikcp.h"
 
 /* ---------------- Client event handlers (extracted) ---------------- */
-struct cfg_client; /* forward decl for ctx */
+struct cfg_client {
+    union sockaddr_inx laddr; /* TCP listen */
+    union sockaddr_inx raddr; /* UDP remote */
+    const char *pidfile;
+    bool daemonize;
+    bool reuse_addr;
+    bool reuse_port;
+    bool v6only;
+    int sockbuf_bytes;
+    bool tcp_nodelay;
+    bool has_psk;
+    uint8_t psk[32];
+};
+
 struct client_ctx {
     int epfd;
     int lsock;
@@ -43,7 +56,6 @@ static void client_handle_udp_events(struct client_ctx *ctx,
 static void client_handle_tcp_events(struct client_ctx *ctx,
                                      struct proxy_conn *c,
                                      uint32_t evmask);
-static void client_timers_and_cleanup(struct client_ctx *ctx);
 
 /* UDP socket events for a single connection */
 static void client_handle_udp_events(struct client_ctx *ctx,
@@ -1051,20 +1063,6 @@ static void print_usage(const char *prog) {
     P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305)");
     P_LOG_INFO("  -h                 show help");
 }
-
-struct cfg_client {
-    union sockaddr_inx laddr; /* TCP listen */
-    union sockaddr_inx raddr; /* UDP remote */
-    const char *pidfile;
-    bool daemonize;
-    bool reuse_addr;
-    bool reuse_port;
-    bool v6only;
-    int sockbuf_bytes;
-    bool tcp_nodelay;
-    bool has_psk;
-    uint8_t psk[32];
-};
 
 int main(int argc, char **argv) {
     int rc = 1;
