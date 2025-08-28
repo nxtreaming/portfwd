@@ -171,14 +171,14 @@ static void poly1305_auth(uint8_t mac[16], const uint8_t *m, size_t inlen, const
     h2 = (h2 >> 12) | (h3 << 14);
     h3 = (h3 >> 18) | (h4 << 8);
 
-    /* s part */
-    uint64_t s0 = ((uint64_t)key[16]) | ((uint64_t)key[17] << 8) | ((uint64_t)key[18] << 16) | ((uint64_t)key[19] << 24) |
+    /* pad (s) part; avoid name clash with precomputed s1..s4 */
+    uint64_t p0 = ((uint64_t)key[16]) | ((uint64_t)key[17] << 8) | ((uint64_t)key[18] << 16) | ((uint64_t)key[19] << 24) |
                   ((uint64_t)key[20] << 32) | ((uint64_t)key[21] << 40) | ((uint64_t)key[22] << 48) | ((uint64_t)key[23] << 56);
-    uint64_t s1 = ((uint64_t)key[24]) | ((uint64_t)key[25] << 8) | ((uint64_t)key[26] << 16) | ((uint64_t)key[27] << 24) |
+    uint64_t p1 = ((uint64_t)key[24]) | ((uint64_t)key[25] << 8) | ((uint64_t)key[26] << 16) | ((uint64_t)key[27] << 24) |
                   ((uint64_t)key[28] << 32) | ((uint64_t)key[29] << 40) | ((uint64_t)key[30] << 48) | ((uint64_t)key[31] << 56);
 
-    uint64_t f0 = (h0 + s0);
-    uint64_t f1 = (h1 + s1);
+    uint64_t f0 = (h0 + p0);
+    uint64_t f1 = (h1 + p1);
 
     /* serialize tag little-endian */
     for (int i = 0; i < 8; ++i) mac[i]     = (uint8_t)(f0 >> (i * 8));
