@@ -21,9 +21,10 @@
 #include "proxy_conn.h"
 #include "kcp_common.h"
 #include "kcptcp_common.h"
-#include "kcp_map.h"
-#include "aead.h"
+#include "kcp_common.h"
+#include "aead_protocol.h"
 #include "anti_replay.h"
+#include "buffer_limits.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "aead_protocol.h"
@@ -301,7 +302,8 @@ int main(int argc, char **argv) {
                         /* Register TCP server socket */
                         if (kcptcp_ep_register_tcp(epfd, ts, nc, true) < 0) {
                             P_LOG_ERR("epoll add tcp: %s", strerror(errno));
-                            ikcp_release(nc->kcp);
+                            if (nc->kcp)
+                                ikcp_release(nc->kcp);
                             close(ts);
                             free(nc);
                             continue;
@@ -371,7 +373,7 @@ int main(int argc, char **argv) {
                             break;
                         }
                         if (res > 0) { // Control packet handled
-                            if (c->svr_in_eof && !c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
+                            if (c->svr_in_eof && !c->svr2cli_shutdown && c->response.dlen == c->response.rpos && c->cli_sock > 0) {
                                 shutdown(c->cli_sock, SHUT_WR);
                                 c->svr2cli_shutdown = true;
                             }
@@ -395,9 +397,14 @@ int main(int argc, char **argv) {
                             if (freecap < need) {
                                 size_t ncap = c->request.capacity
                                                   ? c->request.capacity * 2
-                                                  : (size_t)65536;
+                                                  : INITIAL_BUFFER_SIZE;
                                 if (ncap < c->request.dlen + need)
                                     ncap = c->request.dlen + need;
+                                if (!buffer_size_check(c->request.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
+                                    P_LOG_WARN("Request buffer size limit exceeded, closing connection");
+                                    c->state = S_CLOSING;
+                                    break;
+                                }
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
@@ -426,7 +433,7 @@ int main(int argc, char **argv) {
                             if (freecap < rem) {
                                 size_t ncap = c->request.capacity
                                                   ? c->request.capacity * 2
-                                                  : (size_t)65536;
+                                                  : INITIAL_BUFFER_SIZE;
                                 if (ncap < c->request.dlen + rem)
                                     ncap = c->request.dlen + rem;
                                 char *np =
@@ -458,7 +465,7 @@ int main(int argc, char **argv) {
                             if (freecap < rem) {
                                 size_t ncap = c->request.capacity
                                                   ? c->request.capacity * 2
-                                                  : (size_t)65536;
+                                                  : INITIAL_BUFFER_SIZE;
                                 if (ncap < c->request.dlen + rem)
                                     ncap = c->request.dlen + rem;
                                 char *np =
@@ -528,7 +535,7 @@ int main(int argc, char **argv) {
                                                      false);
                         /* If we got FIN from peer earlier, perform shutdown
                          * write now */
-                        if (c->cli_in_eof && !c->cli2svr_shutdown) {
+                        if (c->cli_in_eof && !c->cli2svr_shutdown && c->svr_sock > 0) {
                             shutdown(c->svr_sock, SHUT_WR);
                             c->cli2svr_shutdown = true;
                         }

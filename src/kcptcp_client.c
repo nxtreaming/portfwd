@@ -19,10 +19,12 @@
 #endif
 #include "common.h"
 #include "proxy_conn.h"
-#include "kcp_common.h"
 #include "kcptcp_common.h"
+#include "kcp_common.h"
 #include "aead_protocol.h"
 #include "anti_replay.h"
+#include "secure_random.h"
+#include "buffer_limits.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "aead.h"
@@ -217,9 +219,14 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                     if (freecap < need) {
                         size_t ncap = c->response.capacity
                                           ? c->response.capacity * 2
-                                          : (size_t)65536;
+                                          : INITIAL_BUFFER_SIZE;
                         if (ncap < c->response.dlen + need)
                             ncap = c->response.dlen + need;
+                        if (!buffer_size_check(c->response.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
+                            P_LOG_WARN("Response buffer size limit exceeded, closing connection");
+                            c->state = S_CLOSING;
+                            break;
+                        }
                         char *np = (char *)realloc(c->response.data, ncap);
                         if (!np) {
                             c->state = S_CLOSING;
@@ -250,9 +257,14 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 if (freecap < rem) {
                     size_t ncap = c->response.capacity
                                       ? c->response.capacity * 2
-                                      : (size_t)65536;
+                                      : INITIAL_BUFFER_SIZE;
                     if (ncap < c->response.dlen + rem)
                         ncap = c->response.dlen + rem;
+                    if (!buffer_size_check(c->response.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
+                        P_LOG_WARN("Response buffer size limit exceeded, closing connection");
+                        c->state = S_CLOSING;
+                        break;
+                    }
                     char *np = (char *)realloc(c->response.data, ncap);
                     if (!np) {
                         c->state = S_CLOSING;
@@ -318,9 +330,12 @@ static void client_handle_accept(struct client_ctx *ctx) {
         c->kcp = NULL; /* not created until ACCEPT */
         c->kcp_ready = false;
         c->next_ka_ms = 0;
-        /* Generate 16-byte token */
-        for (int i = 0; i < 16; ++i)
-            c->hs_token[i] = (unsigned char)(rand() & 0xFF);
+        /* Generate 16-byte token using cryptographically secure random */
+        if (secure_random_bytes(c->hs_token, 16) != 0) {
+            P_LOG_ERR("Failed to generate secure random token");
+            c->state = S_CLOSING;
+            break;
+        }
         /* Send HELLO: [type][ver][token(16)] */
         unsigned char hbuf[1 + 1 + 16];
         hbuf[0] = (unsigned char)KTP_HS_HELLO;
@@ -339,7 +354,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
                 free(ctag);
             if (utag)
                 free(utag);
-            ikcp_release(c->kcp);
+            if (c->kcp)
+                ikcp_release(c->kcp);
             close(cs);
             close(us);
             free(c);
@@ -355,7 +371,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
         /* Register both fds */
         if (kcptcp_ep_register_tcp(ctx->epfd, cs, ctag, false) < 0) {
             P_LOG_ERR("epoll add cli: %s", strerror(errno));
-            ikcp_release(c->kcp);
+            if (c->kcp)
+                ikcp_release(c->kcp);
             close(cs);
             close(us);
             free(ctag);
@@ -366,7 +383,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
         if (kcptcp_ep_register_rw(ctx->epfd, us, utag, false) < 0) {
             P_LOG_ERR("epoll add udp: %s", strerror(errno));
             (void)ep_del(ctx->epfd, cs);
-            ikcp_release(c->kcp);
+            if (c->kcp)
+                ikcp_release(c->kcp);
             close(cs);
             close(us);
             free(ctag);
@@ -439,9 +457,14 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
                 if (freecap < need) {
                     size_t ncap = c->request.capacity
                                       ? c->request.capacity * 2
-                                      : (size_t)65536;
+                                      : INITIAL_BUFFER_SIZE;
                     if (ncap < c->request.dlen + need)
                         ncap = c->request.dlen + need;
+                    if (!buffer_size_check(c->request.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
+                        P_LOG_WARN("Request buffer size limit exceeded, closing connection");
+                        c->state = S_CLOSING;
+                        break;
+                    }
                     char *np = (char *)realloc(c->request.data, ncap);
                     if (!np) {
                         c->state = S_CLOSING;
