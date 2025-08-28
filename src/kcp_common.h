@@ -52,12 +52,19 @@ enum kcp_tun_type {
     /* Encrypted variants (ChaCha20-Poly1305) */
     KTP_EDATA = 0x20, /* [type][seq(4)][ciphertext][tag(16)] */
     KTP_EFIN  = 0x21, /* [type][seq(4)][tag(16)] */
+    /* Rekey control (sent inside KCP stream, AEAD-authenticated) */
+    KTP_REKEY_INIT = 0x22, /* [type][seq(4)][tag(16)] sealed with CURRENT key */
+    KTP_REKEY_ACK  = 0x23, /* [type][seq(4)==0][tag(16)] sealed with NEXT key */
     /* Handshake control (outer, non-KCP) */
     KTP_HS_HELLO  = 0x10,
     KTP_HS_ACCEPT = 0x11,
     KTP_HS_REJECT = 0x12,
     KTP_HS_RESUME = 0x13
 };
+
+/* Rekey policy defaults */
+#define REKEY_SEQ_THRESHOLD 0xFFF00000u /* start rekey before wraparound */
+#define REKEY_TIMEOUT_MS    5000u       /* wait for ACK before fail-closed */
 
 #define KCP_HS_VER 0x01
 

@@ -88,6 +88,14 @@ struct proxy_conn {
      */
     uint32_t recv_win;        /* highest accepted seq */
     uint64_t recv_win_mask;   /* bit i set means (recv_win - i) was seen */
+
+    /* Rekeying state (Phase 3.5): key epochs and next-key staging */
+    uint32_t epoch;               /* current key epoch; starts at 0 when session key derived */
+    bool rekey_in_progress;       /* set after sending/receiving REKEY_INIT until switch */
+    uint8_t next_session_key[32]; /* derived via derive_session_key_epoch(psk, token, conv, epoch+1) */
+    uint8_t next_nonce_base[12];  /* base for next epoch; usually first 12 bytes of next_session_key */
+    uint32_t next_epoch;          /* typically epoch+1 */
+    uint64_t rekey_deadline_ms;   /* absolute deadline (kcp_now_ms) to receive/switch, else close */
 };
 
 /* Epoll event tag to disambiguate fd source */

@@ -14,6 +14,13 @@ extern "C" {
  */
 int derive_session_key_from_psk(const uint8_t psk[32], const uint8_t token16[16], uint32_t conv, uint8_t out_key[32]);
 
+/* Derive a session key with an explicit epoch for rekeying.
+ * This must be deterministic for both peers given PSK, token, conv, and epoch.
+ * out_key[32] receives the session key. Returns 0 on success, -1 otherwise.
+ */
+int derive_session_key_epoch(const uint8_t psk[32], const uint8_t token16[16],
+                             uint32_t conv, uint32_t epoch, uint8_t out_key[32]);
+
 #ifdef __cplusplus
 }
 #endif
