@@ -370,11 +370,30 @@ int main(int argc, char **argv) {
                         int got = ikcp_recv(c->kcp, ubuf, peek);
                         if (got <= 0)
                             break;
-                        ssize_t wn = send(c->cli_sock, ubuf, (size_t)got, MSG_NOSIGNAL);
+                        if (got < 1) continue;
+                        unsigned char t = (unsigned char)ubuf[0];
+                        if (t == KTP_KA) {
+                            /* ignore */
+                            continue;
+                        }
+                        if (t == KTP_FIN) {
+                            /* Peer half-closing server->client: record and possibly shutdown write after drain */
+                            c->svr_in_eof = true;
+                            /* Try to shutdown write if nothing pending */
+                            if (!c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
+                                shutdown(c->cli_sock, SHUT_WR);
+                                c->svr2cli_shutdown = true;
+                            }
+                            continue;
+                        }
+                        /* Data */
+                        char *payload = ubuf + 1;
+                        int plen = got - 1;
+                        ssize_t wn = send(c->cli_sock, payload, (size_t)plen, MSG_NOSIGNAL);
                         if (wn < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                                 /* Backpressure: buffer and enable EPOLLOUT */
-                                size_t need = (size_t)got;
+                                size_t need = (size_t)plen;
                                 size_t freecap = (c->response.capacity > c->response.dlen) ? (c->response.capacity - c->response.dlen) : 0;
                                 if (freecap < need) {
                                     size_t ncap = c->response.capacity ? c->response.capacity * 2 : (size_t)65536;
@@ -384,8 +403,8 @@ int main(int argc, char **argv) {
                                     c->response.data = np;
                                     c->response.capacity = ncap;
                                 }
-                                memcpy(c->response.data + c->response.dlen, ubuf, (size_t)got);
-                                c->response.dlen += (size_t)got;
+                                memcpy(c->response.data + c->response.dlen, payload, (size_t)plen);
+                                c->response.dlen += (size_t)plen;
                                 struct epoll_event cev = (struct epoll_event){0};
                                 cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
                                 cev.data.ptr = c->cli_tag;
@@ -394,9 +413,9 @@ int main(int argc, char **argv) {
                             }
                             c->state = S_CLOSING;
                             break;
-                        } else if (wn < got) {
+                        } else if (wn < plen) {
                             /* Short write: buffer remaining and enable EPOLLOUT */
-                            size_t rem = (size_t)got - (size_t)wn;
+                            size_t rem = (size_t)plen - (size_t)wn;
                             size_t freecap = (c->response.capacity > c->response.dlen) ? (c->response.capacity - c->response.dlen) : 0;
                             if (freecap < rem) {
                                 size_t ncap = c->response.capacity ? c->response.capacity * 2 : (size_t)65536;
@@ -406,7 +425,7 @@ int main(int argc, char **argv) {
                                 c->response.data = np;
                                 c->response.capacity = ncap;
                             }
-                            memcpy(c->response.data + c->response.dlen, ubuf + wn, rem);
+                            memcpy(c->response.data + c->response.dlen, payload + wn, rem);
                             c->response.dlen += rem;
                             struct epoll_event cev = (struct epoll_event){0};
                             cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
@@ -449,6 +468,11 @@ int main(int argc, char **argv) {
                     cev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
                     cev.data.ptr = c->cli_tag;
                     (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
+                    /* If we received FIN earlier, shutdown write now that buffer is drained */
+                    if (c->svr_in_eof && !c->svr2cli_shutdown) {
+                        shutdown(c->cli_sock, SHUT_WR);
+                        c->svr2cli_shutdown = true;
+                    }
                 }
             }
 
@@ -457,7 +481,11 @@ int main(int argc, char **argv) {
                 char tbuf[64 * 1024];
                 ssize_t rn;
                 while ((rn = recv(c->cli_sock, tbuf, sizeof(tbuf), 0)) > 0) {
-                    int sn = ikcp_send(c->kcp, tbuf, (int)rn);
+                    /* Wrap as DATA with 1-byte header */
+                    unsigned char hdrbuf[1 + sizeof(tbuf)];
+                    hdrbuf[0] = (unsigned char)KTP_DATA;
+                    memcpy(hdrbuf + 1, tbuf, (size_t)rn);
+                    int sn = ikcp_send(c->kcp, (const char*)hdrbuf, (int)(rn + 1));
                     if (sn < 0) {
                         c->state = S_CLOSING;
                         break;
@@ -465,8 +493,14 @@ int main(int argc, char **argv) {
                     c->last_active = time(NULL);
                 }
                 if (rn == 0) {
-                    /* TCP EOF -> close */
-                    c->state = S_CLOSING;
+                    /* TCP EOF: send FIN over KCP, stop further reads; allow pending KCP->TCP to drain */
+                    unsigned char fin = (unsigned char)KTP_FIN;
+                    (void)ikcp_send(c->kcp, (const char*)&fin, 1);
+                    c->cli_in_eof = true;
+                    struct epoll_event cev = {0};
+                    cev.events = EPOLLRDHUP | EPOLLERR | EPOLLHUP; /* disable EPOLLIN */
+                    cev.data.ptr = c->cli_tag;
+                    (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
                 } else if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     c->state = S_CLOSING;
                 }
@@ -480,9 +514,23 @@ int main(int argc, char **argv) {
             (void)kcp_update_flush(pos, now);
             /* Heartbeat over KCP every 30s */
             if (pos->state != S_CLOSING && pos->kcp && pos->next_ka_ms && (int32_t)(now - pos->next_ka_ms) >= 0) {
-                static const char ka = 0;
-                (void)ikcp_send(pos->kcp, &ka, 1);
+                unsigned char ka = (unsigned char)KTP_KA;
+                (void)ikcp_send(pos->kcp, (const char*)&ka, 1);
                 pos->next_ka_ms = now + 30000;
+            }
+            /* If we received FIN earlier and output buffer has drained, shutdown(WRITE) */
+            if (pos->svr_in_eof && !pos->svr2cli_shutdown && pos->response.dlen == pos->response.rpos) {
+                shutdown(pos->cli_sock, SHUT_WR);
+                pos->svr2cli_shutdown = true;
+            }
+            /* Graceful close when both halves have signaled EOF and all pending are flushed */
+            if (pos->state != S_CLOSING && pos->cli_in_eof && pos->svr_in_eof) {
+                int kcp_unsent = pos->kcp ? ikcp_waitsnd(pos->kcp) : 0;
+                bool udp_backlog_empty = (pos->udp_backlog.dlen == 0);
+                bool resp_empty = (pos->response.dlen == pos->response.rpos);
+                if (kcp_unsent == 0 && udp_backlog_empty && resp_empty) {
+                    pos->state = S_CLOSING;
+                }
             }
             /* Idle timeout (e.g., 180s) */
             time_t ct = time(NULL);

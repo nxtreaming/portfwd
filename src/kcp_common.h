@@ -44,6 +44,13 @@ int kcp_setup_conn(struct proxy_conn *c, int udp_fd, const union sockaddr_inx *p
 /* Drive timer update/flush (stub until ikcp is linked) */
 int kcp_update_flush(struct proxy_conn *c, uint32_t now_ms);
 
+/* KCP tunneled packet types (1-byte header before payload) */
+enum kcp_tun_type {
+    KTP_DATA = 0x00,
+    KTP_FIN  = 0x01,
+    KTP_KA   = 0x02
+};
+
 #ifdef __cplusplus
 }
 #endif

@@ -321,7 +321,7 @@ int main(int argc, char **argv) {
 
                     /* Feed KCP */
                     (void)ikcp_input(c->kcp, buf, (long)rn);
-                    /* Drain to TCP */
+                    /* Drain to TCP (KCP -> target TCP) */
                     for (;;) {
                         int peek = ikcp_peeksize(c->kcp);
                         if (peek < 0)
@@ -331,9 +331,27 @@ int main(int argc, char **argv) {
                         int got = ikcp_recv(c->kcp, buf, peek);
                         if (got <= 0)
                             break;
+                        if (got < 1) continue;
+                        unsigned char t = (unsigned char)buf[0];
+                        if (t == KTP_KA) {
+                            /* ignore */
+                            continue;
+                        }
+                        if (t == KTP_FIN) {
+                            /* Peer indicates no more client->server data; schedule shutdown(WRITE) after request buffer drains */
+                            c->cli_in_eof = true;
+                            if (!c->cli2svr_shutdown && c->request.rpos == c->request.dlen) {
+                                shutdown(c->svr_sock, SHUT_WR);
+                                c->cli2svr_shutdown = true;
+                            }
+                            continue;
+                        }
+                        /* Data payload */
+                        char *payload = buf + 1;
+                        int plen = got - 1;
                         /* If TCP connect not completed, buffer instead of sending */
                         if (c->state != S_FORWARDING) {
-                            size_t need = (size_t)got;
+                            size_t need = (size_t)plen;
                             size_t freecap = (c->request.capacity > c->request.dlen) ? (c->request.capacity - c->request.dlen) : 0;
                             if (freecap < need) {
                                 size_t ncap = c->request.capacity ? c->request.capacity * 2 : (size_t)65536;
@@ -343,8 +361,8 @@ int main(int argc, char **argv) {
                                 c->request.data = np;
                                 c->request.capacity = ncap;
                             }
-                            memcpy(c->request.data + c->request.dlen, buf, (size_t)got);
-                            c->request.dlen += (size_t)got;
+                            memcpy(c->request.data + c->request.dlen, payload, (size_t)plen);
+                            c->request.dlen += (size_t)plen;
                             /* Ensure EPOLLOUT is enabled to both complete connect and flush later */
                             struct epoll_event tev2 = (struct epoll_event){0};
                             tev2.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
@@ -352,11 +370,11 @@ int main(int argc, char **argv) {
                             (void)ep_add_or_mod(epfd, c->svr_sock, &tev2);
                             break;
                         }
-                        ssize_t wn = send(c->svr_sock, buf, (size_t)got, MSG_NOSIGNAL);
+                        ssize_t wn = send(c->svr_sock, payload, (size_t)plen, MSG_NOSIGNAL);
                         if (wn < 0) {
                             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                                 /* Backpressure: buffer and enable EPOLLOUT */
-                                size_t need = (size_t)got;
+                                size_t need = (size_t)plen;
                                 size_t freecap = (c->request.capacity > c->request.dlen) ? (c->request.capacity - c->request.dlen) : 0;
                                 if (freecap < need) {
                                     size_t ncap = c->request.capacity ? c->request.capacity * 2 : (size_t)65536;
@@ -366,8 +384,8 @@ int main(int argc, char **argv) {
                                     c->request.data = np;
                                     c->request.capacity = ncap;
                                 }
-                                memcpy(c->request.data + c->request.dlen, buf, (size_t)got);
-                                c->request.dlen += (size_t)got;
+                                memcpy(c->request.data + c->request.dlen, payload, (size_t)plen);
+                                c->request.dlen += (size_t)plen;
                                 struct epoll_event tev2 = (struct epoll_event){0};
                                 tev2.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
                                 tev2.data.ptr = c;
@@ -376,9 +394,9 @@ int main(int argc, char **argv) {
                             }
                             c->state = S_CLOSING;
                             break;
-                        } else if (wn < got) {
+                        } else if (wn < plen) {
                             /* Short write: buffer remaining and enable EPOLLOUT */
-                            size_t rem = (size_t)got - (size_t)wn;
+                            size_t rem = (size_t)plen - (size_t)wn;
                             size_t freecap = (c->request.capacity > c->request.dlen) ? (c->request.capacity - c->request.dlen) : 0;
                             if (freecap < rem) {
                                 size_t ncap = c->request.capacity ? c->request.capacity * 2 : (size_t)65536;
@@ -388,7 +406,7 @@ int main(int argc, char **argv) {
                                 c->request.data = np;
                                 c->request.capacity = ncap;
                             }
-                            memcpy(c->request.data + c->request.dlen, buf + wn, rem);
+                            memcpy(c->request.data + c->request.dlen, payload + wn, rem);
                             c->request.dlen += rem;
                             struct epoll_event tev2 = (struct epoll_event){0};
                             tev2.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
@@ -439,13 +457,22 @@ int main(int argc, char **argv) {
                     tev2.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
                     tev2.data.ptr = c;
                     (void)ep_add_or_mod(epfd, c->svr_sock, &tev2);
+                    /* If we got FIN from peer earlier, perform shutdown write now */
+                    if (c->cli_in_eof && !c->cli2svr_shutdown) {
+                        shutdown(c->svr_sock, SHUT_WR);
+                        c->cli2svr_shutdown = true;
+                    }
                 }
             }
             if (events[i].events & EPOLLIN) {
                 char sbuf[64 * 1024];
                 ssize_t rn;
                 while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) > 0) {
-                    int sn = ikcp_send(c->kcp, sbuf, (int)rn);
+                    /* Wrap as DATA */
+                    unsigned char hdrbuf[1 + sizeof(sbuf)];
+                    hdrbuf[0] = (unsigned char)KTP_DATA;
+                    memcpy(hdrbuf + 1, sbuf, (size_t)rn);
+                    int sn = ikcp_send(c->kcp, (const char*)hdrbuf, (int)(rn + 1));
                     if (sn < 0) {
                         c->state = S_CLOSING;
                         break;
@@ -453,7 +480,14 @@ int main(int argc, char **argv) {
                     c->last_active = time(NULL);
                 }
                 if (rn == 0) {
-                    c->state = S_CLOSING;
+                    /* TCP target sent EOF: send FIN over KCP, stop further reads, allow pending KCP to flush */
+                    unsigned char fin = (unsigned char)KTP_FIN;
+                    (void)ikcp_send(c->kcp, (const char*)&fin, 1);
+                    c->svr_in_eof = true;
+                    struct epoll_event tev2 = (struct epoll_event){0};
+                    tev2.events = EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP; /* disable EPOLLIN */
+                    tev2.data.ptr = c;
+                    (void)ep_add_or_mod(epfd, c->svr_sock, &tev2);
                 } else if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                     c->state = S_CLOSING;
                 }
@@ -465,10 +499,19 @@ int main(int argc, char **argv) {
         struct proxy_conn *pos, *tmp;
         list_for_each_entry_safe(pos, tmp, &conns, list) {
             (void)kcp_update_flush(pos, now);
+            /* If server TCP got EOF, wait until all buffered client->server data is flushed before closing */
+            if (pos->svr_in_eof && pos->state != S_CLOSING) {
+                bool tcp_buf_empty = (pos->request.dlen == pos->request.rpos);
+                int kcp_unsent = pos->kcp ? ikcp_waitsnd(pos->kcp) : 0;
+                bool udp_backlog_empty = (pos->udp_backlog.dlen == 0);
+                if (tcp_buf_empty && kcp_unsent == 0 && udp_backlog_empty) {
+                    pos->state = S_CLOSING;
+                }
+            }
             /* Heartbeat over KCP every 30s to keep NAT/paths warm */
             if (pos->state != S_CLOSING && pos->kcp && pos->next_ka_ms && (int32_t)(now - pos->next_ka_ms) >= 0) {
-                static const char ka = 0;
-                (void)ikcp_send(pos->kcp, &ka, 1);
+                unsigned char ka = (unsigned char)KTP_KA;
+                (void)ikcp_send(pos->kcp, (const char*)&ka, 1);
                 pos->next_ka_ms = now + 30000;
             }
             /* Idle timeout (e.g., 180s) */
