@@ -18,6 +18,39 @@
 static volatile sig_atomic_t g_stop = 0;
 static void on_sig(int s){ (void)s; g_stop = 1; }
 
+struct totals {
+    unsigned conv;
+    unsigned long long tcp_rx, tcp_tx;
+    unsigned long long udp_rx, udp_tx;
+    unsigned long long kcp_rx_msgs, kcp_tx_msgs;
+    unsigned long long kcp_rx_bytes, kcp_tx_bytes;
+    unsigned rekeys_i, rekeys_c;
+};
+
+/* Try to parse a totals line starting at ptr. Returns true on success. */
+static bool parse_totals_line(const char* ptr, struct totals* out) {
+    return sscanf(ptr,
+                  "stats total conv=%u: tcp_rx=%llu tcp_tx=%llu udp_rx=%llu udp_tx=%llu kcp_rx_msgs=%llu kcp_tx_msgs=%llu kcp_rx_bytes=%llu kcp_tx_bytes=%llu rekeys_i=%u rekeys_c=%u",
+                  &out->conv,
+                  &out->tcp_rx, &out->tcp_tx,
+                  &out->udp_rx, &out->udp_tx,
+                  &out->kcp_rx_msgs, &out->kcp_tx_msgs,
+                  &out->kcp_rx_bytes, &out->kcp_tx_bytes,
+                  &out->rekeys_i, &out->rekeys_c) == 11;
+}
+
+/* Scan buffer for the last totals line; if found, parse into out and return true */
+static bool find_last_totals(const char* buf, size_t len, struct totals* out) {
+    const char* key = "stats total conv=";
+    size_t klen = strlen(key);
+    const char* last = NULL;
+    for (size_t i = 0; i + klen < len; ++i) {
+        if (memcmp(buf + i, key, klen) == 0) last = buf + i;
+    }
+    if (!last) return false;
+    return parse_totals_line(last, out);
+}
+
 /* Find maximum floating value after key, tolerant to following text like " Mbps" */
 static double find_max_double(const char* buf, size_t len, const char* key) {
     if (!buf || !key) return 0.0;
@@ -309,6 +342,18 @@ out:
         double kcp_out = find_max_double(cli_log, cli_len, "KCP payload out=");
         if (kcp_out <= 0.0) kcp_out = find_max_double(srv_log, srv_len, "KCP payload out=");
         if (tcp_in <= 0.0 && kcp_out <= 0.0) ok = false;
+        // Validate core counters from totals
+        struct totals t = {0}; bool have_totals = false;
+        if (find_last_totals(cli_log, cli_len, &t)) have_totals = true;
+        else if (find_last_totals(srv_log, srv_len, &t)) have_totals = true;
+        if (!have_totals) ok = false;
+        if (have_totals) {
+            if (t.tcp_rx == 0ull || t.tcp_tx == 0ull) ok = false;
+            if (t.udp_rx == 0ull || t.udp_tx == 0ull) ok = false;
+            if (t.kcp_rx_bytes == 0ull || t.kcp_tx_bytes == 0ull) ok = false;
+            if (t.kcp_rx_msgs == 0ull || t.kcp_tx_msgs == 0ull) ok = false;
+            if (t.rekeys_i == 0u || t.rekeys_c == 0u) ok = false;
+        }
         // Verify rekey counter deltas observed in stats logs (expect >=1 initiated and completed)
         unsigned i_max = find_max_counter(cli_log, cli_len, "rekey i=");
         if (i_max == 0u) {
