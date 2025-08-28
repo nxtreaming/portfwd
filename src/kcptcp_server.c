@@ -1429,3 +1429,4 @@ cleanup:
         cleanup_pidfile();
         return rc;
     }
+}
