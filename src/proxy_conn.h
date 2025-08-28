@@ -81,7 +81,13 @@ struct proxy_conn {
     uint8_t session_key[32];
     uint8_t nonce_base[12];   /* 12-byte base; per-direction seq fills low 4 bytes */
     uint32_t send_seq;        /* increment per outbound KCP packet carrying DATA/FIN */
-    uint32_t recv_seq;        /* increment per inbound KCP packet carrying DATA/FIN */
+    uint32_t recv_seq;        /* legacy counter; not used for anti-replay window */
+    /* Anti-replay sliding window (Phase 3):
+     *  - recv_win tracks the highest validated sequence number received so far
+     *  - recv_win_mask is a 64-bit bitmap of recently seen sequences in the range [recv_win-63, recv_win]
+     */
+    uint32_t recv_win;        /* highest accepted seq */
+    uint64_t recv_win_mask;   /* bit i set means (recv_win - i) was seen */
 };
 
 /* Epoll event tag to disambiguate fd source */

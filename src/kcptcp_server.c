@@ -22,6 +22,38 @@
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 
+/* Anti-replay helpers (sliding window, 64 entries) */
+static inline int32_t seq_diff_u32(uint32_t a, uint32_t b) { return (int32_t)(a - b); }
+static inline bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win, uint64_t *p_mask) {
+    uint32_t win = *p_win;
+    uint64_t mask = *p_mask;
+    if (win == UINT32_MAX) { /* uninitialized */
+        *p_win = seq;
+        *p_mask = 1ULL; /* mark bit0 */
+        return true;
+    }
+    int32_t d = seq_diff_u32(seq, win);
+    if (d > 0) {
+        uint32_t shift = (d >= 64) ? 64u : (uint32_t)d;
+        mask = (shift >= 64) ? 0ULL : (mask << shift);
+        mask |= 1ULL;
+        win = seq;
+        *p_win = win; *p_mask = mask; return true;
+    }
+    int32_t behind = -d;
+    if (behind >= 64) return false;
+    uint64_t bit = 1ULL << behind;
+    if (mask & bit) return false; /* replay */
+    mask |= bit; *p_win = win; *p_mask = mask; return true;
+}
+
+/* Guard against send_seq wraparound; returns false on wrap */
+static inline bool aead_next_send_seq(struct proxy_conn *c, uint32_t *out_seq) {
+    if (c->send_seq == UINT32_MAX) return false;
+    *out_seq = c->send_seq++;
+    return true;
+}
+
 static void print_usage(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <local_udp_addr:port> <target_tcp_addr:port>", prog);
     P_LOG_INFO("Options (subset; KCP tunables to be added):");
@@ -322,6 +354,8 @@ int main(int argc, char **argv) {
                                 memcpy(nc->nonce_base, nc->session_key, 12);
                                 nc->send_seq = 0;
                                 nc->recv_seq = 0;
+                                nc->recv_win = UINT32_MAX; /* uninitialized */
+                                nc->recv_win_mask = 0ULL;
                             } else {
                                 P_LOG_ERR("session key derivation failed");
                                 close(ts);
@@ -394,9 +428,19 @@ int main(int argc, char **argv) {
                             break;
                         if (got < 1) continue;
                         unsigned char t = (unsigned char)buf[0];
+                        if (c->has_session_key && (t == KTP_DATA || t == KTP_FIN)) {
+                            P_LOG_ERR("plaintext pkt type in encrypted session (svr)");
+                            c->state = S_CLOSING; break;
+                        }
                         if (t == KTP_EFIN && c->has_session_key) {
                             if (got < (int)(1 + 4 + 16)) continue;
                             uint32_t seq = (uint32_t)((uint8_t)buf[1] | ((uint8_t)buf[2] << 8) | ((uint8_t)buf[3] << 16) | ((uint8_t)buf[4] << 24));
+                            /* Anti-replay window check (tentative) */
+                            uint32_t win_tmp = c->recv_win; uint64_t mask_tmp = c->recv_win_mask;
+                            if (!aead_replay_check_and_update(seq, &win_tmp, &mask_tmp)) {
+                                P_LOG_WARN("drop replay/old EFIN seq=%u (svr)", seq);
+                                continue;
+                            }
                             uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
                             nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
                             uint8_t ad[5]; ad[0]=(uint8_t)KTP_EFIN; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
@@ -404,6 +448,8 @@ int main(int argc, char **argv) {
                                 P_LOG_ERR("EFIN tag verify failed (svr)");
                                 c->state = S_CLOSING; break;
                             }
+                            /* Commit anti-replay window advance */
+                            c->recv_win = win_tmp; c->recv_win_mask = mask_tmp;
                             /* treat as FIN */
                             c->cli_in_eof = true;
                             if (!c->cli2svr_shutdown && c->request.rpos == c->request.dlen) {
@@ -427,6 +473,12 @@ int main(int argc, char **argv) {
                         if (t == KTP_EDATA && c->has_session_key) {
                             if (got < (int)(1 + 4 + 16)) continue;
                             uint32_t seq = (uint32_t)((uint8_t)buf[1] | ((uint8_t)buf[2] << 8) | ((uint8_t)buf[3] << 16) | ((uint8_t)buf[4] << 24));
+                            /* Anti-replay window check (tentative) */
+                            uint32_t win_tmp = c->recv_win; uint64_t mask_tmp = c->recv_win_mask;
+                            if (!aead_replay_check_and_update(seq, &win_tmp, &mask_tmp)) {
+                                P_LOG_WARN("drop replay/old EDATA seq=%u (svr)", seq);
+                                continue;
+                            }
                             uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
                             nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
                             uint8_t ad[5]; ad[0]=(uint8_t)KTP_EDATA; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
@@ -436,6 +488,8 @@ int main(int argc, char **argv) {
                                 P_LOG_ERR("EDATA tag verify failed (svr)");
                                 c->state = S_CLOSING; break;
                             }
+                            /* Commit anti-replay window advance */
+                            c->recv_win = win_tmp; c->recv_win_mask = mask_tmp;
                             payload = buf; plen = ctlen;
                         } else {
                             payload = buf + 1; plen = got - 1;
@@ -564,7 +618,7 @@ int main(int argc, char **argv) {
                     if (c->has_session_key) {
                         unsigned char hdrbuf[1 + 4 + sizeof(sbuf) + 16];
                         uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
-                        uint32_t seq = c->send_seq++;
+                        uint32_t seq; if (!aead_next_send_seq(c, &seq)) { c->state = S_CLOSING; break; }
                         nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
                         uint8_t ad[5]; ad[0]=(uint8_t)KTP_EDATA; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
                         hdrbuf[0] = (unsigned char)KTP_EDATA;
@@ -587,7 +641,7 @@ int main(int argc, char **argv) {
                     /* TCP target sent EOF: send FIN/EFIN over KCP, stop further reads, allow pending KCP to flush */
                     if (c->has_session_key) {
                         uint8_t nonce[12]; memcpy(nonce, c->nonce_base, 12);
-                        uint32_t seq = c->send_seq++;
+                        uint32_t seq; if (!aead_next_send_seq(c, &seq)) { c->state = S_CLOSING; }
                         nonce[8]=(uint8_t)seq; nonce[9]=(uint8_t)(seq>>8); nonce[10]=(uint8_t)(seq>>16); nonce[11]=(uint8_t)(seq>>24);
                         uint8_t ad[5]; ad[0]=(uint8_t)KTP_EFIN; ad[1]=(uint8_t)seq; ad[2]=(uint8_t)(seq>>8); ad[3]=(uint8_t)(seq>>16); ad[4]=(uint8_t)(seq>>24);
                         unsigned char pkt[1 + 4 + 16];
