@@ -188,7 +188,7 @@ int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk, bool has_ps
     uint8_t nonce[12];
     uint8_t ad[5];
     memcpy(nonce, c->nonce_base, 12);
-    aead_gen_control_packet(c, KTP_EFIN, seq, c->session_key, nonce, ad, pkt);
+    aead_gen_control_packet(KTP_EFIN, seq, c->session_key, nonce, ad, pkt);
     
     return ikcp_send(c->kcp, (const char *)pkt, sizeof(pkt));
 }
