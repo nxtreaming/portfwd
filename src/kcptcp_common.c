@@ -3,6 +3,8 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <unistd.h> /* getopt */
+#include <stdio.h>
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <netinet/tcp.h>
 #endif
@@ -262,4 +264,119 @@ int kcptcp_create_tcp_socket(int family, int sockbuf_bytes, bool tcp_nodelay) {
     (void)tcp_nodelay;
 #endif
     return fd;
+}
+
+/* ---------------- Common CLI parsing (shared) ---------------- */
+int kcptcp_parse_common_opts(int argc, char **argv,
+                             struct kcptcp_common_cli *out,
+                             int *pos_start,
+                             bool is_server) {
+    (void)is_server; /* currently unused, reserved for divergence */
+    if (!out) return 0;
+    memset(out, 0, sizeof(*out));
+    out->reuse_addr = false;
+    out->reuse_port = false;
+    out->v6only = false;
+    out->sockbuf_bytes = 0;
+    out->tcp_nodelay = false;
+    out->has_psk = false;
+    out->kcp_mtu = 0;   /* only apply if >0 */
+    out->kcp_nd = -1;   /* apply if >=0 */
+    out->kcp_it = -1;
+    out->kcp_rs = -1;
+    out->kcp_nc = -1;
+    out->kcp_snd = -1;
+    out->kcp_rcv = -1;
+    out->show_help = false;
+
+    /* reset getopt state */
+    optind = 1;
+
+    int opt;
+    /* Options:
+       -d (daemonize)
+       -p <pidfile>
+       -r (SO_REUSEADDR)
+       -R (SO_REUSEPORT)
+       -6 (IPV6_V6ONLY)
+       -b <bytes> (socket buffers)
+       -N (TCP_NODELAY)
+       -K <hex32> (PSK)
+       -M <mtu> (KCP mtu)
+       -n <0|1> (KCP nodelay)
+       -I <ms> (KCP interval)
+       -X <n> (KCP fast resend)
+       -C <0|1> (KCP no congestion)
+       -w <sndwnd>
+       -W <rcvwnd>
+       -h (help)
+    */
+    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:h")) != -1) {
+        switch (opt) {
+        case 'd': out->daemonize = true; break;
+        case 'p': out->pidfile = optarg; break;
+        case 'r': out->reuse_addr = true; break;
+        case 'R': out->reuse_port = true; break;
+        case '6': out->v6only = true; break;
+        case 'b': {
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            out->sockbuf_bytes = (int)v;
+            break;
+        }
+        case 'N': out->tcp_nodelay = true; break;
+        case 'K': {
+            if (!parse_psk_hex32(optarg, out->psk)) return 0;
+            out->has_psk = true;
+            break;
+        }
+        case 'M': {
+            long v = strtol(optarg, NULL, 10);
+            if (v <= 0) return 0;
+            out->kcp_mtu = (int)v;
+            break;
+        }
+        case 'n': {
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            out->kcp_nd = (int)v;
+            break;
+        }
+        case 'I': {
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            out->kcp_it = (int)v;
+            break;
+        }
+        case 'X': {
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            out->kcp_rs = (int)v;
+            break;
+        }
+        case 'C': {
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            out->kcp_nc = (int)v;
+            break;
+        }
+        case 'w': {
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            out->kcp_snd = (int)v;
+            break;
+        }
+        case 'W': {
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            out->kcp_rcv = (int)v;
+            break;
+        }
+        case 'h': out->show_help = true; break;
+        default:
+            return 0;
+        }
+    }
+    if (pos_start) *pos_start = optind;
+    return 1;
 }
