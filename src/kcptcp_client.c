@@ -674,6 +674,7 @@ int main(int argc, char **argv) {
                             if (sn < 0) { c->state = S_CLOSING; break; }
                         }
                     }
+                }
                 if (rn == 0) {
                     /* TCP EOF: on handshake pending, defer FIN until ready */
                     if (c->kcp_ready) {
@@ -695,7 +696,7 @@ int main(int argc, char **argv) {
                         }
                     }
                     c->cli_in_eof = true;
-                    struct epoll_event cev = {0};
+                    struct epoll_event cev = (struct epoll_event){0};
                     cev.events = EPOLLRDHUP | EPOLLERR | EPOLLHUP; /* disable EPOLLIN */
                     cev.data.ptr = c->cli_tag;
                     (void)ep_add_or_mod(epfd, c->cli_sock, &cev);
