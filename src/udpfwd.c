@@ -1,7 +1,9 @@
 #define _GNU_SOURCE 1
+
 #include "common.h"
 #include "list.h"
 #include "proxy_conn.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,13 +30,19 @@
 #include "no-epoll.h"
 #endif
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Constants and Tunables */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
 
-/* Tunables */
+/* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
 #define UDP_PROXY_SOCKBUF_CAP (256 * 1024)
 #endif
+
+/* Linux-specific batching parameters */
 #ifdef __linux__
 #ifndef UDP_PROXY_BATCH_SZ
 #define UDP_PROXY_BATCH_SZ 16
@@ -45,13 +53,17 @@
 #endif
 #endif
 
+/* Hash function constants */
 #define FNV_PRIME_32 16777619
 #define FNV_OFFSET_BASIS_32 2166136261U
 
+/* Connection pool size */
 #ifndef UDP_PROXY_MAX_CONNS
 #define UDP_PROXY_MAX_CONNS 4096
 #endif
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Data Structures */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 struct config {
@@ -66,14 +78,6 @@ struct config {
     bool reuse_port;
 };
 
-static struct list_head *conn_tbl_hbase;
-static unsigned g_conn_tbl_hash_size;
-static unsigned conn_tbl_len;
-
-/* Function pointer to compute bucket index from a 32-bit hash. */
-static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
-static uint32_t hash_addr(const union sockaddr_inx *a);
-
 struct conn_pool {
     struct proxy_conn *connections;
     struct proxy_conn *freelist;
@@ -81,13 +85,23 @@ struct conn_pool {
     int used_count;
 };
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Global Variables */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+/* Connection hash table */
+static struct list_head *conn_tbl_hbase;
+static unsigned g_conn_tbl_hash_size;
+static unsigned conn_tbl_len;
+
+/* Connection pool */
 static struct conn_pool g_conn_pool;
 
 /* Runtime tunables (overridable via CLI) */
 static int g_sockbuf_cap_runtime = UDP_PROXY_SOCKBUF_CAP;
 static int g_conn_pool_capacity = UDP_PROXY_MAX_CONNS;
 #ifdef __linux__
-static int g_batch_sz_runtime = UDP_PROXY_BATCH_SZ; /* for recvmmsg/sendmmsg */
+static int g_batch_sz_runtime = UDP_PROXY_BATCH_SZ;
 #endif
 
 /* Global LRU list for O(1) oldest selection */
@@ -95,6 +109,17 @@ static LIST_HEAD(g_lru_list);
 
 /* Cached current timestamp (monotonic seconds on Linux) for hot paths */
 static time_t g_now_ts;
+
+/* Function pointer to compute bucket index from a 32-bit hash */
+static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
+
+/* Stats: batch overflow immediate-sends (client->server) */
+static uint64_t g_stat_c2s_batch_socket_overflow;
+static uint64_t g_stat_c2s_batch_entry_overflow;
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Utility Functions */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Simple monotonic-seconds helper (Linux) with portable fallback */
 static inline time_t monotonic_seconds(void) {
@@ -106,12 +131,6 @@ static inline time_t monotonic_seconds(void) {
 #endif
     return time(NULL);
 }
-
-/* Stats: batch overflow immediate-sends (client->server) */
-static uint64_t g_stat_c2s_batch_socket_overflow;
-static uint64_t g_stat_c2s_batch_entry_overflow;
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static int safe_close(int fd) {
     if (fd < 0)
@@ -125,12 +144,21 @@ static int safe_close(int fd) {
     }
 }
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Function Declarations */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+/* Hash functions */
+static uint32_t hash_addr(const union sockaddr_inx *a);
+
+/* Connection management */
+static struct proxy_conn *alloc_proxy_conn(void);
+static void release_proxy_conn_to_pool(struct proxy_conn *conn);
 static void proxy_conn_walk_continue(const struct config *cfg,
                                      unsigned walk_max, int epfd);
 static bool proxy_conn_evict_one(int epfd);
-static struct proxy_conn *alloc_proxy_conn(void);
-static void release_proxy_conn_to_pool(struct proxy_conn *conn);
 
+/* Data handling */
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
 #ifdef __linux__
 static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd,
@@ -142,6 +170,7 @@ static void handle_client_data(const struct config *cfg, int lsn_sock,
                                int epfd);
 #endif
 
+/* Linux batching support */
 #ifdef __linux__
 static void init_batching_resources(struct mmsghdr **c_msgs,
                                     struct iovec **c_iov,
@@ -158,6 +187,8 @@ static void destroy_batching_resources(struct mmsghdr *c_msgs,
                                        struct iovec *s_iovs);
 #endif
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Connection Pool Management */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static int init_conn_pool(void) {
@@ -182,7 +213,7 @@ static int init_conn_pool(void) {
     return 0;
 }
 
-/* Small helper to check if an unsigned value is a power of two. */
+/* Small helper to check if an unsigned value is a power of two */
 static inline bool is_power_of_two(unsigned v) {
     return v && ((v & (v - 1)) == 0);
 }
@@ -206,6 +237,26 @@ static void destroy_conn_pool(void) {
     }
 }
 
+static struct proxy_conn *alloc_proxy_conn(void) {
+    if (!g_conn_pool.freelist) {
+        P_LOG_WARN("Connection pool exhausted!");
+        return NULL;
+    }
+    struct proxy_conn *conn = g_conn_pool.freelist;
+    g_conn_pool.freelist = conn->next;
+    g_conn_pool.used_count++;
+    assert(g_conn_pool.used_count <= g_conn_pool.capacity);
+    memset(conn, 0, sizeof(*conn));
+    return conn;
+}
+
+static void release_proxy_conn_to_pool(struct proxy_conn *conn) {
+    conn->next = g_conn_pool.freelist;
+    g_conn_pool.freelist = conn;
+    assert(g_conn_pool.used_count > 0);
+    g_conn_pool.used_count--;
+}
+
 static void set_sock_buffers(int sockfd) {
     int sz = g_sockbuf_cap_runtime;
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) < 0) {
@@ -216,6 +267,8 @@ static void set_sock_buffers(int sockfd) {
     }
 }
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Hash Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static uint32_t fnv1a_32_hash(const void *data, size_t len) {
@@ -252,6 +305,10 @@ static uint32_t hash_addr(const union sockaddr_inx *a) {
     }
     return 0;
 }
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Connection Management */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Move to MRU (tail) and refresh timestamp */
@@ -418,27 +475,9 @@ static void proxy_conn_walk_continue(const struct config *cfg,
     }
 }
 
-static struct proxy_conn *alloc_proxy_conn(void) {
-    if (!g_conn_pool.freelist) {
-        P_LOG_WARN("Connection pool exhausted!");
-        return NULL;
-    }
-    struct proxy_conn *conn = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn->next;
-    g_conn_pool.used_count++;
-    assert(g_conn_pool.used_count <= g_conn_pool.capacity);
-    memset(conn, 0, sizeof(*conn));
-    return conn;
-}
 
-static void release_proxy_conn_to_pool(struct proxy_conn *conn) {
-    conn->next = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn;
-    assert(g_conn_pool.used_count > 0);
-    g_conn_pool.used_count--;
-}
 
-/* Evict the least recently active connection (LRU-ish across all buckets). */
+/* Evict the least recently active connection (LRU-ish across all buckets) */
 static bool proxy_conn_evict_one(int epfd) {
     if (list_empty(&g_lru_list))
         return false;
@@ -456,6 +495,8 @@ static bool proxy_conn_evict_one(int epfd) {
     return true;
 }
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Data Handling Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #ifdef __linux__
@@ -705,6 +746,10 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
 #endif
 }
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Linux Batching Support */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 #ifdef __linux__
 static void init_batching_resources(struct mmsghdr **c_msgs,
                                     struct iovec **c_iov,
@@ -768,6 +813,8 @@ static void destroy_batching_resources(struct mmsghdr *c_msgs,
 #endif
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Help and Main Function */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static void show_help(const char *prog) {
     P_LOG_INFO("Userspace UDP proxy.");
@@ -797,27 +844,29 @@ static void show_help(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Local variables */
     int opt, b_true = 1, lsn_sock = -1, epfd = -1, i, rc = 0;
     struct config cfg;
     struct epoll_event ev, events[MAX_EVENTS];
     char s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
 
+    /* Initialize configuration with defaults */
     memset(&cfg, 0, sizeof(cfg));
-    cfg.proxy_conn_timeo = 60;     /* default */
-    cfg.conn_tbl_hash_size = 4093; /* default */
-#ifdef __linux__
-    /* Batching resources (allocated at runtime) */
-    struct mmsghdr *c_msgs = NULL; /* client -> server */
-    struct iovec *c_iov = NULL;
-    struct sockaddr_storage *c_addrs = NULL;
-    char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL;
+    cfg.proxy_conn_timeo = 60;     /* default timeout */
+    cfg.conn_tbl_hash_size = 4093; /* default hash table size */
 
-    /* For sendmmsg() */
-    struct mmsghdr *s_msgs = NULL;
-    struct iovec *s_iovs = NULL;
+#ifdef __linux__
+    /* Linux batching resources (allocated at runtime) */
+    struct mmsghdr *c_msgs = NULL;              /* client -> server messages */
+    struct iovec *c_iov = NULL;                 /* client I/O vectors */
+    struct sockaddr_storage *c_addrs = NULL;    /* client addresses */
+    char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL; /* client buffers */
+    struct mmsghdr *s_msgs = NULL;              /* server messages */
+    struct iovec *s_iovs = NULL;                /* server I/O vectors */
 #endif
 
+    /* Parse command line arguments */
     while ((opt = getopt(argc, argv, "t:dhorp:H:RS:C:B:")) != -1) {
         switch (opt) {
         case 't': {
@@ -949,19 +998,24 @@ int main(int argc, char *argv[]) {
     }
     optind++;
 
+    /* Initialize logging */
     openlog("udpfwd", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
+    /* Initialize connection pool */
     if (init_conn_pool() != 0) {
         rc = 1;
         goto cleanup;
     }
 
+    /* Create listening socket */
     lsn_sock = socket(cfg.src_addr.sa.sa_family, SOCK_DGRAM, 0);
     if (lsn_sock < 0) {
         P_LOG_ERR("socket(): %s.", strerror(errno));
         rc = 1;
         goto cleanup;
     }
+
+    /* Configure socket options */
     if (cfg.reuse_addr) {
         if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true,
                        sizeof(b_true)) < 0)
@@ -1081,19 +1135,21 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    /* Main event loop */
     for (;;) {
         int nfds;
         time_t current_ts = monotonic_seconds();
 
-        /* Timeout check and recycle */
+        /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= 2) {
             proxy_conn_walk_continue(&cfg, 200, epfd);
             last_check = current_ts;
         }
 
-        /* cache current timestamp for hot paths */
+        /* Cache current timestamp for hot paths */
         g_now_ts = current_ts;
 
+        /* Wait for events */
         nfds = epoll_wait(epfd, events, countof(events), 1000 * 2);
         if (nfds == 0)
             continue;
@@ -1108,17 +1164,18 @@ int main(int argc, char *argv[]) {
         if (g_state.terminate)
             break;
 
+        /* Process events */
         for (i = 0; i < nfds; i++) {
             struct epoll_event *evp = &events[i];
             struct proxy_conn *conn;
 
             if (evp->data.ptr == NULL) {
                 /* Data from client */
-            if (evp->events & (EPOLLERR | EPOLLHUP)) {
-                P_LOG_ERR("listener: EPOLLERR/HUP");
-                rc = 1;
-                goto cleanup;
-            }
+                if (evp->events & (EPOLLERR | EPOLLHUP)) {
+                    P_LOG_ERR("listener: EPOLLERR/HUP");
+                    rc = 1;
+                    goto cleanup;
+                }
 #ifdef __linux__
                 handle_client_data(&cfg, lsn_sock, epfd, c_msgs, s_msgs, s_iovs,
                                    c_bufs);
@@ -1139,6 +1196,7 @@ int main(int argc, char *argv[]) {
     }
 
 cleanup:
+    /* Cleanup resources */
     if (lsn_sock >= 0) {
         if (safe_close(lsn_sock) < 0) {
             P_LOG_WARN("close(lsn_sock=%d): %s", lsn_sock, strerror(errno));
@@ -1150,6 +1208,8 @@ cleanup:
 #ifdef __linux__
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
 #endif
+
+    /* Print statistics if any batch overflows occurred */
     if (g_stat_c2s_batch_socket_overflow || g_stat_c2s_batch_entry_overflow) {
         P_LOG_INFO("c2s batch overflows: sockets=%" PRIu64 ", entries=%" PRIu64,
                    g_stat_c2s_batch_socket_overflow,
