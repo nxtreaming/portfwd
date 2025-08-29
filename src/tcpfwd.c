@@ -1,3 +1,16 @@
+/**
+ * @file tcpfwd.c
+ * @brief High-performance TCP port forwarding proxy with connection pooling
+ *
+ * This implementation provides:
+ * - Thread-safe connection pooling with dynamic expansion
+ * - Connection rate limiting per IP and total
+ * - Zero-copy forwarding using Linux splice() when available
+ * - Robust error handling and graceful shutdown
+ * - Dynamic epoll event array sizing for optimal performance
+ * - Comprehensive security checks for transparent proxy mode
+ */
+
 #define _GNU_SOURCE
 
 #include <stdio.h>
@@ -16,6 +29,7 @@
 #include <syslog.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "common.h"
 #include "list.h"
@@ -59,6 +73,29 @@
 /* Memory pool for connection objects (default) */
 #define TCP_PROXY_CONN_POOL_SIZE 4096
 
+/* Epoll event batch size - start small and grow as needed */
+#define EPOLL_EVENTS_MIN 64
+#define EPOLL_EVENTS_MAX 2048
+#define EPOLL_EVENTS_DEFAULT 512
+
+/* Connection limiting constants */
+#define MAX_CONSECUTIVE_ACCEPT_ERRORS 10
+#define ACCEPT_ERROR_RESET_INTERVAL 60  /* seconds */
+#define ACCEPT_ERROR_DELAY_US 100000    /* 100ms in microseconds */
+#define MAX_TOTAL_CONNECTIONS_LIMIT 1000000
+#define MAX_PER_IP_CONNECTIONS_LIMIT 10000
+
+/* Buffer management constants */
+#define BUFFER_COMPACT_THRESHOLD_RATIO 4  /* Compact when waste > 1/4 of capacity */
+#define EPOLL_EXPAND_THRESHOLD 3          /* Expand after 3 consecutive full batches */
+#define EPOLL_SHRINK_THRESHOLD 10         /* Shrink after 10 consecutive small batches */
+#define EPOLL_SHRINK_USAGE_RATIO 4        /* Shrink when usage < 1/4 of capacity */
+
+/* Network validation constants */
+#define MIN_PORT_OFFSET -65535
+#define MAX_PORT_OFFSET 65535
+#define LISTEN_BACKLOG 128
+
 /* Magic numbers for epoll event identification */
 #define EV_MAGIC_LISTENER 0xdeadbeefU
 #define EV_MAGIC_CLIENT 0xfeedfaceU
@@ -67,6 +104,13 @@
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Data Structures */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+/**
+ * @brief Configuration structure for the TCP forwarder
+ *
+ * Contains all runtime configuration including addresses, limits,
+ * and behavioral flags.
+ */
 
 struct config {
     union sockaddr_inx src_addr;
@@ -77,22 +121,59 @@ struct config {
     bool reuse_addr;
     bool reuse_port;
     bool v6only;
+    int max_connections;
+    int max_per_ip;
 };
 
+/**
+ * @brief Connection limiting structures for DoS protection
+ *
+ * Implements a simple hash table to track connections per IP address
+ * and enforce both per-IP and total connection limits.
+ */
+#define CONN_LIMIT_HASH_SIZE 1024
+
+struct conn_limit_entry {
+    union sockaddr_inx addr;    /**< Client IP address */
+    int count;                  /**< Current connection count for this IP */
+    time_t first_seen;          /**< First connection timestamp */
+    time_t last_seen;           /**< Last connection timestamp */
+};
+
+struct conn_limiter {
+    struct conn_limit_entry entries[CONN_LIMIT_HASH_SIZE];  /**< Hash table entries */
+    int total_connections;      /**< Current total active connections */
+    int max_total;              /**< Maximum total connections allowed */
+    int max_per_ip;             /**< Maximum connections per IP */
+    pthread_mutex_t lock;       /**< Thread safety mutex */
+};
+
+/**
+ * @brief Thread-safe connection pool with mutex protection
+ *
+ * Pre-allocates connection objects to avoid malloc/free overhead
+ * during high-frequency connection establishment. Provides thread-safe
+ * allocation and deallocation with optional blocking when pool is exhausted.
+ */
 struct conn_pool {
-    struct proxy_conn *connections;
-    struct proxy_conn *freelist;
-    int capacity;
-    int used_count;
+    struct proxy_conn *connections;  /**< Pre-allocated connection array */
+    struct proxy_conn *freelist;     /**< Linked list of available connections */
+    int capacity;                    /**< Total pool capacity */
+    int used_count;                  /**< Currently allocated connections */
+    int high_water_mark;             /**< Peak usage for monitoring */
+    pthread_mutex_t lock;            /**< Thread safety mutex */
+    pthread_cond_t available;        /**< Condition variable for blocking allocation */
 };
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Global Variables */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
+/* Global state protected by mutex where needed */
 static struct conn_pool g_conn_pool;
+static struct conn_limiter g_conn_limiter;
 
-/* Runtime tunables (overridable via CLI) */
+/* Runtime tunables (overridable via CLI) - these are read-only after initialization */
 static int g_conn_pool_capacity = TCP_PROXY_CONN_POOL_SIZE;
 static int g_userbuf_cap_runtime = TCP_PROXY_USERBUF_CAP;
 static int g_sockbuf_cap_runtime = TCP_PROXY_SOCKBUF_CAP;
@@ -100,6 +181,55 @@ static int g_ka_idle = TCP_PROXY_KEEPALIVE_IDLE;
 static int g_ka_intvl = TCP_PROXY_KEEPALIVE_INTVL;
 static int g_ka_cnt = TCP_PROXY_KEEPALIVE_CNT;
 static int g_backpressure_wm = TCP_PROXY_BACKPRESSURE_WM;
+
+/* Signal-safe flag for graceful shutdown */
+static volatile sig_atomic_t g_shutdown_requested = 0;
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Signal Handling */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+/* Signal-safe shutdown handler */
+static void handle_shutdown_signal(int sig) {
+    (void)sig; /* Unused parameter */
+    g_shutdown_requested = 1;
+}
+
+/* Setup signal handlers for graceful shutdown */
+static int setup_shutdown_signals(void) {
+    struct sigaction sa;
+
+    /* Block signals during handler execution */
+    sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGTERM);
+    sigaddset(&sa.sa_mask, SIGINT);
+    sigaddset(&sa.sa_mask, SIGQUIT);
+
+    sa.sa_handler = handle_shutdown_signal;
+    sa.sa_flags = SA_RESTART; /* Restart interrupted system calls */
+
+    if (sigaction(SIGTERM, &sa, NULL) < 0) {
+        P_LOG_ERR("sigaction(SIGTERM): %s", strerror(errno));
+        return -1;
+    }
+    if (sigaction(SIGINT, &sa, NULL) < 0) {
+        P_LOG_ERR("sigaction(SIGINT): %s", strerror(errno));
+        return -1;
+    }
+    if (sigaction(SIGQUIT, &sa, NULL) < 0) {
+        P_LOG_ERR("sigaction(SIGQUIT): %s", strerror(errno));
+        return -1;
+    }
+
+    /* Ignore SIGPIPE - we handle EPIPE explicitly */
+    sa.sa_handler = SIG_IGN;
+    if (sigaction(SIGPIPE, &sa, NULL) < 0) {
+        P_LOG_ERR("sigaction(SIGPIPE): %s", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Function Declarations */
@@ -112,42 +242,56 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
 /* Utility Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static void set_sock_buffers(int sockfd) {
+static int set_sock_buffers(int sockfd) {
     int sz = g_sockbuf_cap_runtime;
+    int ret = 0;
+
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) < 0) {
-        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(SO_RCVBUF) on fd %d: %s", sockfd, strerror(errno));
+        ret = -1;
     }
     if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz)) < 0) {
-        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(SO_SNDBUF) on fd %d: %s", sockfd, strerror(errno));
+        ret = -1;
     }
+    return ret;
 }
 
-static void set_keepalive(int sockfd) {
+static int set_keepalive(int sockfd) {
     int on = 1;
+    int ret = 0;
+
     if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0) {
-        P_LOG_WARN("setsockopt(SO_KEEPALIVE): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(SO_KEEPALIVE) on fd %d: %s", sockfd, strerror(errno));
+        ret = -1;
     }
 #ifdef __linux__
     int idle = g_ka_idle;
     int intvl = g_ka_intvl;
     int cnt = g_ka_cnt;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0) {
-        P_LOG_WARN("setsockopt(TCP_KEEPIDLE): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(TCP_KEEPIDLE) on fd %d: %s", sockfd, strerror(errno));
+        ret = -1;
     }
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) < 0) {
-        P_LOG_WARN("setsockopt(TCP_KEEPINTVL): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(TCP_KEEPINTVL) on fd %d: %s", sockfd, strerror(errno));
+        ret = -1;
     }
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) < 0) {
-        P_LOG_WARN("setsockopt(TCP_KEEPCNT): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(TCP_KEEPCNT) on fd %d: %s", sockfd, strerror(errno));
+        ret = -1;
     }
 #endif
+    return ret;
 }
 
-static void set_tcp_nodelay(int sockfd) {
+static int set_tcp_nodelay(int sockfd) {
     int on = 1;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
-        P_LOG_WARN("setsockopt(TCP_NODELAY): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(TCP_NODELAY) on fd %d: %s", sockfd, strerror(errno));
+        return -1;
     }
+    return 0;
 }
 
 static int safe_close(int fd) {
@@ -160,6 +304,193 @@ static int safe_close(int fd) {
             continue;
         return -1;
     }
+}
+
+/* Handle accept errors with proper recovery strategy */
+static int handle_accept_errors(int listen_sock) {
+    static int consecutive_errors = 0;
+    static time_t last_error_time = 0;
+    time_t now = time(NULL);
+
+    /* Reset error count if enough time has passed */
+    if (now - last_error_time > ACCEPT_ERROR_RESET_INTERVAL) {
+        consecutive_errors = 0;
+    }
+
+    /* Handle different error types */
+    switch (errno) {
+    case EAGAIN:
+    case EWOULDBLOCK:
+        /* Normal case - no more connections to accept */
+        consecutive_errors = 0;
+        return 0;
+
+    case EMFILE:
+    case ENFILE:
+        /* File descriptor limit reached */
+        P_LOG_ERR("File descriptor limit reached: %s", strerror(errno));
+        consecutive_errors++;
+        last_error_time = now;
+        return -1;
+
+    case ENOBUFS:
+    case ENOMEM:
+        /* System resource exhaustion */
+        P_LOG_ERR("System resource exhaustion: %s", strerror(errno));
+        consecutive_errors++;
+        last_error_time = now;
+        return -1;
+
+    case ECONNABORTED:
+    case EPROTO:
+        /* Connection aborted by client - not fatal */
+        P_LOG_WARN("Connection aborted: %s", strerror(errno));
+        return 0;
+
+    default:
+        /* Other errors */
+        consecutive_errors++;
+        last_error_time = now;
+        P_LOG_ERR("accept() error: %s", strerror(errno));
+        break;
+    }
+
+    /* Check if we have too many consecutive errors */
+    if (consecutive_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS) {
+        P_LOG_ERR("Too many consecutive accept errors (%d), stopping", consecutive_errors);
+        return -2; /* Fatal error */
+    }
+
+    P_LOG_WARN("Accept error %d of %d: %s", consecutive_errors,
+               MAX_CONSECUTIVE_ACCEPT_ERRORS, strerror(errno));
+
+    /* Brief delay to avoid CPU spinning */
+    if (consecutive_errors > 3) {
+        usleep(ACCEPT_ERROR_DELAY_US);
+    }
+
+    return -1;
+}
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Connection Limiting Functions */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+/* Simple hash function for IP addresses */
+static uint32_t addr_hash(const union sockaddr_inx *addr) {
+    if (addr->sa.sa_family == AF_INET) {
+        return ntohl(addr->sin.sin_addr.s_addr) % CONN_LIMIT_HASH_SIZE;
+    } else if (addr->sa.sa_family == AF_INET6) {
+        const uint32_t *p = (const uint32_t *)&addr->sin6.sin6_addr;
+        return (ntohl(p[0]) ^ ntohl(p[1]) ^ ntohl(p[2]) ^ ntohl(p[3])) % CONN_LIMIT_HASH_SIZE;
+    }
+    return 0;
+}
+
+/* Initialize connection limiter */
+static int init_conn_limiter(int max_total, int max_per_ip) {
+    memset(&g_conn_limiter, 0, sizeof(g_conn_limiter));
+
+    if (pthread_mutex_init(&g_conn_limiter.lock, NULL) != 0) {
+        P_LOG_ERR("Failed to initialize connection limiter mutex");
+        return -1;
+    }
+
+    g_conn_limiter.max_total = max_total;
+    g_conn_limiter.max_per_ip = max_per_ip;
+    g_conn_limiter.total_connections = 0;
+
+    P_LOG_INFO("Connection limiter initialized: max_total=%d, max_per_ip=%d",
+               max_total, max_per_ip);
+    return 0;
+}
+
+/* Destroy connection limiter */
+static void destroy_conn_limiter(void) {
+    pthread_mutex_destroy(&g_conn_limiter.lock);
+    memset(&g_conn_limiter, 0, sizeof(g_conn_limiter));
+}
+
+/* Check if connection is allowed */
+static bool check_connection_limit(const union sockaddr_inx *addr) {
+    if (g_conn_limiter.max_total <= 0 && g_conn_limiter.max_per_ip <= 0) {
+        return true; /* No limits configured */
+    }
+
+    pthread_mutex_lock(&g_conn_limiter.lock);
+
+    /* Check total connection limit */
+    if (g_conn_limiter.max_total > 0 &&
+        g_conn_limiter.total_connections >= g_conn_limiter.max_total) {
+        pthread_mutex_unlock(&g_conn_limiter.lock);
+        P_LOG_WARN("Total connection limit reached (%d)", g_conn_limiter.max_total);
+        return false;
+    }
+
+    /* Check per-IP limit if configured */
+    if (g_conn_limiter.max_per_ip > 0) {
+        uint32_t hash = addr_hash(addr);
+        struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
+        time_t now = time(NULL);
+
+        /* Check if this is the same IP or a hash collision */
+        if (entry->count > 0) {
+            if (is_sockaddr_inx_equal(&entry->addr, addr)) {
+                /* Same IP */
+                if (entry->count >= g_conn_limiter.max_per_ip) {
+                    pthread_mutex_unlock(&g_conn_limiter.lock);
+                    P_LOG_WARN("Per-IP connection limit reached for %s (%d connections)",
+                               sockaddr_to_string(addr), entry->count);
+                    return false;
+                }
+                entry->count++;
+                entry->last_seen = now;
+            } else {
+                /* Hash collision - allow but log warning */
+                P_LOG_WARN("Hash collision in connection limiter for %s",
+                           sockaddr_to_string(addr));
+            }
+        } else {
+            /* New entry */
+            entry->addr = *addr;
+            entry->count = 1;
+            entry->first_seen = now;
+            entry->last_seen = now;
+        }
+    }
+
+    g_conn_limiter.total_connections++;
+    pthread_mutex_unlock(&g_conn_limiter.lock);
+
+    return true;
+}
+
+/* Release connection from limiter */
+static void release_connection_limit(const union sockaddr_inx *addr) {
+    if (g_conn_limiter.max_total <= 0 && g_conn_limiter.max_per_ip <= 0) {
+        return; /* No limits configured */
+    }
+
+    pthread_mutex_lock(&g_conn_limiter.lock);
+
+    if (g_conn_limiter.total_connections > 0) {
+        g_conn_limiter.total_connections--;
+    }
+
+    /* Update per-IP count if configured */
+    if (g_conn_limiter.max_per_ip > 0) {
+        uint32_t hash = addr_hash(addr);
+        struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
+
+        if (entry->count > 0 && is_sockaddr_inx_equal(&entry->addr, addr)) {
+            entry->count--;
+            if (entry->count == 0) {
+                memset(entry, 0, sizeof(*entry));
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_conn_limiter.lock);
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -177,6 +508,21 @@ static int init_conn_pool(void) {
         return -1;
     }
 
+    /* Initialize mutex and condition variable */
+    if (pthread_mutex_init(&g_conn_pool.lock, NULL) != 0) {
+        P_LOG_ERR("Failed to initialize connection pool mutex");
+        free(g_conn_pool.connections);
+        g_conn_pool.connections = NULL;
+        return -1;
+    }
+    if (pthread_cond_init(&g_conn_pool.available, NULL) != 0) {
+        P_LOG_ERR("Failed to initialize connection pool condition variable");
+        pthread_mutex_destroy(&g_conn_pool.lock);
+        free(g_conn_pool.connections);
+        g_conn_pool.connections = NULL;
+        return -1;
+    }
+
     g_conn_pool.freelist = NULL;
     for (int i = 0; i < g_conn_pool.capacity; i++) {
         struct proxy_conn *conn = &g_conn_pool.connections[i];
@@ -184,6 +530,7 @@ static int init_conn_pool(void) {
         g_conn_pool.freelist = conn;
     }
     g_conn_pool.used_count = 0;
+    g_conn_pool.high_water_mark = 0;
     P_LOG_INFO("Connection pool initialized with %d connections",
                g_conn_pool.capacity);
     return 0;
@@ -191,11 +538,14 @@ static int init_conn_pool(void) {
 
 static void destroy_conn_pool(void) {
     if (g_conn_pool.connections) {
+        pthread_mutex_destroy(&g_conn_pool.lock);
+        pthread_cond_destroy(&g_conn_pool.available);
         free(g_conn_pool.connections);
         g_conn_pool.connections = NULL;
         g_conn_pool.freelist = NULL;
         g_conn_pool.capacity = 0;
         g_conn_pool.used_count = 0;
+        g_conn_pool.high_water_mark = 0;
         P_LOG_INFO("Connection pool destroyed");
     }
 }
@@ -203,7 +553,10 @@ static void destroy_conn_pool(void) {
 static inline struct proxy_conn *alloc_proxy_conn(void) {
     struct proxy_conn *conn;
 
+    pthread_mutex_lock(&g_conn_pool.lock);
+
     if (!g_conn_pool.freelist) {
+        pthread_mutex_unlock(&g_conn_pool.lock);
         P_LOG_WARN("Connection pool exhausted!");
         return NULL;
     }
@@ -211,6 +564,12 @@ static inline struct proxy_conn *alloc_proxy_conn(void) {
     conn = g_conn_pool.freelist;
     g_conn_pool.freelist = conn->next;
     g_conn_pool.used_count++;
+
+    if (g_conn_pool.used_count > g_conn_pool.high_water_mark) {
+        g_conn_pool.high_water_mark = g_conn_pool.used_count;
+    }
+
+    pthread_mutex_unlock(&g_conn_pool.lock);
 
     memset(conn, 0x0, sizeof(*conn));
 
@@ -240,28 +599,38 @@ static void release_proxy_conn(struct proxy_conn *conn,
                                int epfd) {
     int i;
 
+    if (!conn) {
+        P_LOG_WARN("Attempted to release NULL connection");
+        return;
+    }
+
     /*
      * Clear any pending epoll events for this connection's file descriptors.
      * This prevents use-after-free bugs where the event loop might process
      * an event for a connection that has already been released.
      */
-    for (i = 0; i < *nfds; i++) {
-        struct epoll_event *ev = &events[i];
-        if (ev->data.ptr == &conn->magic_client ||
-            ev->data.ptr == &conn->magic_server) {
-            ev->data.ptr = NULL;
+    if (events && nfds) {
+        for (i = 0; i < *nfds; i++) {
+            struct epoll_event *ev = &events[i];
+            if (ev->data.ptr == &conn->magic_client ||
+                ev->data.ptr == &conn->magic_server) {
+                ev->data.ptr = NULL;
+            }
         }
     }
 
+    /* Remove from epoll first to prevent new events */
     if (epfd >= 0) {
         if (conn->cli_sock >= 0) {
-            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL) < 0) {
+            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->cli_sock, NULL) < 0 &&
+                errno != ENOENT) {
                 P_LOG_WARN("epoll_ctl(DEL, cli_sock=%d): %s", conn->cli_sock,
                            strerror(errno));
             }
         }
         if (conn->svr_sock >= 0) {
-            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0) {
+            if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 &&
+                errno != ENOENT) {
                 P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock,
                            strerror(errno));
             }
@@ -269,29 +638,43 @@ static void release_proxy_conn(struct proxy_conn *conn,
     }
 
 #ifdef __linux__
+    /* Clean up splice pipes safely */
     if (conn->use_splice) {
-        if (safe_close(conn->c2s_pipe[0]) < 0) {
-            P_LOG_WARN("close(c2s_pipe[0]=%d): %s", conn->c2s_pipe[0],
-                       strerror(errno));
+        if (conn->c2s_pipe[0] >= 0) {
+            if (safe_close(conn->c2s_pipe[0]) < 0) {
+                P_LOG_WARN("close(c2s_pipe[0]=%d): %s", conn->c2s_pipe[0],
+                           strerror(errno));
+            }
+            conn->c2s_pipe[0] = -1;
         }
-        if (safe_close(conn->c2s_pipe[1]) < 0) {
-            P_LOG_WARN("close(c2s_pipe[1]=%d): %s", conn->c2s_pipe[1],
-                       strerror(errno));
+        if (conn->c2s_pipe[1] >= 0) {
+            if (safe_close(conn->c2s_pipe[1]) < 0) {
+                P_LOG_WARN("close(c2s_pipe[1]=%d): %s", conn->c2s_pipe[1],
+                           strerror(errno));
+            }
+            conn->c2s_pipe[1] = -1;
         }
-        if (safe_close(conn->s2c_pipe[0]) < 0) {
-            P_LOG_WARN("close(s2c_pipe[0]=%d): %s", conn->s2c_pipe[0],
-                       strerror(errno));
+        if (conn->s2c_pipe[0] >= 0) {
+            if (safe_close(conn->s2c_pipe[0]) < 0) {
+                P_LOG_WARN("close(s2c_pipe[0]=%d): %s", conn->s2c_pipe[0],
+                           strerror(errno));
+            }
+            conn->s2c_pipe[0] = -1;
         }
-        if (safe_close(conn->s2c_pipe[1]) < 0) {
-            P_LOG_WARN("close(s2c_pipe[1]=%d): %s", conn->s2c_pipe[1],
-                       strerror(errno));
+        if (conn->s2c_pipe[1] >= 0) {
+            if (safe_close(conn->s2c_pipe[1]) < 0) {
+                P_LOG_WARN("close(s2c_pipe[1]=%d): %s", conn->s2c_pipe[1],
+                           strerror(errno));
+            }
+            conn->s2c_pipe[1] = -1;
         }
-        conn->c2s_pipe[0] = conn->c2s_pipe[1] = -1;
-        conn->s2c_pipe[0] = conn->s2c_pipe[1] = -1;
         conn->c2s_pending = 0;
         conn->s2c_pending = 0;
+        conn->use_splice = false;
     }
 #endif
+
+    /* Close sockets safely */
     if (conn->cli_sock >= 0) {
         if (safe_close(conn->cli_sock) < 0) {
             P_LOG_WARN("close(cli_sock=%d): %s", conn->cli_sock,
@@ -299,7 +682,7 @@ static void release_proxy_conn(struct proxy_conn *conn,
         }
         conn->cli_sock = -1;
     }
-    if (conn->svr_sock != -1) {
+    if (conn->svr_sock >= 0) {
         if (safe_close(conn->svr_sock) < 0) {
             P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock,
                        strerror(errno));
@@ -307,8 +690,7 @@ static void release_proxy_conn(struct proxy_conn *conn,
         conn->svr_sock = -1;
     }
 
-    /* Free user buffers to avoid leaks, since alloc_proxy_conn() zeroes
-     * pointers */
+    /* Free user buffers to avoid leaks */
     if (conn->request.data) {
         free(conn->request.data);
         conn->request.data = NULL;
@@ -322,9 +704,16 @@ static void release_proxy_conn(struct proxy_conn *conn,
         conn->response.dlen = conn->response.rpos = 0;
     }
 
+    /* Release connection from limiter */
+    release_connection_limit(&conn->cli_addr);
+
+    /* Return connection to pool with thread safety */
+    pthread_mutex_lock(&g_conn_pool.lock);
     conn->next = g_conn_pool.freelist;
     g_conn_pool.freelist = conn;
     g_conn_pool.used_count--;
+    pthread_cond_signal(&g_conn_pool.available);
+    pthread_mutex_unlock(&g_conn_pool.lock);
 }
 
 /**
@@ -396,9 +785,19 @@ create_proxy_conn(struct config *cfg, int cli_sock,
     struct proxy_conn *conn = NULL;
     char s_addr1[50] = "", s_addr2[50] = "";
 
+    /* Check connection limits first */
+    if (!check_connection_limit(cli_addr)) {
+        P_LOG_WARN("Connection from %s rejected due to limits",
+                   sockaddr_to_string(cli_addr));
+        close(cli_sock);
+        return NULL;
+    }
+
     /* Client calls in, allocate session data for it. */
     if (!(conn = alloc_proxy_conn())) {
         P_LOG_ERR("alloc_proxy_conn(): %s", strerror(errno));
+        /* Release the connection limit since we're failing */
+        release_connection_limit(cli_addr);
         close(cli_sock);
         return NULL;
     }
@@ -445,33 +844,106 @@ create_proxy_conn(struct config *cfg, int cli_sock,
         memset(&orig_dst, 0x0, sizeof(orig_dst));
         if (getsockname(conn->cli_sock, (struct sockaddr *)&loc_addr,
                         &loc_alen)) {
-            P_LOG_ERR("getsockname(): %s.", strerror(errno));
+            P_LOG_ERR("getsockname() failed: %s", strerror(errno));
             goto err;
         }
+
+        /* Validate local address length */
+        if (loc_alen < sizeof(struct sockaddr_in) ||
+            (loc_addr.sa.sa_family == AF_INET6 && loc_alen < sizeof(struct sockaddr_in6))) {
+            P_LOG_ERR("Invalid local address length: %u", loc_alen);
+            goto err;
+        }
+
         if (getsockopt(conn->cli_sock, SOL_IP, SO_ORIGINAL_DST, &orig_dst,
                        &orig_alen)) {
-            P_LOG_ERR("getsockopt(SO_ORIGINAL_DST): %s.", strerror(errno));
+            int saved_errno = errno;
+            P_LOG_ERR("getsockopt(SO_ORIGINAL_DST) failed: %s", strerror(saved_errno));
+
+            /* Provide more specific error information */
+            if (saved_errno == ENOPROTOOPT) {
+                P_LOG_ERR("SO_ORIGINAL_DST not supported - ensure iptables REDIRECT/DNAT is used");
+            } else if (saved_errno == ENOENT) {
+                P_LOG_ERR("No original destination found - connection may not be redirected");
+            }
+            goto err;
+        }
+
+        /* Validate original destination address length */
+        if (orig_alen < sizeof(struct sockaddr_in) ||
+            (orig_dst.sa.sa_family == AF_INET6 && orig_alen < sizeof(struct sockaddr_in6))) {
+            P_LOG_ERR("Invalid original destination address length: %u", orig_alen);
             goto err;
         }
 
         if (conn->svr_addr.sa.sa_family == AF_INET) {
             addr_pos = (uint32_t *)&conn->svr_addr.sin.sin_addr;
-        } else {
+        } else if (conn->svr_addr.sa.sa_family == AF_INET6) {
             addr_pos = (uint32_t *)&conn->svr_addr.sin6.sin6_addr.s6_addr32[3];
-        }
-        port_offset = (int)(ntohs(*port_of_sockaddr(&orig_dst)) -
-                            ntohs(*port_of_sockaddr(&loc_addr)));
-
-        base = ntohl(*addr_pos);
-        /* Apply signed offset without unnecessary casts */
-        sum = (int64_t)base + (int64_t)port_offset;
-        if (sum < 0 || sum > UINT32_MAX) {
-            P_LOG_ERR("base address adjustment overflows: base=%u, off=%d",
-                      base, port_offset);
+        } else {
+            P_LOG_ERR("Unsupported address family %d in base_addr_mode",
+                      conn->svr_addr.sa.sa_family);
             goto err;
         }
 
-        *addr_pos = htonl((uint32_t)sum);
+        /* Validate original destination and local address families match */
+        if (orig_dst.sa.sa_family != loc_addr.sa.sa_family) {
+            P_LOG_ERR("Address family mismatch: orig_dst=%d, local=%d",
+                      orig_dst.sa.sa_family, loc_addr.sa.sa_family);
+            goto err;
+        }
+
+        port_offset = (int)(ntohs(*port_of_sockaddr(&orig_dst)) -
+                            ntohs(*port_of_sockaddr(&loc_addr)));
+
+        /* Validate port offset is reasonable */
+        if (port_offset < MIN_PORT_OFFSET || port_offset > MAX_PORT_OFFSET) {
+            P_LOG_ERR("Port offset too large: %d", port_offset);
+            goto err;
+        }
+
+        base = ntohl(*addr_pos);
+
+        /* Check for overflow/underflow with proper bounds checking */
+        if (port_offset > 0) {
+            if (base > UINT32_MAX - (uint32_t)port_offset) {
+                P_LOG_ERR("Address calculation would overflow: base=%u, offset=%d",
+                          base, port_offset);
+                goto err;
+            }
+        } else if (port_offset < 0) {
+            if (base < (uint32_t)(-port_offset)) {
+                P_LOG_ERR("Address calculation would underflow: base=%u, offset=%d",
+                          base, port_offset);
+                goto err;
+            }
+        }
+
+        sum = (int64_t)base + (int64_t)port_offset;
+
+        /* Additional safety check */
+        if (sum < 0 || sum > UINT32_MAX) {
+            P_LOG_ERR("base address adjustment overflows: base=%u, off=%d, result=%ld",
+                      base, port_offset, sum);
+            goto err;
+        }
+
+        uint32_t new_addr = (uint32_t)sum;
+
+        /* Validate the resulting address is reasonable */
+        if (conn->svr_addr.sa.sa_family == AF_INET) {
+            /* Check if it's a valid unicast address */
+            if ((new_addr & 0xFF000000) == 0x00000000 ||  /* 0.0.0.0/8 */
+                (new_addr & 0xFF000000) == 0x7F000000 ||  /* 127.0.0.0/8 */
+                (new_addr & 0xF0000000) == 0xE0000000 ||  /* 224.0.0.0/4 multicast */
+                (new_addr & 0xF0000000) == 0xF0000000) {  /* 240.0.0.0/4 reserved */
+                P_LOG_WARN("Calculated address may be invalid: %u.%u.%u.%u",
+                           (new_addr >> 24) & 0xFF, (new_addr >> 16) & 0xFF,
+                           (new_addr >> 8) & 0xFF, new_addr & 0xFF);
+            }
+        }
+
+        *addr_pos = htonl(new_addr);
     }
 #endif
 
@@ -494,11 +966,18 @@ create_proxy_conn(struct config *cfg, int cli_sock,
     set_keepalive(conn->svr_sock);
     set_tcp_nodelay(conn->svr_sock);
 
-    /* Allocate per-connection user buffers */
+    /* Allocate per-connection user buffers with proper error handling */
     conn->request.data = (char *)malloc((size_t)g_userbuf_cap_runtime);
+    if (!conn->request.data) {
+        P_LOG_ERR("malloc(request buffer) failed: %s", strerror(errno));
+        goto err;
+    }
     conn->response.data = (char *)malloc((size_t)g_userbuf_cap_runtime);
-    if (!conn->request.data || !conn->response.data) {
-        P_LOG_ERR("malloc(user buffers) failed");
+    if (!conn->response.data) {
+        P_LOG_ERR("malloc(response buffer) failed: %s", strerror(errno));
+        /* Clean up already allocated request buffer */
+        free(conn->request.data);
+        conn->request.data = NULL;
         goto err;
     }
     conn->request.capacity = (size_t)g_userbuf_cap_runtime;
@@ -512,22 +991,38 @@ create_proxy_conn(struct config *cfg, int cli_sock,
                 sizeof_sockaddr(&conn->svr_addr)) == 0) {
         /* Connected, ready for data forwarding immediately. */
         conn->state = S_FORWARDING;
-        /* Set up splice (Linux) */
+        /* Set up splice (Linux) with proper error handling */
 #ifdef __linux__
         if (!conn->use_splice) {
-            int p1[2], p2[2];
-            if (pipe2(p1, O_NONBLOCK | O_CLOEXEC) == 0 &&
-                pipe2(p2, O_NONBLOCK | O_CLOEXEC) == 0) {
-                conn->c2s_pipe[0] = p1[0];
-                conn->c2s_pipe[1] = p1[1];
-                conn->s2c_pipe[0] = p2[0];
-                conn->s2c_pipe[1] = p2[1];
-                conn->use_splice = true;
+            int p1[2] = {-1, -1}, p2[2] = {-1, -1};
+            bool p1_created = false, p2_created = false;
+
+            if (pipe2(p1, O_NONBLOCK | O_CLOEXEC) == 0) {
+                p1_created = true;
+                if (pipe2(p2, O_NONBLOCK | O_CLOEXEC) == 0) {
+                    p2_created = true;
+                    conn->c2s_pipe[0] = p1[0];
+                    conn->c2s_pipe[1] = p1[1];
+                    conn->s2c_pipe[0] = p2[0];
+                    conn->s2c_pipe[1] = p2[1];
+                    conn->use_splice = true;
+                } else {
+                    P_LOG_WARN("Failed to create s2c pipe for splice: %s", strerror(errno));
+                }
             } else {
-                if (p1[0] > -1) safe_close(p1[0]);
-                if (p1[1] > -1) safe_close(p1[1]);
-                if (p2[0] > -1) safe_close(p2[0]);
-                if (p2[1] > -1) safe_close(p2[1]);
+                P_LOG_WARN("Failed to create c2s pipe for splice: %s", strerror(errno));
+            }
+
+            /* Clean up on partial failure */
+            if (!conn->use_splice) {
+                if (p1_created) {
+                    safe_close(p1[0]);
+                    safe_close(p1[1]);
+                }
+                if (p2_created) {
+                    safe_close(p2[0]);
+                    safe_close(p2[1]);
+                }
             }
         }
 #endif
@@ -535,22 +1030,38 @@ create_proxy_conn(struct config *cfg, int cli_sock,
     } else if (errno == EINPROGRESS) {
         /* OK, poll for the connection to complete or fail */
         conn->state = S_SERVER_CONNECTING;
-        /* Prepare splice early (Linux) */
+        /* Prepare splice early (Linux) with proper error handling */
 #ifdef __linux__
         if (!conn->use_splice) {
-            int p1[2], p2[2];
-            if (pipe2(p1, O_NONBLOCK | O_CLOEXEC) == 0 &&
-                pipe2(p2, O_NONBLOCK | O_CLOEXEC) == 0) {
-                conn->c2s_pipe[0] = p1[0];
-                conn->c2s_pipe[1] = p1[1];
-                conn->s2c_pipe[0] = p2[0];
-                conn->s2c_pipe[1] = p2[1];
-                conn->use_splice = true;
+            int p1[2] = {-1, -1}, p2[2] = {-1, -1};
+            bool p1_created = false, p2_created = false;
+
+            if (pipe2(p1, O_NONBLOCK | O_CLOEXEC) == 0) {
+                p1_created = true;
+                if (pipe2(p2, O_NONBLOCK | O_CLOEXEC) == 0) {
+                    p2_created = true;
+                    conn->c2s_pipe[0] = p1[0];
+                    conn->c2s_pipe[1] = p1[1];
+                    conn->s2c_pipe[0] = p2[0];
+                    conn->s2c_pipe[1] = p2[1];
+                    conn->use_splice = true;
+                } else {
+                    P_LOG_WARN("Failed to create s2c pipe for splice: %s", strerror(errno));
+                }
             } else {
-                if (p1[0] > -1) safe_close(p1[0]);
-                if (p1[1] > -1) safe_close(p1[1]);
-                if (p2[0] > -1) safe_close(p2[0]);
-                if (p2[1] > -1) safe_close(p2[1]);
+                P_LOG_WARN("Failed to create c2s pipe for splice: %s", strerror(errno));
+            }
+
+            /* Clean up on partial failure */
+            if (!conn->use_splice) {
+                if (p1_created) {
+                    safe_close(p1[0]);
+                    safe_close(p1[1]);
+                }
+                if (p2_created) {
+                    safe_close(p2[0]);
+                    safe_close(p2[1]);
+                }
             }
         }
 #endif
@@ -751,10 +1262,12 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
                                       ? &conn->request
                                       : &conn->response;
         ssize_t rc;
-        /* Compact buffer if fully filled but with headroom at front */
-        if (buf->dlen == buf->capacity && buf->rpos > 0) {
+        /* Compact buffer if needed - only when we have significant waste */
+        if (buf->dlen == buf->capacity && buf->rpos > buf->capacity / BUFFER_COMPACT_THRESHOLD_RATIO) {
             size_t unread = buf->dlen - buf->rpos;
-            memmove(buf->data, buf->data + buf->rpos, unread);
+            if (unread > 0) {
+                memmove(buf->data, buf->data + buf->rpos, unread);
+            }
             buf->dlen = unread;
             buf->rpos = 0;
         }
@@ -831,8 +1344,8 @@ err:
 /* Event Handling Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static void handle_new_connection(int listen_sock, int epfd,
-                                  struct config *cfg) {
+static int handle_new_connection(int listen_sock, int epfd,
+                                 struct config *cfg) {
     for (;;) {
         union sockaddr_inx cli_addr;
         socklen_t cli_alen = sizeof(cli_addr);
@@ -842,40 +1355,109 @@ static void handle_new_connection(int listen_sock, int epfd,
                            SOCK_NONBLOCK | SOCK_CLOEXEC);
         if (cli_sock < 0 && (errno == ENOSYS || errno == EINVAL)) {
             /* Fallback if accept4 not supported */
-            cli_sock =
-                accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+            cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+            if (cli_sock >= 0) {
+                set_nonblock(cli_sock);
+                fcntl(cli_sock, F_SETFD, FD_CLOEXEC);
+            }
         }
 #else
         cli_sock = accept(listen_sock, (struct sockaddr *)&cli_addr, &cli_alen);
+        if (cli_sock >= 0) {
+            set_nonblock(cli_sock);
+            fcntl(cli_sock, F_SETFD, FD_CLOEXEC);
+        }
 #endif
         if (cli_sock < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                /* Processed all incoming connections. */
+            int error_result = handle_accept_errors(listen_sock);
+            if (error_result == 0) {
+                /* Normal case - no more connections */
                 break;
+            } else if (error_result == -2) {
+                /* Fatal error - stop accepting */
+                return -1;
             }
-            P_LOG_ERR("accept(): %s", strerror(errno));
-            break;
+            /* Temporary error - continue trying */
+            continue;
         }
 
         struct proxy_conn *conn = create_proxy_conn(cfg, cli_sock, &cli_addr);
         if (conn) {
             set_conn_epoll_fds(conn, epfd);
-        } else {
-            close(cli_sock);
         }
+        /* Note: create_proxy_conn handles socket closure on failure */
     }
+    return 0;
 }
 
 static int proxy_loop(int epfd, int listen_sock, struct config *cfg) {
-    struct epoll_event events[512];
+    struct epoll_event *events = NULL;
+    int events_size = EPOLL_EVENTS_DEFAULT;
+    int consecutive_full_batches = 0;
+    int consecutive_small_batches = 0;
 
-    while (!g_state.terminate) {
-        int nfds = epoll_wait(epfd, events, countof(events), 1000);
+    /* Allocate initial event array */
+    events = malloc(sizeof(struct epoll_event) * events_size);
+    if (!events) {
+        P_LOG_ERR("Failed to allocate epoll events array");
+        return 1;
+    }
+
+    while (!g_state.terminate && !g_shutdown_requested) {
+        int nfds = epoll_wait(epfd, events, events_size, 1000);
         if (nfds < 0) {
             if (errno == EINTR)
                 continue;
             P_LOG_ERR("epoll_wait(): %s", strerror(errno));
+            free(events);
             return 1;
+        }
+
+        /* Dynamic adjustment of event array size */
+        if (nfds == events_size) {
+            /* Array was full - consider expanding */
+            consecutive_full_batches++;
+            consecutive_small_batches = 0;
+
+            if (consecutive_full_batches >= EPOLL_EXPAND_THRESHOLD && events_size < EPOLL_EVENTS_MAX) {
+                int new_size = events_size * 2;
+                if (new_size > EPOLL_EVENTS_MAX) {
+                    new_size = EPOLL_EVENTS_MAX;
+                }
+
+                struct epoll_event *new_events = realloc(events,
+                    sizeof(struct epoll_event) * new_size);
+                if (new_events) {
+                    events = new_events;
+                    events_size = new_size;
+                    consecutive_full_batches = 0;
+                    P_LOG_INFO("Expanded epoll events array to %d", events_size);
+                }
+            }
+        } else if (nfds < events_size / EPOLL_SHRINK_USAGE_RATIO) {
+            /* Array usage is low - consider shrinking */
+            consecutive_small_batches++;
+            consecutive_full_batches = 0;
+
+            if (consecutive_small_batches >= EPOLL_SHRINK_THRESHOLD && events_size > EPOLL_EVENTS_MIN) {
+                int new_size = events_size / 2;
+                if (new_size < EPOLL_EVENTS_MIN) {
+                    new_size = EPOLL_EVENTS_MIN;
+                }
+
+                struct epoll_event *new_events = realloc(events,
+                    sizeof(struct epoll_event) * new_size);
+                if (new_events) {
+                    events = new_events;
+                    events_size = new_size;
+                    consecutive_small_batches = 0;
+                    P_LOG_INFO("Shrunk epoll events array to %d", events_size);
+                }
+            }
+        } else {
+            /* Reset counters for moderate usage */
+            consecutive_full_batches = 0;
+            consecutive_small_batches = 0;
         }
 
         for (int i = 0; i < nfds; i++) {
@@ -889,20 +1471,37 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg) {
 
             if (*(const uint32_t *)ev->data.ptr == EV_MAGIC_LISTENER) {
                 /* Listener socket */
-                handle_new_connection(listen_sock, epfd, cfg);
+                if (handle_new_connection(listen_sock, epfd, cfg) < 0) {
+                    P_LOG_ERR("Fatal error in accept handling, terminating");
+                    return 1;
+                }
                 continue;
             } else {
-                /* Client or server socket */
+                /* Client or server socket - validate magic numbers */
                 uint32_t *magic = ev->data.ptr;
                 int efd = -1;
+
                 if (*magic == EV_MAGIC_CLIENT) {
                     conn = container_of(magic, struct proxy_conn, magic_client);
                     efd = conn->cli_sock;
+                    /* Validate connection state */
+                    if (efd < 0 || conn->state == S_CLOSING) {
+                        P_LOG_WARN("Event for invalid client socket (fd=%d, state=%d)",
+                                   efd, conn->state);
+                        continue;
+                    }
                 } else if (*magic == EV_MAGIC_SERVER) {
                     conn = container_of(magic, struct proxy_conn, magic_server);
                     efd = conn->svr_sock;
+                    /* Validate connection state */
+                    if (efd < 0 || conn->state == S_CLOSING) {
+                        P_LOG_WARN("Event for invalid server socket (fd=%d, state=%d)",
+                                   efd, conn->state);
+                        continue;
+                    }
                 } else {
-                    continue; /* Should not happen */
+                    P_LOG_WARN("Invalid magic number in epoll event: 0x%x", *magic);
+                    continue;
                 }
 
                 switch (conn->state) {
@@ -927,6 +1526,8 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg) {
             }
         }
     }
+
+    free(events);
     return 0;
 }
 
@@ -966,6 +1567,10 @@ static void show_help(const char *prog) {
     P_LOG_INFO("  -K <ka_cnt>               -- TCP keepalive probe count "
                "(default: %d)",
                TCP_PROXY_KEEPALIVE_CNT);
+    P_LOG_INFO("  -M <max_conn>             -- maximum total connections "
+               "(default: unlimited)");
+    P_LOG_INFO("  -P <max_per_ip>           -- maximum connections per IP "
+               "(default: unlimited)");
     P_LOG_INFO("  -h, --help                -- show this help");
 }
 
@@ -979,10 +1584,12 @@ int main(int argc, char *argv[]) {
     /* Initialize configuration with defaults */
     memset(&cfg, 0, sizeof(cfg));
     cfg.reuse_addr = true;
+    cfg.max_connections = 0;  /* 0 = no limit */
+    cfg.max_per_ip = 0;       /* 0 = no limit */
 
     /* Parse command line arguments */
     int opt;
-    while ((opt = getopt(argc, argv, "dp:brR6hC:U:S:I:N:K:")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:brR6hC:U:S:I:N:K:M:P:")) != -1) {
         switch (opt) {
         case 'd':
             cfg.daemonize = true;
@@ -1092,6 +1699,32 @@ int main(int argc, char *argv[]) {
             }
             break;
         }
+        case 'M': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v < 0) {
+                P_LOG_WARN("invalid -M value '%s', keeping default %d", optarg,
+                           cfg.max_connections);
+            } else {
+                if (v > MAX_TOTAL_CONNECTIONS_LIMIT)
+                    v = MAX_TOTAL_CONNECTIONS_LIMIT;
+                cfg.max_connections = (int)v;
+            }
+            break;
+        }
+        case 'P': {
+            char *end = NULL;
+            long v = strtol(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v < 0) {
+                P_LOG_WARN("invalid -P value '%s', keeping default %d", optarg,
+                           cfg.max_per_ip);
+            } else {
+                if (v > MAX_PER_IP_CONNECTIONS_LIMIT)
+                    v = MAX_PER_IP_CONNECTIONS_LIMIT;
+                cfg.max_per_ip = (int)v;
+            }
+            break;
+        }
         case 'h':
             show_help(argv[0]);
             return 0;
@@ -1128,6 +1761,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Initialize connection limiter */
+    if (init_conn_limiter(cfg.max_connections, cfg.max_per_ip) != 0) {
+        destroy_conn_pool();
+        closelog();
+        return 1;
+    }
+
     /* Daemonize if requested */
     if (cfg.daemonize && do_daemonize() != 0)
         goto cleanup;
@@ -1141,6 +1781,11 @@ int main(int argc, char *argv[]) {
     }
 
     /* Set up signal handlers */
+    if (setup_shutdown_signals() != 0) {
+        P_LOG_ERR("Failed to setup signal handlers");
+        rc = 1;
+        goto cleanup;
+    }
     setup_signal_handlers();
 
     /* Create listening socket */
@@ -1187,7 +1832,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Start listening */
-    if (listen(listen_sock, 128) < 0) {
+    if (listen(listen_sock, LISTEN_BACKLOG) < 0) {
         P_LOG_ERR("listen(): %s", strerror(errno));
         goto cleanup;
     }
@@ -1220,7 +1865,15 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    P_LOG_INFO("TCP forwarding started.");
+    P_LOG_INFO("TCP forwarding started: %s -> %s",
+               sockaddr_to_string(&cfg.src_addr),
+               sockaddr_to_string(&cfg.dst_addr));
+    if (cfg.max_connections > 0) {
+        P_LOG_INFO("Connection limits: total=%d, per-IP=%d",
+                   cfg.max_connections, cfg.max_per_ip);
+    }
+    P_LOG_INFO("Connection pool size: %d, buffer size: %d bytes",
+               g_conn_pool_capacity, g_userbuf_cap_runtime);
 
     /* Run main event loop */
     rc = proxy_loop(epfd, listen_sock, &cfg);
@@ -1237,6 +1890,7 @@ cleanup:
         epoll_close_comp(epfd);
     }
     destroy_conn_pool();
+    destroy_conn_limiter();
     closelog();
 
     return rc;

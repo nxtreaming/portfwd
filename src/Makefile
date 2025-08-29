@@ -6,11 +6,13 @@ CFLAGS += -Wall -Wextra
 # Build directory
 BUILD_DIR = build
 
-NO_EPOLL_O = 
+NO_EPOLL_O =
 ifeq ($(shell uname), Linux)
 #LDFLAGS += -levent
+LDFLAGS += -lpthread
 else
 NO_EPOLL_O = $(BUILD_DIR)/no-epoll.o
+LDFLAGS += -lpthread
 endif
 
 all: $(BUILD_DIR) tcpfwd udpfwd kcptcp-client kcptcp-server
