@@ -292,6 +292,12 @@ int main(int argc, char **argv) {
                             } else {
                                 P_LOG_ERR("session key derivation failed");
                                 close(ts);
+                                if (nc->request.data)
+                                    free(nc->request.data);
+                                if (nc->response.data)
+                                    free(nc->response.data);
+                                if (nc->udp_backlog.data)
+                                    free(nc->udp_backlog.data);
                                 free(nc);
                                 continue;
                             }
@@ -301,6 +307,13 @@ int main(int argc, char **argv) {
                             0) {
                             P_LOG_ERR("kcp_setup_conn failed");
                             close(ts);
+                            if (nc->request.data)
+                                free(nc->request.data);
+                            if (nc->response.data)
+                                free(nc->response.data);
+                            if (nc->udp_backlog.data)
+                                free(nc->udp_backlog.data);
+                            kcp_map_del(&cmap, nc->conv);
                             free(nc);
                             continue;
                         }
@@ -358,7 +371,12 @@ int main(int argc, char **argv) {
                     }
                     /* Feed KCP */
                     c->udp_rx_bytes += (uint64_t)rn; /* Stats: UDP RX */
-                    (void)ikcp_input(c->kcp, buf, (long)rn);
+                    if (c->kcp) {
+                        (void)ikcp_input(c->kcp, buf, (long)rn);
+                    } else {
+                        P_LOG_WARN("drop UDP for conv=%u with no KCP", conv);
+                        continue;
+                    }
                     /* Drain to TCP (KCP -> target TCP) */
                     for (;;) {
                         int peek = ikcp_peeksize(c->kcp);
@@ -420,6 +438,12 @@ int main(int argc, char **argv) {
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
+                                    if (c->request.data)
+                                        free(c->request.data);
+                                    c->request.data = NULL;
+                                    c->request.capacity = 0;
+                                    c->request.dlen = 0;
+                                    c->request.rpos = 0;
                                     c->state = S_CLOSING;
                                     break;
                                 }
@@ -463,6 +487,12 @@ int main(int argc, char **argv) {
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
+                                    if (c->request.data)
+                                        free(c->request.data);
+                                    c->request.data = NULL;
+                                    c->request.capacity = 0;
+                                    c->request.dlen = 0;
+                                    c->request.rpos = 0;
                                     c->state = S_CLOSING;
                                     break;
                                 }
@@ -506,6 +536,12 @@ int main(int argc, char **argv) {
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
+                                    if (c->request.data)
+                                        free(c->request.data);
+                                    c->request.data = NULL;
+                                    c->request.capacity = 0;
+                                    c->request.dlen = 0;
+                                    c->request.rpos = 0;
                                     c->state = S_CLOSING;
                                     break;
                                 }
@@ -527,10 +563,14 @@ int main(int argc, char **argv) {
                         c->last_active = time(NULL);
                     }
                     continue;
-                }
+            }
 
-                /* TCP events for an existing connection */
-                struct proxy_conn *c = (struct proxy_conn *)tag;
+            /* TCP events for an existing connection */
+            if (!tag) {
+                P_LOG_WARN("epoll event with NULL tag");
+                continue;
+            }
+            struct proxy_conn *c = (struct proxy_conn *)tag;
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                     c->state = S_CLOSING;
                 }
