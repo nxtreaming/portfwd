@@ -96,20 +96,32 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
 
 static void set_sock_buffers(int sockfd) {
     int sz = g_sockbuf_cap_runtime;
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) < 0) {
+        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz)) < 0) {
+        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
+    }
 }
 
 static void set_keepalive(int sockfd) {
     int on = 1;
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0) {
+        P_LOG_WARN("setsockopt(SO_KEEPALIVE): %s", strerror(errno));
+    }
 #ifdef __linux__
     int idle = g_ka_idle;
     int intvl = g_ka_intvl;
     int cnt = g_ka_cnt;
-    (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-    (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-    (void)setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0) {
+        P_LOG_WARN("setsockopt(TCP_KEEPIDLE): %s", strerror(errno));
+    }
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) < 0) {
+        P_LOG_WARN("setsockopt(TCP_KEEPINTVL): %s", strerror(errno));
+    }
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) < 0) {
+        P_LOG_WARN("setsockopt(TCP_KEEPCNT): %s", strerror(errno));
+    }
 #endif
 }
 
@@ -176,11 +188,24 @@ static inline struct proxy_conn *alloc_proxy_conn(void) {
     conn->splice_pipe[0] = -1;
     conn->splice_pipe[1] = -1;
     conn->use_splice = false;
+    conn->splice_pending_dir = 0;
 #endif
     conn->magic_client = EV_MAGIC_CLIENT;
     conn->magic_server = EV_MAGIC_SERVER;
 
     return conn;
+}
+
+static int safe_close(int fd) {
+    if (fd < 0)
+        return 0;
+    for (;;) {
+        if (close(fd) == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
 }
 
 static void release_proxy_conn(struct proxy_conn *conn,
@@ -218,27 +243,31 @@ static void release_proxy_conn(struct proxy_conn *conn,
 
 #ifdef __linux__
     if (conn->use_splice) {
-        if (close(conn->splice_pipe[0]) < 0) {
+        if (safe_close(conn->splice_pipe[0]) < 0) {
             P_LOG_WARN("close(splice_pipe[0]=%d): %s", conn->splice_pipe[0],
                        strerror(errno));
         }
-        if (close(conn->splice_pipe[1]) < 0) {
+        if (safe_close(conn->splice_pipe[1]) < 0) {
             P_LOG_WARN("close(splice_pipe[1]=%d): %s", conn->splice_pipe[1],
                        strerror(errno));
         }
+        conn->splice_pipe[0] = conn->splice_pipe[1] = -1;
+        conn->splice_pending_dir = 0;
     }
 #endif
     if (conn->cli_sock >= 0) {
-        if (close(conn->cli_sock) < 0) {
+        if (safe_close(conn->cli_sock) < 0) {
             P_LOG_WARN("close(cli_sock=%d): %s", conn->cli_sock,
                        strerror(errno));
         }
+        conn->cli_sock = -1;
     }
     if (conn->svr_sock != -1) {
-        if (close(conn->svr_sock) < 0) {
+        if (safe_close(conn->svr_sock) < 0) {
             P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock,
                        strerror(errno));
         }
+        conn->svr_sock = -1;
     }
 
     /* Free user buffers to avoid leaks, since alloc_proxy_conn() zeroes
@@ -278,10 +307,22 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     ev_svr.data.ptr = &conn->magic_server;
 
     if (conn->use_splice) {
-        /* With splice, we don't maintain user buffers; rely on kernel pipe.
-         * Enable both IN and OUT on both ends to guarantee progress. */
-        ev_cli.events |= EPOLLIN | EPOLLOUT;
-        ev_svr.events |= EPOLLIN | EPOLLOUT;
+        /* With splice, read readiness: keep EPOLLIN on both ends.
+         * Write readiness: only enable EPOLLOUT on the destination that has
+         * pending data to flush to avoid busy-waiting on always-writable fds. */
+        ev_cli.events |= EPOLLIN;
+        ev_svr.events |= EPOLLIN;
+        if (conn->splice_pending > 0) {
+            if (conn->splice_pending_dir == 1) { /* cli -> svr */
+                ev_svr.events |= EPOLLOUT;
+            } else if (conn->splice_pending_dir == 2) { /* svr -> cli */
+                ev_cli.events |= EPOLLOUT;
+            } else {
+                /* Unknown direction: conservatively enable both */
+                ev_cli.events |= EPOLLOUT;
+                ev_svr.events |= EPOLLOUT;
+            }
+        }
     } else {
         switch (conn->state) {
         case S_SERVER_CONNECTING:
@@ -389,7 +430,8 @@ create_proxy_conn(struct config *cfg, int cli_sock,
                             ntohs(*port_of_sockaddr(&loc_addr)));
 
         base = ntohl(*addr_pos);
-        sum = (int64_t)base + (int64_t)(int32_t)port_offset;
+        /* Apply signed offset without unnecessary casts */
+        sum = (int64_t)base + (int64_t)port_offset;
         if (sum < 0 || sum > UINT32_MAX) {
             P_LOG_ERR("base address adjustment overflows: base=%u, off=%d",
                       base, port_offset);
@@ -586,6 +628,10 @@ static int handle_forwarding_splice(struct proxy_conn *conn,
                 return 0;
             }
             to_write = n_in;
+            if (src_fd == conn->cli_sock)
+                conn->splice_pending_dir = 1; /* cli -> svr */
+            else
+                conn->splice_pending_dir = 2; /* svr -> cli */
         }
 
         /* Write to destination */
@@ -604,13 +650,14 @@ static int handle_forwarding_splice(struct proxy_conn *conn,
         }
 
         if ((size_t)n_out < to_write) {
-            /* Partial write, update pending and try again */
+            /* Partial write, update pending and yield to EPOLLOUT */
             conn->splice_pending = to_write - n_out;
-            continue;
+            break;
         }
 
         /* Full write */
         conn->splice_pending = 0;
+        conn->splice_pending_dir = 0;
     }
 
     return -EAGAIN;
@@ -653,6 +700,13 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
                                       ? &conn->request
                                       : &conn->response;
         ssize_t rc;
+        /* Compact buffer if fully filled but with headroom at front */
+        if (buf->dlen == buf->capacity && buf->rpos > 0) {
+            size_t unread = buf->dlen - buf->rpos;
+            memmove(buf->data, buf->data + buf->rpos, unread);
+            buf->dlen = unread;
+            buf->rpos = 0;
+        }
         while (buf->dlen < buf->capacity) {
             rc =
                 recv(sock, buf->data + buf->dlen, buf->capacity - buf->dlen, 0);

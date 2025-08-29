@@ -46,6 +46,8 @@ struct proxy_conn {
 
     bool use_splice;
     size_t splice_pending;
+    /* Direction of pending splice write: 0=none, 1=cli->svr, 2=svr->cli */
+    int splice_pending_dir;
     int splice_pipe[2];
     bool cli_in_eof;
     bool svr_in_eof;
