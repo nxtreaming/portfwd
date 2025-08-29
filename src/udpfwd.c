@@ -87,9 +87,7 @@
 #endif
 #endif
 
-/* Hash function constants */
-#define FNV_PRIME_32 16777619
-#define FNV_OFFSET_BASIS_32 2166136261U
+
 
 /* Connection pool size */
 #ifndef UDP_PROXY_MAX_CONNS
@@ -180,8 +178,8 @@ struct adaptive_batch {
     int current_size;
     int min_size;
     int max_size;
-    atomic_uint64_t total_packets;
-    atomic_uint64_t total_batches;
+    _Atomic uint64_t total_packets;
+    _Atomic uint64_t total_batches;
     time_t last_adjust;
     pthread_mutex_t lock;
 };
@@ -208,8 +206,8 @@ static atomic_long g_now_ts;                    /**< Atomic timestamp cache */
 static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 
 /* Stats: batch overflow immediate-sends (client->server) - atomic counters */
-static atomic_uint64_t g_stat_c2s_batch_socket_overflow;
-static atomic_uint64_t g_stat_c2s_batch_entry_overflow;
+static _Atomic uint64_t g_stat_c2s_batch_socket_overflow;
+static _Atomic uint64_t g_stat_c2s_batch_entry_overflow;
 
 /* Signal-safe shutdown flag */
 static volatile sig_atomic_t g_shutdown_requested = 0;
@@ -436,7 +434,7 @@ static void adjust_batch_size(void) {
                 if (g_adaptive_batch.current_size > g_adaptive_batch.max_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.max_size;
                 }
-                P_LOG_DEBUG("Increased batch size to %d (avg=%.1f)",
+                P_LOG_INFO("Increased batch size to %d (avg=%.1f)",
                            g_adaptive_batch.current_size, avg_batch_size);
             }
         } else if (avg_batch_size < g_adaptive_batch.current_size * BATCH_LOW_UTILIZATION_RATIO) {
@@ -447,7 +445,7 @@ static void adjust_batch_size(void) {
                 if (g_adaptive_batch.current_size < g_adaptive_batch.min_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.min_size;
                 }
-                P_LOG_DEBUG("Decreased batch size to %d (avg=%.1f)",
+                P_LOG_INFO("Decreased batch size to %d (avg=%.1f)",
                            g_adaptive_batch.current_size, avg_batch_size);
             }
         }
@@ -637,15 +635,7 @@ static void set_sock_buffers(int sockfd) {
 /* Hash Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static uint32_t fnv1a_32_hash(const void *data, size_t len) {
-    uint32_t hash = FNV_OFFSET_BASIS_32;
-    const unsigned char *p = (const unsigned char *)data;
-    for (size_t i = 0; i < len; i++) {
-        hash ^= (uint32_t)p[i];
-        hash *= FNV_PRIME_32;
-    }
-    return hash;
-}
+
 
 static uint32_t hash_addr(const union sockaddr_inx *a) {
     /* Use the improved hash function for better distribution */
@@ -954,7 +944,7 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
 
                 /* Validate packet size and rate limits */
                 size_t packet_len = c_msgs[i].msg_len;
-                if (!validate_packet(c_iov[i].iov_base, packet_len, sa)) {
+                if (!validate_packet(c_bufs[i], packet_len, sa)) {
                     continue; /* Drop invalid packet */
                 }
                 if (!check_rate_limit(sa, packet_len)) {
@@ -1031,8 +1021,8 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     }
                     if (sent < remaining) {
                         /* Partial send - log for debugging */
-                        P_LOG_DEBUG("sendmmsg(server) partial: sent=%d, remaining=%d",
-                                    sent, remaining);
+                        P_LOG_INFO("sendmmsg(server) partial: sent=%d, remaining=%d",
+                                   sent, remaining);
                     }
                     remaining -= sent;
                     msgp += sent;
@@ -1162,8 +1152,8 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
             }
             if (sent < remaining) {
                 /* Partial send - log for debugging */
-                P_LOG_DEBUG("sendmmsg(client) partial: sent=%d, remaining=%d",
-                            sent, remaining);
+                P_LOG_INFO("sendmmsg(client) partial: sent=%d, remaining=%d",
+                           sent, remaining);
             }
             remaining -= sent;
             msgp += sent;
@@ -1601,7 +1591,7 @@ int main(int argc, char *argv[]) {
             for (int j = 0; j < i; j++) {
                 pthread_spin_destroy(&conn_tbl_locks[j]);
             }
-            free(conn_tbl_locks);
+            free((void *)conn_tbl_locks);
             free(conn_tbl_hbase);
             conn_tbl_hbase = NULL;
             conn_tbl_locks = NULL;
@@ -1705,7 +1695,7 @@ cleanup:
         for (unsigned i = 0; i < g_conn_tbl_hash_size; i++) {
             pthread_spin_destroy(&conn_tbl_locks[i]);
         }
-        free(conn_tbl_locks);
+        free((void *)conn_tbl_locks);
         conn_tbl_locks = NULL;
     }
 
