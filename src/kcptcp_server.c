@@ -324,6 +324,13 @@ int main(int argc, char **argv) {
                             if (nc->kcp)
                                 ikcp_release(nc->kcp);
                             close(ts);
+                            if (nc->request.data)
+                                free(nc->request.data);
+                            if (nc->response.data)
+                                free(nc->response.data);
+                            if (nc->udp_backlog.data)
+                                free(nc->udp_backlog.data);
+                            kcp_map_del(&cmap, nc->conv);
                             free(nc);
                             continue;
                         }
