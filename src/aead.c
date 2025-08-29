@@ -63,7 +63,6 @@ void aead_gen_control_packet(unsigned char type, uint32_t seq, const uint8_t *ke
 }
 
 int aead_verify_packet(struct proxy_conn *c, uint8_t *data, int len, uint32_t *out_seq) {
-    unsigned char t = data[0];
     if (len < 1 + 4 + 16) return -1;
     
     uint32_t seq = (uint32_t)data[1] | ((uint32_t)data[2] << 8) | ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
