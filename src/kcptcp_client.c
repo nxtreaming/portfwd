@@ -61,6 +61,9 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
 /* UDP socket events for a single connection */
 static void client_handle_udp_events(struct client_ctx *ctx,
                                      struct proxy_conn *c, uint32_t evmask) {
+    if (c->state == S_CLOSING)
+        return;
+
     if (!(evmask & EPOLLIN)) {
         return;
     }
@@ -76,6 +79,7 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 break;
             }
             P_LOG_WARN("recvfrom udp: %s", strerror(errno));
+            c->state = S_CLOSING;
             break;
         }
         if (rn == 0) {
@@ -96,9 +100,14 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             continue; /* Unknown family: drop */
         }
         if (!is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
-            P_LOG_WARN("dropping UDP from unexpected %s (expected %s)",
-                       sockaddr_to_string(&ra),
-                       sockaddr_to_string(&c->peer_addr));
+            static time_t last_warn = 0;
+            time_t now = time(NULL);
+            if (now - last_warn >= 1) {
+                P_LOG_WARN("dropping UDP from unexpected %s (expected %s)",
+                           sockaddr_to_string(&ra),
+                           sockaddr_to_string(&c->peer_addr));
+                last_warn = now;
+            }
             continue;
         }
         /* Handshake ACCEPT path */
@@ -132,6 +141,18 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                     c->rekey_in_progress = false;
                 } else {
                     P_LOG_ERR("session key derivation failed");
+                    if (c->request.data) {
+                        free(c->request.data);
+                        c->request.data = NULL;
+                        c->request.capacity = c->request.dlen =
+                            c->request.rpos = 0;
+                    }
+                    if (c->response.data) {
+                        free(c->response.data);
+                        c->response.data = NULL;
+                        c->response.capacity = c->response.dlen =
+                            c->response.rpos = 0;
+                    }
                     c->state = S_CLOSING;
                     break;
                 }
@@ -193,6 +214,7 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 &plen);
 
             if (res < 0) { // Error
+                P_LOG_ERR("AEAD packet handling failed (res=%d)", res);
                 c->state = S_CLOSING;
                 break;
             }
@@ -229,11 +251,19 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                                                MAX_TCP_BUFFER_SIZE)) {
                             P_LOG_WARN("Response buffer size limit exceeded, "
                                        "closing connection");
+                            free(c->response.data);
+                            c->response.data = NULL;
+                            c->response.capacity = c->response.dlen =
+                                c->response.rpos = 0;
                             c->state = S_CLOSING;
                             break;
                         }
                         char *np = (char *)realloc(c->response.data, ncap);
                         if (!np) {
+                            free(c->response.data);
+                            c->response.data = NULL;
+                            c->response.capacity = c->response.dlen =
+                                c->response.rpos = 0;
                             c->state = S_CLOSING;
                             break;
                         }
@@ -268,11 +298,19 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                                            MAX_TCP_BUFFER_SIZE)) {
                         P_LOG_WARN("Response buffer size limit exceeded, "
                                    "closing connection");
+                        free(c->response.data);
+                        c->response.data = NULL;
+                        c->response.capacity = c->response.dlen =
+                            c->response.rpos = 0;
                         c->state = S_CLOSING;
                         break;
                     }
                     char *np = (char *)realloc(c->response.data, ncap);
                     if (!np) {
+                        free(c->response.data);
+                        c->response.data = NULL;
+                        c->response.capacity = c->response.dlen =
+                            c->response.rpos = 0;
                         c->state = S_CLOSING;
                         break;
                     }
@@ -338,8 +376,10 @@ static void client_handle_accept(struct client_ctx *ctx) {
         /* Generate 16-byte token using cryptographically secure random */
         if (secure_random_bytes(c->hs_token, 16) != 0) {
             P_LOG_ERR("Failed to generate secure random token");
-            c->state = S_CLOSING;
-            break;
+            close(cs);
+            close(us);
+            free(c);
+            continue;
         }
         /* Send HELLO: [type][ver][token(16)] */
         unsigned char hbuf[1 + 1 + 16];
@@ -407,6 +447,9 @@ static void client_handle_accept(struct client_ctx *ctx) {
 /* TCP client socket events for a single connection */
 static void client_handle_tcp_events(struct client_ctx *ctx,
                                      struct proxy_conn *c, uint32_t evmask) {
+    if (c->state == S_CLOSING)
+        return;
+
     if (evmask & (EPOLLERR | EPOLLHUP)) {
         c->state = S_CLOSING;
     }
@@ -467,11 +510,19 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
                                            MAX_TCP_BUFFER_SIZE)) {
                         P_LOG_WARN("Request buffer size limit exceeded, "
                                    "closing connection");
+                        free(c->request.data);
+                        c->request.data = NULL;
+                        c->request.capacity = c->request.dlen =
+                            c->request.rpos = 0;
                         c->state = S_CLOSING;
                         break;
                     }
                     char *np = (char *)realloc(c->request.data, ncap);
                     if (!np) {
+                        free(c->request.data);
+                        c->request.data = NULL;
+                        c->request.capacity = c->request.dlen =
+                            c->request.rpos = 0;
                         c->state = S_CLOSING;
                         break;
                     }
