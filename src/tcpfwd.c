@@ -312,6 +312,8 @@ static int handle_accept_errors(int listen_sock) {
     static time_t last_error_time = 0;
     time_t now = time(NULL);
 
+    (void)listen_sock; /* Suppress unused parameter warning */
+
     /* Reset error count if enough time has passed */
     if (now - last_error_time > ACCEPT_ERROR_RESET_INTERVAL) {
         consecutive_errors = 0;
@@ -320,7 +322,9 @@ static int handle_accept_errors(int listen_sock) {
     /* Handle different error types */
     switch (errno) {
     case EAGAIN:
+#if EAGAIN != EWOULDBLOCK
     case EWOULDBLOCK:
+#endif
         /* Normal case - no more connections to accept */
         consecutive_errors = 0;
         return 0;
