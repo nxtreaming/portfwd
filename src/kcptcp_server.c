@@ -292,6 +292,12 @@ int main(int argc, char **argv) {
                             } else {
                                 P_LOG_ERR("session key derivation failed");
                                 close(ts);
+                                if (nc->request.data)
+                                    free(nc->request.data);
+                                if (nc->response.data)
+                                    free(nc->response.data);
+                                if (nc->udp_backlog.data)
+                                    free(nc->udp_backlog.data);
                                 free(nc);
                                 continue;
                             }
@@ -301,6 +307,13 @@ int main(int argc, char **argv) {
                             0) {
                             P_LOG_ERR("kcp_setup_conn failed");
                             close(ts);
+                            if (nc->request.data)
+                                free(nc->request.data);
+                            if (nc->response.data)
+                                free(nc->response.data);
+                            if (nc->udp_backlog.data)
+                                free(nc->udp_backlog.data);
+                            kcp_map_del(&cmap, nc->conv);
                             free(nc);
                             continue;
                         }
@@ -311,6 +324,13 @@ int main(int argc, char **argv) {
                             if (nc->kcp)
                                 ikcp_release(nc->kcp);
                             close(ts);
+                            if (nc->request.data)
+                                free(nc->request.data);
+                            if (nc->response.data)
+                                free(nc->response.data);
+                            if (nc->udp_backlog.data)
+                                free(nc->udp_backlog.data);
+                            kcp_map_del(&cmap, nc->conv);
                             free(nc);
                             continue;
                         }
@@ -358,7 +378,12 @@ int main(int argc, char **argv) {
                     }
                     /* Feed KCP */
                     c->udp_rx_bytes += (uint64_t)rn; /* Stats: UDP RX */
-                    (void)ikcp_input(c->kcp, buf, (long)rn);
+                    if (c->kcp) {
+                        (void)ikcp_input(c->kcp, buf, (long)rn);
+                    } else {
+                        P_LOG_WARN("drop UDP for conv=%u with no KCP", conv);
+                        continue;
+                    }
                     /* Drain to TCP (KCP -> target TCP) */
                     for (;;) {
                         int peek = ikcp_peeksize(c->kcp);
@@ -420,6 +445,12 @@ int main(int argc, char **argv) {
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
+                                    if (c->request.data)
+                                        free(c->request.data);
+                                    c->request.data = NULL;
+                                    c->request.capacity = 0;
+                                    c->request.dlen = 0;
+                                    c->request.rpos = 0;
                                     c->state = S_CLOSING;
                                     break;
                                 }
@@ -463,6 +494,12 @@ int main(int argc, char **argv) {
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
+                                    if (c->request.data)
+                                        free(c->request.data);
+                                    c->request.data = NULL;
+                                    c->request.capacity = 0;
+                                    c->request.dlen = 0;
+                                    c->request.rpos = 0;
                                     c->state = S_CLOSING;
                                     break;
                                 }
@@ -506,6 +543,12 @@ int main(int argc, char **argv) {
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
+                                    if (c->request.data)
+                                        free(c->request.data);
+                                    c->request.data = NULL;
+                                    c->request.capacity = 0;
+                                    c->request.dlen = 0;
+                                    c->request.rpos = 0;
                                     c->state = S_CLOSING;
                                     break;
                                 }
@@ -527,10 +570,14 @@ int main(int argc, char **argv) {
                         c->last_active = time(NULL);
                     }
                     continue;
-                }
+            }
 
-                /* TCP events for an existing connection */
-                struct proxy_conn *c = (struct proxy_conn *)tag;
+            /* TCP events for an existing connection */
+            if (!tag) {
+                P_LOG_WARN("epoll event with NULL tag");
+                continue;
+            }
+            struct proxy_conn *c = (struct proxy_conn *)tag;
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                     c->state = S_CLOSING;
                 }
@@ -609,141 +656,132 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* Timers and cleanup */
-            uint32_t now = kcp_now_ms();
-
-            struct proxy_conn *pos, *tmp;
-            list_for_each_entry_safe(pos, tmp, &conns, list) {
-                (void)kcp_update_flush(pos, now);
-                /* If server TCP got EOF, wait until all buffered client->server
-                 * data is flushed before closing */
-                if (pos->svr_in_eof && pos->state != S_CLOSING) {
-                    bool tcp_buf_empty =
-                        (pos->request.dlen == pos->request.rpos);
-                    int kcp_unsent = pos->kcp ? ikcp_waitsnd(pos->kcp) : 0;
-                    bool udp_backlog_empty = (pos->udp_backlog.dlen == 0);
-                    if (tcp_buf_empty && kcp_unsent == 0 && udp_backlog_empty) {
-                        pos->state = S_CLOSING;
-                    }
-                }
-                /* Idle timeout (e.g., 180s) */
-                time_t ct = time(NULL);
-                const time_t IDLE_TO = 180;
-                if (pos->state != S_CLOSING && pos->last_active &&
-                    (ct - pos->last_active) > IDLE_TO) {
-                    P_LOG_INFO("idle timeout, conv=%u", pos->conv);
-                    pos->state = S_CLOSING;
-                }
-                /* Rekey timeout enforcement */
-                if (pos->state != S_CLOSING && pos->has_session_key &&
-                    pos->rekey_in_progress) {
-                    if (now >= pos->rekey_deadline_ms) {
-                        P_LOG_ERR("rekey timeout, closing conv=%u (svr)",
-                                  pos->conv);
-                        pos->state = S_CLOSING;
-                    }
-                }
-                /* Periodic runtime stats logging (~5s, configurable) */
-                if (pos->kcp && get_stats_enabled()) {
-                    uint64_t now_ms = now;
-                    if (pos->last_stat_ms == 0) {
-                        pos->last_stat_ms = now_ms;
-                        pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
-                        pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
-                        pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
-                        pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
-                        pos->last_kcp_xmit = pos->kcp->xmit;
-                        pos->last_rekeys_initiated = pos->rekeys_initiated;
-                        pos->last_rekeys_completed = pos->rekeys_completed;
-                    } else if (now_ms - pos->last_stat_ms >=
-                               get_stats_interval_ms()) {
-                        uint64_t dt = now_ms - pos->last_stat_ms;
-                        uint64_t d_tcp_rx =
-                            pos->tcp_rx_bytes - pos->last_tcp_rx_bytes;
-                        uint64_t d_tcp_tx =
-                            pos->tcp_tx_bytes - pos->last_tcp_tx_bytes;
-                        uint64_t d_kcp_tx =
-                            pos->kcp_tx_bytes - pos->last_kcp_tx_bytes;
-                        uint64_t d_kcp_rx =
-                            pos->kcp_rx_bytes - pos->last_kcp_rx_bytes;
-                        uint32_t d_xmit = pos->kcp->xmit - pos->last_kcp_xmit;
-                        uint32_t d_rekey_i =
-                            pos->rekeys_initiated - pos->last_rekeys_initiated;
-                        uint32_t d_rekey_c =
-                            pos->rekeys_completed - pos->last_rekeys_completed;
-                        double sec = (double)dt / 1000.0;
-                        double tcp_in_mbps =
-                            sec > 0 ? (double)d_tcp_rx * 8.0 / (sec * 1e6)
-                                    : 0.0;
-                        double tcp_out_mbps =
-                            sec > 0 ? (double)d_tcp_tx * 8.0 / (sec * 1e6)
-                                    : 0.0;
-                        double kcp_in_mbps =
-                            sec > 0 ? (double)d_kcp_rx * 8.0 / (sec * 1e6)
-                                    : 0.0;
-                        double kcp_out_mbps =
-                            sec > 0 ? (double)d_kcp_tx * 8.0 / (sec * 1e6)
-                                    : 0.0;
-                        P_LOG_INFO(
-                            "stats conv=%u: TCP in=%.3f Mbps out=%.3f Mbps | "
-                            "KCP payload in=%.3f Mbps out=%.3f Mbps | KCP "
-                            "xmit_delta=%u RTT=%dms | rekey i=%u c=%u",
-                            pos->conv, tcp_in_mbps, tcp_out_mbps, kcp_in_mbps,
-                            kcp_out_mbps, d_xmit, pos->kcp->rx_srtt, d_rekey_i,
-                            d_rekey_c);
-                        pos->last_stat_ms = now_ms;
-                        pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
-                        pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
-                        pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
-                        pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
-                        pos->last_kcp_xmit = pos->kcp->xmit;
-                        pos->last_rekeys_initiated = pos->rekeys_initiated;
-                        pos->last_rekeys_completed = pos->rekeys_completed;
-                    }
-                }
-                if (pos->state == S_CLOSING) {
-                    if (get_stats_dump_enabled()) {
-                        P_LOG_INFO(
-                            "stats total conv=%u: tcp_rx=%llu tcp_tx=%llu "
-                            "udp_rx=%llu udp_tx=%llu kcp_rx_msgs=%llu "
-                            "kcp_tx_msgs=%llu kcp_rx_bytes=%llu "
-                            "kcp_tx_bytes=%llu rekeys_i=%u rekeys_c=%u",
-                            pos->conv, (unsigned long long)pos->tcp_rx_bytes,
-                            (unsigned long long)pos->tcp_tx_bytes,
-                            (unsigned long long)pos->udp_rx_bytes,
-                            (unsigned long long)pos->udp_tx_bytes,
-                            (unsigned long long)pos->kcp_rx_msgs,
-                            (unsigned long long)pos->kcp_tx_msgs,
-                            (unsigned long long)pos->kcp_rx_bytes,
-                            (unsigned long long)pos->kcp_tx_bytes,
-                            pos->rekeys_initiated, pos->rekeys_completed);
-                    }
-                    (void)ep_del(epfd, pos->svr_sock);
-                    kcp_map_del(&cmap, pos->conv);
-                    if (pos->kcp)
-                        ikcp_release(pos->kcp);
-                    close(pos->svr_sock);
-                    if (pos->request.data)
-                        free(pos->request.data);
-                    if (pos->response.data)
-                        free(pos->response.data);
-                    if (pos->udp_backlog.data)
-                        free(pos->udp_backlog.data);
-                    list_del(&pos->list);
-                    free(pos);
-                }
-            }
         }
 
-        rc = 0;
+        /* Timers and cleanup */
+        uint32_t now = kcp_now_ms();
+
+        struct proxy_conn *pos, *tmp;
+        list_for_each_entry_safe(pos, tmp, &conns, list) {
+            (void)kcp_update_flush(pos, now);
+            /* If server TCP got EOF, wait until all buffered client->server
+             * data is flushed before closing */
+            if (pos->svr_in_eof && pos->state != S_CLOSING) {
+                bool tcp_buf_empty = (pos->request.dlen == pos->request.rpos);
+                int kcp_unsent = pos->kcp ? ikcp_waitsnd(pos->kcp) : 0;
+                bool udp_backlog_empty = (pos->udp_backlog.dlen == 0);
+                if (tcp_buf_empty && kcp_unsent == 0 && udp_backlog_empty) {
+                    pos->state = S_CLOSING;
+                }
+            }
+            /* Idle timeout (e.g., 180s) */
+            time_t ct = time(NULL);
+            const time_t IDLE_TO = 180;
+            if (pos->state != S_CLOSING && pos->last_active &&
+                (ct - pos->last_active) > IDLE_TO) {
+                P_LOG_INFO("idle timeout, conv=%u", pos->conv);
+                pos->state = S_CLOSING;
+            }
+            /* Rekey timeout enforcement */
+            if (pos->state != S_CLOSING && pos->has_session_key &&
+                pos->rekey_in_progress) {
+                if (now >= pos->rekey_deadline_ms) {
+                    P_LOG_ERR("rekey timeout, closing conv=%u (svr)",
+                              pos->conv);
+                    pos->state = S_CLOSING;
+                }
+            }
+            /* Periodic runtime stats logging (~5s, configurable) */
+            if (pos->kcp && get_stats_enabled()) {
+                uint64_t now_ms = now;
+                if (pos->last_stat_ms == 0) {
+                    pos->last_stat_ms = now_ms;
+                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
+                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
+                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
+                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
+                    pos->last_kcp_xmit = pos->kcp->xmit;
+                    pos->last_rekeys_initiated = pos->rekeys_initiated;
+                    pos->last_rekeys_completed = pos->rekeys_completed;
+                } else if (now_ms - pos->last_stat_ms >= get_stats_interval_ms()) {
+                    uint64_t dt = now_ms - pos->last_stat_ms;
+                    uint64_t d_tcp_rx = pos->tcp_rx_bytes - pos->last_tcp_rx_bytes;
+                    uint64_t d_tcp_tx = pos->tcp_tx_bytes - pos->last_tcp_tx_bytes;
+                    uint64_t d_kcp_tx = pos->kcp_tx_bytes - pos->last_kcp_tx_bytes;
+                    uint64_t d_kcp_rx = pos->kcp_rx_bytes - pos->last_kcp_rx_bytes;
+                    uint32_t d_xmit = pos->kcp->xmit - pos->last_kcp_xmit;
+                    uint32_t d_rekey_i =
+                        pos->rekeys_initiated - pos->last_rekeys_initiated;
+                    uint32_t d_rekey_c =
+                        pos->rekeys_completed - pos->last_rekeys_completed;
+                    double sec = (double)dt / 1000.0;
+                    double tcp_in_mbps =
+                        sec > 0 ? (double)d_tcp_rx * 8.0 / (sec * 1e6) : 0.0;
+                    double tcp_out_mbps =
+                        sec > 0 ? (double)d_tcp_tx * 8.0 / (sec * 1e6) : 0.0;
+                    double kcp_in_mbps =
+                        sec > 0 ? (double)d_kcp_rx * 8.0 / (sec * 1e6) : 0.0;
+                    double kcp_out_mbps =
+                        sec > 0 ? (double)d_kcp_tx * 8.0 / (sec * 1e6) : 0.0;
+                    P_LOG_INFO(
+                        "stats conv=%u: TCP in=%.3f Mbps out=%.3f Mbps | "
+                        "KCP payload in=%.3f Mbps out=%.3f Mbps | KCP "
+                        "xmit_delta=%u RTT=%dms | rekey i=%u c=%u",
+                        pos->conv, tcp_in_mbps, tcp_out_mbps, kcp_in_mbps,
+                        kcp_out_mbps, d_xmit, pos->kcp->rx_srtt, d_rekey_i,
+                        d_rekey_c);
+                    pos->last_stat_ms = now_ms;
+                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
+                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
+                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
+                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
+                    pos->last_kcp_xmit = pos->kcp->xmit;
+                    pos->last_rekeys_initiated = pos->rekeys_initiated;
+                    pos->last_rekeys_completed = pos->rekeys_completed;
+                }
+            }
+            if (pos->state == S_CLOSING) {
+                if (get_stats_dump_enabled()) {
+                    P_LOG_INFO(
+                        "stats total conv=%u: tcp_rx=%llu tcp_tx=%llu "
+                        "udp_rx=%llu udp_tx=%llu kcp_rx_msgs=%llu "
+                        "kcp_tx_msgs=%llu kcp_rx_bytes=%llu "
+                        "kcp_tx_bytes=%llu rekeys_i=%u rekeys_c=%u",
+                        pos->conv, (unsigned long long)pos->tcp_rx_bytes,
+                        (unsigned long long)pos->tcp_tx_bytes,
+                        (unsigned long long)pos->udp_rx_bytes,
+                        (unsigned long long)pos->udp_tx_bytes,
+                        (unsigned long long)pos->kcp_rx_msgs,
+                        (unsigned long long)pos->kcp_tx_msgs,
+                        (unsigned long long)pos->kcp_rx_bytes,
+                        (unsigned long long)pos->kcp_tx_bytes,
+                        pos->rekeys_initiated, pos->rekeys_completed);
+                }
+                (void)ep_del(epfd, pos->svr_sock);
+                kcp_map_del(&cmap, pos->conv);
+                if (pos->kcp)
+                    ikcp_release(pos->kcp);
+                close(pos->svr_sock);
+                if (pos->request.data)
+                    free(pos->request.data);
+                if (pos->response.data)
+                    free(pos->response.data);
+                if (pos->udp_backlog.data)
+                    free(pos->udp_backlog.data);
+                list_del(&pos->list);
+                free(pos);
+            }
+        }
+    }
+
+    rc = 0;
 
 cleanup:
-        if (usock >= 0)
-            close(usock);
-        if (epfd >= 0)
-            epoll_close_comp(epfd);
-        kcp_map_free(&cmap);
-        cleanup_pidfile();
-        return rc;
-    }
+    if (usock >= 0)
+        close(usock);
+    if (epfd >= 0)
+        epoll_close_comp(epfd);
+    kcp_map_free(&cmap);
+    cleanup_pidfile();
+    return rc;
 }
