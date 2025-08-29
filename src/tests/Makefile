@@ -2,7 +2,7 @@ CC ?= $(CROSS_COMPILE)gcc
 CFLAGS += -Wall -Wextra -I.. -I../3rd/chacha20poly1305
 
 # Reuse project objects for AEAD
-AEADOBJS = ../aead.o ../3rd/chacha20poly1305/chacha20poly1305.o
+AEADOBJS = ../aead.o ../anti_replay.o ../3rd/chacha20poly1305/chacha20poly1305.o
 
 all: test_aead test_replay tcp_echo it_kcp
 
