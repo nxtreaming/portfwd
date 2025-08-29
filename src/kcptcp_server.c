@@ -382,8 +382,8 @@ int main(int argc, char **argv) {
                         if (res > 0) { // Control packet handled
                             if (c->svr_in_eof && !c->svr2cli_shutdown &&
                                 c->response.dlen == c->response.rpos &&
-                                c->cli_sock > 0) {
-                                shutdown(c->cli_sock, SHUT_WR);
+                                c->svr_sock > 0) {
+                                shutdown(c->svr_sock, SHUT_WR);
                                 c->svr2cli_shutdown = true;
                             }
                             continue;
