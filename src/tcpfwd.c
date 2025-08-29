@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -25,9 +26,13 @@
 #include <linux/netfilter_ipv4.h>
 #endif
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Constants and Tunables */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 
-/* Tunables for throughput */
+/* Buffer size tunables for throughput */
 #ifndef TCP_PROXY_USERBUF_CAP
 #define TCP_PROXY_USERBUF_CAP (64 * 1024)
 #endif
@@ -35,8 +40,7 @@
 #define TCP_PROXY_SOCKBUF_CAP (256 * 1024)
 #endif
 
-/* Backpressure watermark: when opposite TX backlog exceeds this, limit further
- * reads */
+/* Backpressure watermark: when opposite TX backlog exceeds this, limit further reads */
 #ifndef TCP_PROXY_BACKPRESSURE_WM
 #define TCP_PROXY_BACKPRESSURE_WM (TCP_PROXY_USERBUF_CAP * 3 / 4)
 #endif
@@ -55,10 +59,13 @@
 /* Memory pool for connection objects (default) */
 #define TCP_PROXY_CONN_POOL_SIZE 4096
 
+/* Magic numbers for epoll event identification */
 #define EV_MAGIC_LISTENER 0xdeadbeefU
 #define EV_MAGIC_CLIENT 0xfeedfaceU
 #define EV_MAGIC_SERVER 0xbaadcafeU
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Data Structures */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 struct config {
@@ -79,6 +86,10 @@ struct conn_pool {
     int used_count;
 };
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Global Variables */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 static struct conn_pool g_conn_pool;
 
 /* Runtime tunables (overridable via CLI) */
@@ -90,9 +101,16 @@ static int g_ka_intvl = TCP_PROXY_KEEPALIVE_INTVL;
 static int g_ka_cnt = TCP_PROXY_KEEPALIVE_CNT;
 static int g_backpressure_wm = TCP_PROXY_BACKPRESSURE_WM;
 
-/* Forward declaration */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Function Declarations */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd,
                              struct epoll_event *ev);
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Utility Functions */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static void set_sock_buffers(int sockfd) {
     int sz = g_sockbuf_cap_runtime;
@@ -132,6 +150,20 @@ static void set_tcp_nodelay(int sockfd) {
     }
 }
 
+static int safe_close(int fd) {
+    if (fd < 0)
+        return 0;
+    for (;;) {
+        if (close(fd) == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Connection Pool Management */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static int init_conn_pool(void) {
@@ -199,17 +231,9 @@ static inline struct proxy_conn *alloc_proxy_conn(void) {
     return conn;
 }
 
-static int safe_close(int fd) {
-    if (fd < 0)
-        return 0;
-    for (;;) {
-        if (close(fd) == 0)
-            return 0;
-        if (errno == EINTR)
-            continue;
-        return -1;
-    }
-}
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Connection Management */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static void release_proxy_conn(struct proxy_conn *conn,
                                struct epoll_event *events, int *nfds,
@@ -362,6 +386,10 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     ep_add_or_mod(epfd, conn->svr_sock, &ev_svr);
 }
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Proxy Connection Creation and Management */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 static struct proxy_conn *
 create_proxy_conn(struct config *cfg, int cli_sock,
                   const union sockaddr_inx *cli_addr) {
@@ -496,10 +524,10 @@ create_proxy_conn(struct config *cfg, int cli_sock,
                 conn->s2c_pipe[1] = p2[1];
                 conn->use_splice = true;
             } else {
-                if (p1[0] > -1) close(p1[0]);
-                if (p1[1] > -1) close(p1[1]);
-                if (p2[0] > -1) close(p2[0]);
-                if (p2[1] > -1) close(p2[1]);
+                if (p1[0] > -1) safe_close(p1[0]);
+                if (p1[1] > -1) safe_close(p1[1]);
+                if (p2[0] > -1) safe_close(p2[0]);
+                if (p2[1] > -1) safe_close(p2[1]);
             }
         }
 #endif
@@ -519,10 +547,10 @@ create_proxy_conn(struct config *cfg, int cli_sock,
                 conn->s2c_pipe[1] = p2[1];
                 conn->use_splice = true;
             } else {
-                if (p1[0] > -1) close(p1[0]);
-                if (p1[1] > -1) close(p1[1]);
-                if (p2[0] > -1) close(p2[0]);
-                if (p2[1] > -1) close(p2[1]);
+                if (p1[0] > -1) safe_close(p1[0]);
+                if (p1[1] > -1) safe_close(p1[1]);
+                if (p2[0] > -1) safe_close(p2[0]);
+                if (p2[1] > -1) safe_close(p2[1]);
             }
         }
 #endif
@@ -541,6 +569,10 @@ err:
         release_proxy_conn(conn, NULL, 0, -1);
     return NULL;
 }
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Connection State Handlers */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static int handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
                                     struct epoll_event *ev) {
@@ -795,6 +827,10 @@ err:
     return 0;
 }
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Event Handling Functions */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 static void handle_new_connection(int listen_sock, int epfd,
                                   struct config *cfg) {
     for (;;) {
@@ -894,6 +930,10 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg) {
     return 0;
 }
 
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Help and Main Function */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 static void show_help(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <src_addr> <dst_addr>", prog);
     P_LOG_INFO("  <src_addr>, <dst_addr>    -- IPv4/IPv6 address with port, "
@@ -930,14 +970,17 @@ static void show_help(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
+    /* Local variables */
     int rc = 1;
     struct config cfg;
     int listen_sock = -1, epfd = -1;
     uint32_t magic_listener = EV_MAGIC_LISTENER;
 
+    /* Initialize configuration with defaults */
     memset(&cfg, 0, sizeof(cfg));
     cfg.reuse_addr = true;
 
+    /* Parse command line arguments */
     int opt;
     while ((opt = getopt(argc, argv, "dp:brR6hC:U:S:I:N:K:")) != -1) {
         switch (opt) {
@@ -1073,19 +1116,23 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Initialize logging */
     openlog("tcpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
     /* Recompute backpressure WM if userbuf changed */
     g_backpressure_wm = (g_userbuf_cap_runtime * 3) / 4;
 
+    /* Initialize connection pool */
     if (init_conn_pool() != 0) {
         closelog();
         return 1;
     }
 
+    /* Daemonize if requested */
     if (cfg.daemonize && do_daemonize() != 0)
         goto cleanup;
 
+    /* Write PID file if specified */
     if (cfg.pidfile) {
         if (write_pidfile(cfg.pidfile) < 0) {
             rc = 1;
@@ -1093,13 +1140,17 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Set up signal handlers */
     setup_signal_handlers();
 
+    /* Create listening socket */
     listen_sock = socket(cfg.src_addr.sa.sa_family, SOCK_STREAM, 0);
     if (listen_sock < 0) {
         P_LOG_ERR("socket(): %s", strerror(errno));
         goto cleanup;
     }
+
+    /* Configure socket options */
 
     if (cfg.reuse_addr) {
         int on = 1;
@@ -1135,6 +1186,7 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    /* Start listening */
     if (listen(listen_sock, 128) < 0) {
         P_LOG_ERR("listen(): %s", strerror(errno));
         goto cleanup;
@@ -1142,7 +1194,7 @@ int main(int argc, char *argv[]) {
 
     set_nonblock(listen_sock);
 
-    /* Prefer epoll_create1 with CLOEXEC when available */
+    /* Create epoll instance */
 #ifdef EPOLL_CLOEXEC
     epfd = epoll_create1(EPOLL_CLOEXEC);
     if (epfd < 0 && (errno == ENOSYS || errno == EINVAL))
@@ -1155,11 +1207,11 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    /* Add listening socket to epoll */
     struct epoll_event ev;
     ev.events = EPOLLIN;
 #ifdef EPOLLEXCLUSIVE
-    /* Reduce thundering herd with multiple processes listening on the same
-     * socket */
+    /* Reduce thundering herd with multiple processes listening on the same socket */
     ev.events |= EPOLLEXCLUSIVE;
 #endif
     ev.data.ptr = &magic_listener;
@@ -1170,9 +1222,11 @@ int main(int argc, char *argv[]) {
 
     P_LOG_INFO("TCP forwarding started.");
 
+    /* Run main event loop */
     rc = proxy_loop(epfd, listen_sock, &cfg);
 
 cleanup:
+    /* Cleanup resources */
     if (listen_sock >= 0) {
         if (close(listen_sock) < 0) {
             P_LOG_WARN("close(listen_sock=%d): %s", listen_sock,
