@@ -40,7 +40,8 @@
 #define UDP_PROXY_BATCH_SZ 16
 #endif
 #ifndef UDP_PROXY_DGRAM_CAP
-#define UDP_PROXY_DGRAM_CAP 65536
+/* Max safe UDP payload size: 65535 - 8 (UDP header) - 20 (IPv4 header) */
+#define UDP_PROXY_DGRAM_CAP 65507
 #endif
 #endif
 
@@ -96,6 +97,18 @@ static LIST_HEAD(g_lru_list);
 static time_t g_now_ts;
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+static int safe_close(int fd) {
+    if (fd < 0)
+        return 0;
+    for (;;) {
+        if (close(fd) == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+}
 
 static void proxy_conn_walk_continue(const struct config *cfg,
                                      unsigned walk_max, int epfd);
@@ -180,8 +193,12 @@ static void destroy_conn_pool(void) {
 
 static void set_sock_buffers(int sockfd) {
     int sz = g_sockbuf_cap_runtime;
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
-    (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) < 0) {
+        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
+    }
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz)) < 0) {
+        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
+    }
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -201,14 +218,21 @@ static uint32_t hash_addr(const union sockaddr_inx *a) {
         struct {
             uint32_t addr;
             uint16_t port;
-        } k = {a->sin.sin_addr.s_addr, a->sin.sin_port};
+        } k;
+        memset(&k, 0, sizeof(k));
+        k.addr = a->sin.sin_addr.s_addr;
+        k.port = a->sin.sin_port;
         return fnv1a_32_hash(&k, sizeof(k));
     } else if (a->sa.sa_family == AF_INET6) {
         struct {
             struct in6_addr addr;
             uint16_t port;
             uint32_t scope;
-        } k = {a->sin6.sin6_addr, a->sin6.sin6_port, a->sin6.sin6_scope_id};
+        } k;
+        memset(&k, 0, sizeof(k));
+        k.addr = a->sin6.sin6_addr;
+        k.port = a->sin6.sin6_port;
+        k.scope = a->sin6.sin6_scope_id;
         return fnv1a_32_hash(&k, sizeof(k));
     }
     return 0;
@@ -216,7 +240,8 @@ static uint32_t hash_addr(const union sockaddr_inx *a) {
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Move to MRU (tail) and refresh timestamp */
-    conn->last_active = g_now_ts ? g_now_ts : time(NULL);
+    time_t snap = g_now_ts;
+    conn->last_active = snap ? snap : time(NULL);
     list_del(&conn->lru);
     list_add_tail(&conn->lru, &g_lru_list);
 }
@@ -316,7 +341,7 @@ proxy_conn_get_or_create(const struct config *cfg,
 
 err:
     if (svr_sock >= 0) {
-        if (close(svr_sock) < 0) {
+        if (safe_close(svr_sock) < 0) {
             P_LOG_WARN("close(svr_sock=%d): %s", svr_sock, strerror(errno));
         }
     }
@@ -342,7 +367,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
         P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock,
                    strerror(errno));
     }
-    if (close(conn->svr_sock) < 0) {
+    if (safe_close(conn->svr_sock) < 0) {
         P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock, strerror(errno));
     }
     release_proxy_conn_to_pool(conn);
@@ -357,10 +382,14 @@ static void proxy_conn_walk_continue(const struct config *cfg,
         return;
 
     while (walked < walk_max && !list_empty(&g_lru_list)) {
-        struct proxy_conn *oldest =
-            list_first_entry(&g_lru_list, struct proxy_conn, lru);
-        if ((unsigned)(now - oldest->last_active) <= cfg->proxy_conn_timeo)
-            break; /* oldest not expired -> none later are expired */
+        struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
+        {
+            long diff = (long)(now - oldest->last_active);
+            if (diff < 0)
+                diff = 0;
+            if ((unsigned)diff <= cfg->proxy_conn_timeo)
+                break; /* oldest not expired -> none later are expired */
+        }
         {
             union sockaddr_inx addr = oldest->cli_addr;
             char s_addr[50] = "";
@@ -468,11 +497,25 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     }
                 }
                 if (batch_idx == -1) {
+                    if (num_batches >= UDP_PROXY_BATCH_SZ) {
+                        ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                            P_LOG_WARN("send(server, overflow): %s", strerror(errno));
+                        }
+                        continue;
+                    }
                     batch_idx = num_batches++;
                     batches[batch_idx].sock = conn->svr_sock;
                     batches[batch_idx].count = 0;
                 }
-                batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+                if (batches[batch_idx].count >= UDP_PROXY_BATCH_SZ) {
+                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        P_LOG_WARN("send(server, batch_full): %s", strerror(errno));
+                    }
+                } else {
+                    batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+                }
             }
 
             for (int i = 0; i < num_batches; i++) {
@@ -486,6 +529,8 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
 
                 /* Retry on partial send to avoid dropping remaining packets */
                 int remaining = b->count;
+                if (remaining > g_batch_sz_runtime)
+                    remaining = g_batch_sz_runtime;
                 struct mmsghdr *msgp = s_msgs;
                 do {
                     int sent = sendmmsg(b->sock, msgp, remaining, 0);
@@ -546,7 +591,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
     /* Use recvmmsg() to batch receive from server and sendmmsg() to client */
     struct mmsghdr msgs[UDP_PROXY_BATCH_SZ];
     struct iovec iovs[UDP_PROXY_BATCH_SZ];
-    static __thread char bufs[UDP_PROXY_BATCH_SZ][UDP_PROXY_DGRAM_CAP];
+    static char bufs[UDP_PROXY_BATCH_SZ][UDP_PROXY_DGRAM_CAP];
 
     int iterations = 0;
     const int max_iterations = 64; /* fairness cap per event */
@@ -1024,7 +1069,7 @@ int main(int argc, char *argv[]) {
         time_t current_ts = time(NULL);
 
         /* Timeout check and recycle */
-        if ((unsigned)(current_ts - last_check) >= 2) {
+        if ((long)(current_ts - last_check) >= 2) {
             proxy_conn_walk_continue(&cfg, 200, epfd);
             last_check = current_ts;
         }
@@ -1052,10 +1097,11 @@ int main(int argc, char *argv[]) {
 
             if (evp->data.ptr == NULL) {
                 /* Data from client */
-                if (evp->events & (EPOLLERR | EPOLLHUP)) {
-                    P_LOG_WARN("listener: EPOLLERR/HUP");
-                    continue;
-                }
+            if (evp->events & (EPOLLERR | EPOLLHUP)) {
+                P_LOG_ERR("listener: EPOLLERR/HUP");
+                rc = 1;
+                goto cleanup;
+            }
 #ifdef __linux__
                 handle_client_data(&cfg, lsn_sock, epfd, c_msgs, s_msgs, s_iovs,
                                    c_bufs);
@@ -1077,7 +1123,7 @@ int main(int argc, char *argv[]) {
 
 cleanup:
     if (lsn_sock >= 0) {
-        if (close(lsn_sock) < 0) {
+        if (safe_close(lsn_sock) < 0) {
             P_LOG_WARN("close(lsn_sock=%d): %s", lsn_sock, strerror(errno));
         }
     }
