@@ -93,8 +93,23 @@ static int g_batch_sz_runtime = UDP_PROXY_BATCH_SZ; /* for recvmmsg/sendmmsg */
 /* Global LRU list for O(1) oldest selection */
 static LIST_HEAD(g_lru_list);
 
-/* Cached current timestamp to avoid frequent time() syscalls on hot path */
+/* Cached current timestamp (monotonic seconds on Linux) for hot paths */
 static time_t g_now_ts;
+
+/* Simple monotonic-seconds helper (Linux) with portable fallback */
+static inline time_t monotonic_seconds(void) {
+#ifdef __linux__
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (time_t)ts.tv_sec;
+    /* Fallback if clock_gettime fails */
+#endif
+    return time(NULL);
+}
+
+/* Stats: batch overflow immediate-sends (client->server) */
+static uint64_t g_stat_c2s_batch_socket_overflow;
+static uint64_t g_stat_c2s_batch_entry_overflow;
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
@@ -241,7 +256,7 @@ static uint32_t hash_addr(const union sockaddr_inx *a) {
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Move to MRU (tail) and refresh timestamp */
     time_t snap = g_now_ts;
-    conn->last_active = snap ? snap : time(NULL);
+    conn->last_active = snap ? snap : monotonic_seconds();
     list_del(&conn->lru);
     list_add_tail(&conn->lru, &g_lru_list);
 }
@@ -336,7 +351,7 @@ proxy_conn_get_or_create(const struct config *cfg,
     P_LOG_INFO("New UDP session for [%s]:%d, total %u", s_addr,
                ntohs(*port_of_sockaddr(cli_addr)), conn_tbl_len);
 
-    conn->last_active = time(NULL);
+    conn->last_active = monotonic_seconds();
     return conn;
 
 err:
@@ -376,7 +391,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
 static void proxy_conn_walk_continue(const struct config *cfg,
                                      unsigned walk_max, int epfd) {
     unsigned walked = 0;
-    time_t now = g_now_ts ? g_now_ts : time(NULL);
+    time_t now = g_now_ts ? g_now_ts : monotonic_seconds();
 
     if (list_empty(&g_lru_list))
         return;
@@ -498,6 +513,7 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                 }
                 if (batch_idx == -1) {
                     if (num_batches >= UDP_PROXY_BATCH_SZ) {
+                        g_stat_c2s_batch_socket_overflow++;
                         ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                         if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                             P_LOG_WARN("send(server, overflow): %s", strerror(errno));
@@ -509,6 +525,7 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     batches[batch_idx].count = 0;
                 }
                 if (batches[batch_idx].count >= UDP_PROXY_BATCH_SZ) {
+                    g_stat_c2s_batch_entry_overflow++;
                     ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                     if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                         P_LOG_WARN("send(server, batch_full): %s", strerror(errno));
@@ -1044,7 +1061,7 @@ int main(int argc, char *argv[]) {
         INIT_LIST_HEAD(&conn_tbl_hbase[i]);
     conn_tbl_len = 0;
 
-    last_check = time(NULL);
+    last_check = monotonic_seconds();
 
     /* Optional Linux batching init */
 #ifdef __linux__
@@ -1066,7 +1083,7 @@ int main(int argc, char *argv[]) {
 
     for (;;) {
         int nfds;
-        time_t current_ts = time(NULL);
+        time_t current_ts = monotonic_seconds();
 
         /* Timeout check and recycle */
         if ((long)(current_ts - last_check) >= 2) {
@@ -1133,6 +1150,11 @@ cleanup:
 #ifdef __linux__
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
 #endif
+    if (g_stat_c2s_batch_socket_overflow || g_stat_c2s_batch_entry_overflow) {
+        P_LOG_INFO("c2s batch overflows: sockets=%" PRIu64 ", entries=%" PRIu64,
+                   g_stat_c2s_batch_socket_overflow,
+                   g_stat_c2s_batch_entry_overflow);
+    }
     closelog();
 
     return rc;
