@@ -114,6 +114,7 @@ static void client_handle_udp_events(struct client_ctx *ctx,
         if (!c->kcp_ready && rn >= (ssize_t)(1 + 1 + 4 + 16) &&
             (unsigned char)ubuf[0] == (unsigned char)KTP_HS_ACCEPT &&
             (unsigned char)ubuf[1] == (unsigned char)KCP_HS_VER) {
+            /* Read BE32 */
             uint32_t conv = (uint32_t)((unsigned char)ubuf[2] << 24 |
                                        (unsigned char)ubuf[3] << 16 |
                                        (unsigned char)ubuf[4] << 8 |
@@ -153,6 +154,12 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                         c->response.capacity = c->response.dlen =
                             c->response.rpos = 0;
                     }
+                    if (c->udp_backlog.data) {
+                        free(c->udp_backlog.data);
+                        c->udp_backlog.data = NULL;
+                        c->udp_backlog.capacity = c->udp_backlog.dlen =
+                            c->udp_backlog.rpos = 0;
+                    }
                     c->state = S_CLOSING;
                     break;
                 }
@@ -191,10 +198,13 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             /* Not ready and not ACCEPT: ignore */
             continue;
         }
-        (void)ikcp_input(c->kcp, ubuf, (long)rn);
-        fed_kcp = true;
+        if (c->kcp) {
+            (void)ikcp_input(c->kcp, ubuf, (long)rn);
+            fed_kcp = true;
+        }
     }
-    if (fed_kcp) {
+
+    if (fed_kcp && c->kcp) {
         /* Drain KCP to TCP once after ingesting all UDP */
         for (;;) {
             int peek = ikcp_peeksize(c->kcp);
