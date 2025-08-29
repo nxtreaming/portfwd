@@ -261,7 +261,7 @@ static void fill_pattern(unsigned char *b, size_t n, unsigned seed) {
 int main(int argc, char **argv) {
     char *cli_log = NULL, *srv_log = NULL;
     size_t cli_len = 0, srv_len = 0;
-    
+
     const char *psk = getenv("IT_PSK");
     if (!psk)
         psk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"

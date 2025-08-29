@@ -17,27 +17,28 @@ int secure_random_bytes(uint8_t *buf, size_t len) {
 
 #ifdef _WIN32
     HCRYPTPROV hProv = 0;
-    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL,
+                             CRYPT_VERIFYCONTEXT)) {
         return -1;
     }
-    
+
     BOOL success = CryptGenRandom(hProv, (DWORD)len, buf);
     CryptReleaseContext(hProv, 0);
-    
+
     return success ? 0 : -1;
-    
+
 #elif defined(__linux__) && defined(SYS_getrandom)
     // Use getrandom() syscall on Linux if available
     ssize_t result = getrandom(buf, len, 0);
     return (result == (ssize_t)len) ? 0 : -1;
-    
+
 #else
     // Fallback to /dev/urandom
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) {
         return -1;
     }
-    
+
     size_t total = 0;
     while (total < len) {
         ssize_t n = read(fd, buf + total, len - total);
@@ -50,7 +51,7 @@ int secure_random_bytes(uint8_t *buf, size_t len) {
         }
         total += (size_t)n;
     }
-    
+
     close(fd);
     return 0;
 #endif

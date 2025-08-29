@@ -5,7 +5,8 @@ void anti_replay_init(struct anti_replay_detector *d) {
     d->last_seq = 0;
 }
 
-bool anti_replay_check_and_update(struct anti_replay_detector *d, uint32_t seq) {
+bool anti_replay_check_and_update(struct anti_replay_detector *d,
+                                  uint32_t seq) {
     if (seq > d->last_seq) {
         uint32_t diff = seq - d->last_seq;
         if (diff < ANTI_REPLAY_WINDOW_SIZE) {

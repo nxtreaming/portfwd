@@ -17,9 +17,12 @@ uint32_t get_stats_interval_ms(void) {
     if (cached == 0) {
         const char *s = getenv("PFWD_STATS_INTERVAL_MS");
         long v = s ? strtol(s, NULL, 10) : 0;
-        if (v <= 0) v = 5000; /* default 5s */
-        if (v < 100) v = 100; /* clamp */
-        if (v > 600000) v = 600000; /* 10 minutes */
+        if (v <= 0)
+            v = 5000; /* default 5s */
+        if (v < 100)
+            v = 100; /* clamp */
+        if (v > 600000)
+            v = 600000; /* 10 minutes */
         cached = (uint32_t)v;
     }
     return cached;
@@ -27,7 +30,8 @@ uint32_t get_stats_interval_ms(void) {
 
 void kcptcp_tune_tcp_socket(int fd, int sockbuf_bytes, bool tcp_nodelay,
                             bool keepalive) {
-    if (fd < 0) return;
+    if (fd < 0)
+        return;
     set_nonblock(fd);
     set_sock_buffers_sz(fd, sockbuf_bytes);
     if (keepalive) {
@@ -46,13 +50,20 @@ void kcptcp_tune_tcp_socket(int fd, int sockbuf_bytes, bool tcp_nodelay,
 
 void kcp_opts_apply_overrides(struct kcp_opts *o, int mtu, int nd, int it,
                               int rs, int nc, int snd, int rcv) {
-    if (mtu > 0) o->mtu = mtu;
-    if (nd >= 0) o->nodelay = nd;
-    if (it >= 0) o->interval_ms = it;
-    if (rs >= 0) o->resend = rs;
-    if (nc >= 0) o->nc = nc;
-    if (snd >= 0) o->sndwnd = snd;
-    if (rcv >= 0) o->rcvwnd = rcv;
+    if (mtu > 0)
+        o->mtu = mtu;
+    if (nd >= 0)
+        o->nodelay = nd;
+    if (it >= 0)
+        o->interval_ms = it;
+    if (rs >= 0)
+        o->resend = rs;
+    if (nc >= 0)
+        o->nc = nc;
+    if (snd >= 0)
+        o->sndwnd = snd;
+    if (rcv >= 0)
+        o->rcvwnd = rcv;
 }
 
 int kcptcp_compute_kcp_timeout_ms(struct list_head *conns, int default_ms) {
@@ -60,16 +71,18 @@ int kcptcp_compute_kcp_timeout_ms(struct list_head *conns, int default_ms) {
     uint32_t now = kcp_now_ms();
     struct proxy_conn *pc;
     list_for_each_entry(pc, conns, list) {
-        if (!pc->kcp) continue;
+        if (!pc->kcp)
+            continue;
         uint32_t due = ikcp_check(pc->kcp, now);
         int t = (int)((due > now) ? (due - now) : 0);
-        if (t < timeout_ms) timeout_ms = t;
+        if (t < timeout_ms)
+            timeout_ms = t;
     }
     return timeout_ms;
 }
 
-int kcptcp_ep_register(int epfd, int fd, void *ptr,
-                       uint32_t base_events, uint32_t extra_events) {
+int kcptcp_ep_register(int epfd, int fd, void *ptr, uint32_t base_events,
+                       uint32_t extra_events) {
     struct epoll_event ev = {0};
     ev.events = base_events | extra_events;
     ev.data.ptr = ptr;
@@ -78,36 +91,44 @@ int kcptcp_ep_register(int epfd, int fd, void *ptr,
 
 bool get_stats_dump_enabled(void) {
     const char *s = getenv("PFWD_STATS_DUMP");
-    if (!s) return false;
+    if (!s)
+        return false;
     return !(s[0] == '0');
 }
 
 bool get_stats_enabled(void) {
     const char *s = getenv("PFWD_STATS_ENABLE");
-    if (!s) return true; /* default enabled */
+    if (!s)
+        return true; /* default enabled */
     return !(s[0] == '0');
 }
 
 void set_sock_buffers_sz(int sockfd, int bytes) {
-    if (bytes <= 0) return;
+    if (bytes <= 0)
+        return;
     (void)setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
 }
 
 static int hex2nibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
     return -1;
 }
 
 bool parse_psk_hex32(const char *hex, uint8_t out[32]) {
     size_t n = strlen(hex);
-    if (n != 64) return false;
+    if (n != 64)
+        return false;
     for (size_t i = 0; i < 32; ++i) {
         int hi = hex2nibble(hex[2 * i]);
         int lo = hex2nibble(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0) return false;
+        if (hi < 0 || lo < 0)
+            return false;
         out[i] = (uint8_t)((hi << 4) | lo);
     }
     return true;
@@ -138,9 +159,11 @@ bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win,
         return true;
     }
     int32_t behind = -d;
-    if (behind >= 64) return false;
+    if (behind >= 64)
+        return false;
     uint64_t bit = 1ULL << behind;
-    if (mask & bit) return false; /* replay */
+    if (mask & bit)
+        return false; /* replay */
     mask |= bit;
     *p_win = win;
     *p_mask = mask;
@@ -148,17 +171,15 @@ bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win,
 }
 
 bool aead_next_send_seq(struct proxy_conn *c, uint32_t *out_seq) {
-    if (c->send_seq == UINT32_MAX) return false;
+    if (c->send_seq == UINT32_MAX)
+        return false;
     *out_seq = c->send_seq++;
     return true;
 }
 
 /* Socket setup helpers */
-int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr,
-                              bool reuse_addr,
-                              bool reuse_port,
-                              bool v6only,
-                              int sockbuf_bytes,
+int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr, bool reuse_addr,
+                              bool reuse_port, bool v6only, int sockbuf_bytes,
                               int backlog) {
     int fd = -1;
     fd = socket(addr->sa.sa_family, SOCK_STREAM, 0);
@@ -198,11 +219,8 @@ int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr,
     return fd;
 }
 
-int kcptcp_setup_udp_listener(const union sockaddr_inx *addr,
-                              bool reuse_addr,
-                              bool reuse_port,
-                              bool v6only,
-                              int sockbuf_bytes) {
+int kcptcp_setup_udp_listener(const union sockaddr_inx *addr, bool reuse_addr,
+                              bool reuse_port, bool v6only, int sockbuf_bytes) {
     int fd = -1;
     fd = socket(addr->sa.sa_family, SOCK_DGRAM, 0);
     if (fd < 0) {
@@ -268,11 +286,11 @@ int kcptcp_create_tcp_socket(int family, int sockbuf_bytes, bool tcp_nodelay) {
 
 /* ---------------- Common CLI parsing (shared) ---------------- */
 int kcptcp_parse_common_opts(int argc, char **argv,
-                             struct kcptcp_common_cli *out,
-                             int *pos_start,
+                             struct kcptcp_common_cli *out, int *pos_start,
                              bool is_server) {
     (void)is_server; /* currently unused, reserved for divergence */
-    if (!out) return 0;
+    if (!out)
+        return 0;
     memset(out, 0, sizeof(*out));
     out->reuse_addr = false;
     out->reuse_port = false;
@@ -280,8 +298,8 @@ int kcptcp_parse_common_opts(int argc, char **argv,
     out->sockbuf_bytes = 0;
     out->tcp_nodelay = false;
     out->has_psk = false;
-    out->kcp_mtu = 0;   /* only apply if >0 */
-    out->kcp_nd = -1;   /* apply if >=0 */
+    out->kcp_mtu = 0; /* only apply if >0 */
+    out->kcp_nd = -1; /* apply if >=0 */
     out->kcp_it = -1;
     out->kcp_rs = -1;
     out->kcp_nc = -1;
@@ -313,70 +331,94 @@ int kcptcp_parse_common_opts(int argc, char **argv,
     */
     while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:h")) != -1) {
         switch (opt) {
-        case 'd': out->daemonize = true; break;
-        case 'p': out->pidfile = optarg; break;
-        case 'r': out->reuse_addr = true; break;
-        case 'R': out->reuse_port = true; break;
-        case '6': out->v6only = true; break;
+        case 'd':
+            out->daemonize = true;
+            break;
+        case 'p':
+            out->pidfile = optarg;
+            break;
+        case 'r':
+            out->reuse_addr = true;
+            break;
+        case 'R':
+            out->reuse_port = true;
+            break;
+        case '6':
+            out->v6only = true;
+            break;
         case 'b': {
             long v = strtol(optarg, NULL, 10);
-            if (v < 0) return 0;
+            if (v < 0)
+                return 0;
             out->sockbuf_bytes = (int)v;
             break;
         }
-        case 'N': out->tcp_nodelay = true; break;
+        case 'N':
+            out->tcp_nodelay = true;
+            break;
         case 'K': {
-            if (!parse_psk_hex32(optarg, out->psk)) return 0;
+            if (!parse_psk_hex32(optarg, out->psk))
+                return 0;
             out->has_psk = true;
             break;
         }
         case 'M': {
             long v = strtol(optarg, NULL, 10);
-            if (v <= 0) return 0;
+            if (v <= 0)
+                return 0;
             out->kcp_mtu = (int)v;
             break;
         }
         case 'n': {
             long v = strtol(optarg, NULL, 10);
-            if (v < 0) return 0;
+            if (v < 0)
+                return 0;
             out->kcp_nd = (int)v;
             break;
         }
         case 'I': {
             long v = strtol(optarg, NULL, 10);
-            if (v < 0) return 0;
+            if (v < 0)
+                return 0;
             out->kcp_it = (int)v;
             break;
         }
         case 'X': {
             long v = strtol(optarg, NULL, 10);
-            if (v < 0) return 0;
+            if (v < 0)
+                return 0;
             out->kcp_rs = (int)v;
             break;
         }
         case 'C': {
             long v = strtol(optarg, NULL, 10);
-            if (v < 0) return 0;
+            if (v < 0)
+                return 0;
             out->kcp_nc = (int)v;
             break;
         }
         case 'w': {
             long v = strtol(optarg, NULL, 10);
-            if (v < 0) return 0;
+            if (v < 0)
+                return 0;
             out->kcp_snd = (int)v;
             break;
         }
         case 'W': {
             long v = strtol(optarg, NULL, 10);
-            if (v < 0) return 0;
+            if (v < 0)
+                return 0;
             out->kcp_rcv = (int)v;
             break;
         }
-        case 'h': out->show_help = true; break;
+        case 'h':
+            out->show_help = true;
+            break;
         default:
             return 0;
         }
     }
-    if (pos_start) *pos_start = optind;
+    if (pos_start)
+        *pos_start = optind;
     return 1;
 }

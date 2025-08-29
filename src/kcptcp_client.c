@@ -54,16 +54,13 @@ struct client_ctx {
 
 static void client_handle_accept(struct client_ctx *ctx);
 static void client_handle_udp_events(struct client_ctx *ctx,
-                                     struct proxy_conn *c,
-                                     uint32_t evmask);
+                                     struct proxy_conn *c, uint32_t evmask);
 static void client_handle_tcp_events(struct client_ctx *ctx,
-                                     struct proxy_conn *c,
-                                     uint32_t evmask);
+                                     struct proxy_conn *c, uint32_t evmask);
 
 /* UDP socket events for a single connection */
 static void client_handle_udp_events(struct client_ctx *ctx,
-                                     struct proxy_conn *c,
-                                     uint32_t evmask) {
+                                     struct proxy_conn *c, uint32_t evmask) {
     if (!(evmask & EPOLLIN)) {
         return;
     }
@@ -151,7 +148,9 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             /* Flush any buffered request data */
             if (c->request.dlen > c->request.rpos) {
                 size_t remain = c->request.dlen - c->request.rpos;
-                if (aead_protocol_send_data(c, c->request.data + c->request.rpos, (int)remain, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+                if (aead_protocol_send_data(
+                        c, c->request.data + c->request.rpos, (int)remain,
+                        ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
                     c->state = S_CLOSING;
                     break;
                 }
@@ -159,7 +158,8 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             }
             /* If TCP already EOF, send FIN now */
             if (c->cli_in_eof) {
-                if (aead_protocol_send_fin(c, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+                if (aead_protocol_send_fin(c, ctx->cfg->psk,
+                                           ctx->cfg->has_psk) < 0) {
                     c->state = S_CLOSING;
                     break;
                 }
@@ -188,14 +188,17 @@ static void client_handle_udp_events(struct client_ctx *ctx,
 
             char *payload = NULL;
             int plen = 0;
-            int res = aead_protocol_handle_incoming_packet(c, ubuf, got, ctx->cfg->psk, ctx->cfg->has_psk, &payload, &plen);
+            int res = aead_protocol_handle_incoming_packet(
+                c, ubuf, got, ctx->cfg->psk, ctx->cfg->has_psk, &payload,
+                &plen);
 
             if (res < 0) { // Error
                 c->state = S_CLOSING;
                 break;
             }
             if (res > 0) { // Control packet handled
-                if (c->svr_in_eof && !c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
+                if (c->svr_in_eof && !c->svr2cli_shutdown &&
+                    c->response.dlen == c->response.rpos) {
                     shutdown(c->cli_sock, SHUT_WR);
                     c->svr2cli_shutdown = true;
                 }
@@ -212,18 +215,20 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                     /* Backpressure: buffer and enable EPOLLOUT */
                     size_t need = (size_t)plen;
-                    size_t freecap = (c->response.capacity > c->response.dlen)
-                                         ? (c->response.capacity -
-                                            c->response.dlen)
-                                         : 0;
+                    size_t freecap =
+                        (c->response.capacity > c->response.dlen)
+                            ? (c->response.capacity - c->response.dlen)
+                            : 0;
                     if (freecap < need) {
                         size_t ncap = c->response.capacity
                                           ? c->response.capacity * 2
                                           : INITIAL_BUFFER_SIZE;
                         if (ncap < c->response.dlen + need)
                             ncap = c->response.dlen + need;
-                        if (!buffer_size_check(c->response.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
-                            P_LOG_WARN("Response buffer size limit exceeded, closing connection");
+                        if (!buffer_size_check(c->response.capacity, ncap,
+                                               MAX_TCP_BUFFER_SIZE)) {
+                            P_LOG_WARN("Response buffer size limit exceeded, "
+                                       "closing connection");
                             c->state = S_CLOSING;
                             break;
                         }
@@ -239,8 +244,8 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                            (size_t)plen);
                     c->response.dlen += (size_t)plen;
                     struct epoll_event cev = (struct epoll_event){0};
-                    cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR |
-                                 EPOLLHUP;
+                    cev.events =
+                        EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
                     cev.data.ptr = c->cli_tag;
                     (void)ep_add_or_mod(ctx->epfd, c->cli_sock, &cev);
                     break;
@@ -251,8 +256,7 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 /* Short write: buffer remaining and enable EPOLLOUT */
                 size_t rem = (size_t)plen - (size_t)wn;
                 size_t freecap = (c->response.capacity > c->response.dlen)
-                                     ? (c->response.capacity -
-                                        c->response.dlen)
+                                     ? (c->response.capacity - c->response.dlen)
                                      : 0;
                 if (freecap < rem) {
                     size_t ncap = c->response.capacity
@@ -260,8 +264,10 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                                       : INITIAL_BUFFER_SIZE;
                     if (ncap < c->response.dlen + rem)
                         ncap = c->response.dlen + rem;
-                    if (!buffer_size_check(c->response.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
-                        P_LOG_WARN("Response buffer size limit exceeded, closing connection");
+                    if (!buffer_size_check(c->response.capacity, ncap,
+                                           MAX_TCP_BUFFER_SIZE)) {
+                        P_LOG_WARN("Response buffer size limit exceeded, "
+                                   "closing connection");
                         c->state = S_CLOSING;
                         break;
                     }
@@ -276,8 +282,8 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 memcpy(c->response.data + c->response.dlen, payload + wn, rem);
                 c->response.dlen += rem;
                 struct epoll_event cev = (struct epoll_event){0};
-                cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR |
-                             EPOLLHUP;
+                cev.events =
+                    EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
                 cev.data.ptr = c->cli_tag;
                 (void)ep_add_or_mod(ctx->epfd, c->cli_sock, &cev);
                 break;
@@ -311,7 +317,6 @@ static void client_handle_accept(struct client_ctx *ctx) {
             close(cs);
             continue;
         }
-
 
         /* Allocate connection */
         struct proxy_conn *c = (struct proxy_conn *)calloc(1, sizeof(*c));
@@ -394,15 +399,14 @@ static void client_handle_accept(struct client_ctx *ctx) {
         }
 
         list_add_tail(&c->list, ctx->conns);
-        P_LOG_INFO("accepted TCP %s, conv=%u",
-                   sockaddr_to_string(&ca), c->conv);
+        P_LOG_INFO("accepted TCP %s, conv=%u", sockaddr_to_string(&ca),
+                   c->conv);
     }
 }
 
 /* TCP client socket events for a single connection */
 static void client_handle_tcp_events(struct client_ctx *ctx,
-                                     struct proxy_conn *c,
-                                     uint32_t evmask) {
+                                     struct proxy_conn *c, uint32_t evmask) {
     if (evmask & (EPOLLERR | EPOLLHUP)) {
         c->state = S_CLOSING;
     }
@@ -432,7 +436,8 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
             cev.events = EPOLLIN | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
             cev.data.ptr = c->cli_tag;
             (void)ep_add_or_mod(ctx->epfd, c->cli_sock, &cev);
-            /* If we received FIN earlier, shutdown write now that buffer is drained */
+            /* If we received FIN earlier, shutdown write now that buffer is
+             * drained */
             if (c->svr_in_eof && !c->svr2cli_shutdown) {
                 shutdown(c->cli_sock, SHUT_WR);
                 c->svr2cli_shutdown = true;
@@ -450,18 +455,18 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
             if (!c->kcp_ready) {
                 /* buffer until KCP ready */
                 size_t need = (size_t)rn;
-                size_t freecap =
-                    (c->request.capacity > c->request.dlen)
-                        ? (c->request.capacity - c->request.dlen)
-                        : 0;
+                size_t freecap = (c->request.capacity > c->request.dlen)
+                                     ? (c->request.capacity - c->request.dlen)
+                                     : 0;
                 if (freecap < need) {
-                    size_t ncap = c->request.capacity
-                                      ? c->request.capacity * 2
-                                      : INITIAL_BUFFER_SIZE;
+                    size_t ncap = c->request.capacity ? c->request.capacity * 2
+                                                      : INITIAL_BUFFER_SIZE;
                     if (ncap < c->request.dlen + need)
                         ncap = c->request.dlen + need;
-                    if (!buffer_size_check(c->request.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
-                        P_LOG_WARN("Request buffer size limit exceeded, closing connection");
+                    if (!buffer_size_check(c->request.capacity, ncap,
+                                           MAX_TCP_BUFFER_SIZE)) {
+                        P_LOG_WARN("Request buffer size limit exceeded, "
+                                   "closing connection");
                         c->state = S_CLOSING;
                         break;
                     }
@@ -476,7 +481,8 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
                 memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
                 c->request.dlen += (size_t)rn;
             } else {
-                int sn = aead_protocol_send_data(c, tbuf, rn, ctx->cfg->psk, ctx->cfg->has_psk);
+                int sn = aead_protocol_send_data(c, tbuf, rn, ctx->cfg->psk,
+                                                 ctx->cfg->has_psk);
                 if (sn < 0) {
                     c->state = S_CLOSING;
                     break;
@@ -486,7 +492,8 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
         if (rn == 0) {
             /* TCP EOF: on handshake pending, defer FIN until ready */
             if (c->kcp_ready) {
-                (void)aead_protocol_send_fin(c, ctx->cfg->psk, ctx->cfg->has_psk);
+                (void)aead_protocol_send_fin(c, ctx->cfg->psk,
+                                             ctx->cfg->has_psk);
             }
             c->cli_in_eof = true;
             struct epoll_event cev = (struct epoll_event){0};
@@ -561,11 +568,16 @@ int main(int argc, char **argv) {
     cfg.sockbuf_bytes = opts.sockbuf_bytes;
     cfg.tcp_nodelay = opts.tcp_nodelay;
     cfg.has_psk = opts.has_psk;
-    if (opts.has_psk) memcpy(cfg.psk, opts.psk, 32);
+    if (opts.has_psk)
+        memcpy(cfg.psk, opts.psk, 32);
 
     kcp_mtu = opts.kcp_mtu;
-    kcp_nd = opts.kcp_nd; kcp_it = opts.kcp_it; kcp_rs = opts.kcp_rs;
-    kcp_nc = opts.kcp_nc; kcp_snd = opts.kcp_snd; kcp_rcv = opts.kcp_rcv;
+    kcp_nd = opts.kcp_nd;
+    kcp_it = opts.kcp_it;
+    kcp_rs = opts.kcp_rs;
+    kcp_nc = opts.kcp_nc;
+    kcp_snd = opts.kcp_snd;
+    kcp_rcv = opts.kcp_rcv;
 
     if (pos + 2 != argc) {
         print_usage(argv[0]);
@@ -601,10 +613,11 @@ int main(int argc, char **argv) {
     }
 
     /* Create TCP listen socket via shared helper */
-    lsock = kcptcp_setup_tcp_listener(&cfg.laddr, cfg.reuse_addr,
-                                      cfg.reuse_port, cfg.v6only,
-                                      cfg.sockbuf_bytes, 128);
-    if (lsock < 0) goto cleanup;
+    lsock =
+        kcptcp_setup_tcp_listener(&cfg.laddr, cfg.reuse_addr, cfg.reuse_port,
+                                  cfg.v6only, cfg.sockbuf_bytes, 128);
+    if (lsock < 0)
+        goto cleanup;
 
     if (kcptcp_ep_register_listener(epfd, lsock, &magic_listener) < 0) {
         P_LOG_ERR("epoll_ctl add listen: %s", strerror(errno));

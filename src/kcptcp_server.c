@@ -108,11 +108,16 @@ int main(int argc, char **argv) {
     cfg.sockbuf_bytes = opts.sockbuf_bytes;
     cfg.tcp_nodelay = opts.tcp_nodelay;
     cfg.has_psk = opts.has_psk;
-    if (opts.has_psk) memcpy(cfg.psk, opts.psk, 32);
+    if (opts.has_psk)
+        memcpy(cfg.psk, opts.psk, 32);
 
     kcp_mtu = opts.kcp_mtu;
-    kcp_nd = opts.kcp_nd; kcp_it = opts.kcp_it; kcp_rs = opts.kcp_rs;
-    kcp_nc = opts.kcp_nc; kcp_snd = opts.kcp_snd; kcp_rcv = opts.kcp_rcv;
+    kcp_nd = opts.kcp_nd;
+    kcp_it = opts.kcp_it;
+    kcp_rs = opts.kcp_rs;
+    kcp_nc = opts.kcp_nc;
+    kcp_snd = opts.kcp_snd;
+    kcp_rcv = opts.kcp_rcv;
 
     if (pos + 2 != argc) {
         print_usage(argv[0]);
@@ -148,10 +153,11 @@ int main(int argc, char **argv) {
     }
 
     /* Create UDP listen socket via shared helper */
-    usock = kcptcp_setup_udp_listener(&cfg.laddr, cfg.reuse_addr,
-                                      cfg.reuse_port, cfg.v6only,
-                                      cfg.sockbuf_bytes);
-    if (usock < 0) goto cleanup;
+    usock =
+        kcptcp_setup_udp_listener(&cfg.laddr, cfg.reuse_addr, cfg.reuse_port,
+                                  cfg.v6only, cfg.sockbuf_bytes);
+    if (usock < 0)
+        goto cleanup;
 
     if (kcptcp_ep_register_listener(epfd, usock, &magic_listener) < 0) {
         P_LOG_ERR("epoll_ctl add udp: %s", strerror(errno));
@@ -366,14 +372,17 @@ int main(int argc, char **argv) {
                         c->kcp_rx_msgs++; /* Stats: KCP RX message */
                         char *payload = NULL;
                         int plen = 0;
-                        int res = aead_protocol_handle_incoming_packet(c, buf, got, cfg.psk, cfg.has_psk, &payload, &plen);
+                        int res = aead_protocol_handle_incoming_packet(
+                            c, buf, got, cfg.psk, cfg.has_psk, &payload, &plen);
 
                         if (res < 0) { // Error
                             c->state = S_CLOSING;
                             break;
                         }
                         if (res > 0) { // Control packet handled
-                            if (c->svr_in_eof && !c->svr2cli_shutdown && c->response.dlen == c->response.rpos && c->cli_sock > 0) {
+                            if (c->svr_in_eof && !c->svr2cli_shutdown &&
+                                c->response.dlen == c->response.rpos &&
+                                c->cli_sock > 0) {
                                 shutdown(c->cli_sock, SHUT_WR);
                                 c->svr2cli_shutdown = true;
                             }
@@ -384,8 +393,8 @@ int main(int argc, char **argv) {
                             continue;
                         }
 
-                        c->kcp_rx_bytes += (uint64_t)plen; /* Stats: accumulate KCP RX
-                                                   payload bytes */
+                        c->kcp_rx_bytes += (uint64_t)plen; /* Stats: accumulate
+                                                   KCP RX payload bytes */
                         /* If TCP connect not completed, buffer instead of
                          * sending */
                         if (c->state != S_FORWARDING) {
@@ -400,8 +409,11 @@ int main(int argc, char **argv) {
                                                   : INITIAL_BUFFER_SIZE;
                                 if (ncap < c->request.dlen + need)
                                     ncap = c->request.dlen + need;
-                                if (!buffer_size_check(c->request.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
-                                    P_LOG_WARN("Request buffer size limit exceeded, closing connection");
+                                if (!buffer_size_check(c->request.capacity,
+                                                       ncap,
+                                                       MAX_TCP_BUFFER_SIZE)) {
+                                    P_LOG_WARN("Request buffer size limit "
+                                               "exceeded, closing connection");
                                     c->state = S_CLOSING;
                                     break;
                                 }
@@ -423,7 +435,8 @@ int main(int argc, char **argv) {
                         }
                         ssize_t wn = send(c->svr_sock, payload, (size_t)plen,
                                           MSG_NOSIGNAL);
-                        if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        if (wn < 0 &&
+                            (errno == EAGAIN || errno == EWOULDBLOCK)) {
                             /* Would block: buffer all and enable EPOLLOUT */
                             size_t rem = (size_t)plen;
                             size_t freecap =
@@ -436,14 +449,17 @@ int main(int argc, char **argv) {
                                                   : INITIAL_BUFFER_SIZE;
                                 if (ncap < c->request.dlen + rem)
                                     ncap = c->request.dlen + rem;
-                                
+
                                 /* Check buffer size limit before realloc */
-                                if (!buffer_size_check(c->request.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
-                                    P_LOG_WARN("Buffer size limit exceeded for connection, closing");
+                                if (!buffer_size_check(c->request.capacity,
+                                                       ncap,
+                                                       MAX_TCP_BUFFER_SIZE)) {
+                                    P_LOG_WARN("Buffer size limit exceeded for "
+                                               "connection, closing");
                                     c->state = S_CLOSING;
                                     break;
                                 }
-                                
+
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
@@ -543,7 +559,8 @@ int main(int argc, char **argv) {
                                                      false);
                         /* If we got FIN from peer earlier, perform shutdown
                          * write now */
-                        if (c->cli_in_eof && !c->cli2svr_shutdown && c->svr_sock > 0) {
+                        if (c->cli_in_eof && !c->cli2svr_shutdown &&
+                            c->svr_sock > 0) {
                             shutdown(c->svr_sock, SHUT_WR);
                             c->cli2svr_shutdown = true;
                         }
@@ -555,7 +572,8 @@ int main(int argc, char **argv) {
                     while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) >
                            0) {
                         c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
-                        if (aead_protocol_send_data(c, sbuf, rn, cfg.psk, cfg.has_psk) < 0) {
+                        if (aead_protocol_send_data(c, sbuf, rn, cfg.psk,
+                                                    cfg.has_psk) < 0) {
                             c->state = S_CLOSING;
                             break;
                         }
@@ -563,7 +581,8 @@ int main(int argc, char **argv) {
                     if (rn == 0) {
                         /* TCP target sent EOF: send FIN/EFIN over KCP, stop
                          * further reads, allow pending KCP to flush */
-                        if (aead_protocol_send_fin(c, cfg.psk, cfg.has_psk) < 0) {
+                        if (aead_protocol_send_fin(c, cfg.psk, cfg.has_psk) <
+                            0) {
                             c->state = S_CLOSING;
                         }
                         c->svr_in_eof = true;

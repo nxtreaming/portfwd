@@ -11,7 +11,7 @@ extern "C" {
 /**
  * Generate cryptographically secure random bytes.
  * Uses platform-specific secure random sources.
- * 
+ *
  * @param buf Buffer to fill with random bytes
  * @param len Number of bytes to generate
  * @return 0 on success, -1 on failure
