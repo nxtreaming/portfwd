@@ -259,6 +259,9 @@ static void fill_pattern(unsigned char *b, size_t n, unsigned seed) {
 }
 
 int main(int argc, char **argv) {
+    char *cli_log = NULL, *srv_log = NULL;
+    size_t cli_len = 0, srv_len = 0;
+    
     const char *psk = getenv("IT_PSK");
     if (!psk)
         psk = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"
@@ -408,9 +411,6 @@ int main(int argc, char **argv) {
 
 out:
     // Read logs from children (do not close read fds before reading)
-    {
-        char *cli_log = NULL, *srv_log = NULL;
-        size_t cli_len = 0, srv_len = 0;
     // Wait a moment to flush
     msleep(200);
     // Reap children after kill below to ensure logs complete
@@ -506,8 +506,6 @@ out:
             "[it] completed echo %zu/%zu bytes OK and rekey logs verified\n",
             recvd, total);
     }
-
-    } // Close compound statement for variable declarations after label
 
     // Cleanup
     close(s);
