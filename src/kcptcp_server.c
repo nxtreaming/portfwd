@@ -436,6 +436,14 @@ int main(int argc, char **argv) {
                                                   : INITIAL_BUFFER_SIZE;
                                 if (ncap < c->request.dlen + rem)
                                     ncap = c->request.dlen + rem;
+                                
+                                /* Check buffer size limit before realloc */
+                                if (!buffer_size_check(ncap)) {
+                                    P_LOG_WARN("Buffer size limit exceeded for connection, closing");
+                                    c->state = S_CLOSING;
+                                    break;
+                                }
+                                
                                 char *np =
                                     (char *)realloc(c->request.data, ncap);
                                 if (!np) {
