@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
                                     ncap = c->request.dlen + rem;
                                 
                                 /* Check buffer size limit before realloc */
-                                if (!buffer_size_check(ncap)) {
+                                if (!buffer_size_check(c->request.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
                                     P_LOG_WARN("Buffer size limit exceeded for connection, closing");
                                     c->state = S_CLOSING;
                                     break;
