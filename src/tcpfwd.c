@@ -185,10 +185,13 @@ static inline struct proxy_conn *alloc_proxy_conn(void) {
     conn->cli_sock = -1;
     conn->svr_sock = -1;
 #ifdef __linux__
-    conn->splice_pipe[0] = -1;
-    conn->splice_pipe[1] = -1;
+    conn->c2s_pipe[0] = -1;
+    conn->c2s_pipe[1] = -1;
+    conn->s2c_pipe[0] = -1;
+    conn->s2c_pipe[1] = -1;
+    conn->c2s_pending = 0;
+    conn->s2c_pending = 0;
     conn->use_splice = false;
-    conn->splice_pending_dir = 0;
 #endif
     conn->magic_client = EV_MAGIC_CLIENT;
     conn->magic_server = EV_MAGIC_SERVER;
@@ -243,16 +246,26 @@ static void release_proxy_conn(struct proxy_conn *conn,
 
 #ifdef __linux__
     if (conn->use_splice) {
-        if (safe_close(conn->splice_pipe[0]) < 0) {
-            P_LOG_WARN("close(splice_pipe[0]=%d): %s", conn->splice_pipe[0],
+        if (safe_close(conn->c2s_pipe[0]) < 0) {
+            P_LOG_WARN("close(c2s_pipe[0]=%d): %s", conn->c2s_pipe[0],
                        strerror(errno));
         }
-        if (safe_close(conn->splice_pipe[1]) < 0) {
-            P_LOG_WARN("close(splice_pipe[1]=%d): %s", conn->splice_pipe[1],
+        if (safe_close(conn->c2s_pipe[1]) < 0) {
+            P_LOG_WARN("close(c2s_pipe[1]=%d): %s", conn->c2s_pipe[1],
                        strerror(errno));
         }
-        conn->splice_pipe[0] = conn->splice_pipe[1] = -1;
-        conn->splice_pending_dir = 0;
+        if (safe_close(conn->s2c_pipe[0]) < 0) {
+            P_LOG_WARN("close(s2c_pipe[0]=%d): %s", conn->s2c_pipe[0],
+                       strerror(errno));
+        }
+        if (safe_close(conn->s2c_pipe[1]) < 0) {
+            P_LOG_WARN("close(s2c_pipe[1]=%d): %s", conn->s2c_pipe[1],
+                       strerror(errno));
+        }
+        conn->c2s_pipe[0] = conn->c2s_pipe[1] = -1;
+        conn->s2c_pipe[0] = conn->s2c_pipe[1] = -1;
+        conn->c2s_pending = 0;
+        conn->s2c_pending = 0;
     }
 #endif
     if (conn->cli_sock >= 0) {
@@ -307,22 +320,14 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     ev_svr.data.ptr = &conn->magic_server;
 
     if (conn->use_splice) {
-        /* With splice, read readiness: keep EPOLLIN on both ends.
-         * Write readiness: only enable EPOLLOUT on the destination that has
-         * pending data to flush to avoid busy-waiting on always-writable fds. */
+        /* With per-direction pipes, always read on both; write only where
+         * there's pending data to flush. */
         ev_cli.events |= EPOLLIN;
         ev_svr.events |= EPOLLIN;
-        if (conn->splice_pending > 0) {
-            if (conn->splice_pending_dir == 1) { /* cli -> svr */
-                ev_svr.events |= EPOLLOUT;
-            } else if (conn->splice_pending_dir == 2) { /* svr -> cli */
-                ev_cli.events |= EPOLLOUT;
-            } else {
-                /* Unknown direction: conservatively enable both */
-                ev_cli.events |= EPOLLOUT;
-                ev_svr.events |= EPOLLOUT;
-            }
-        }
+        if (conn->c2s_pending > 0)
+            ev_svr.events |= EPOLLOUT; /* flush to server */
+        if (conn->s2c_pending > 0)
+            ev_cli.events |= EPOLLOUT; /* flush to client */
     } else {
         switch (conn->state) {
         case S_SERVER_CONNECTING:
@@ -482,11 +487,19 @@ create_proxy_conn(struct config *cfg, int cli_sock,
         /* Set up splice (Linux) */
 #ifdef __linux__
         if (!conn->use_splice) {
-            int pfds[2];
-            if (pipe2(pfds, O_NONBLOCK | O_CLOEXEC) == 0) {
-                conn->splice_pipe[0] = pfds[0];
-                conn->splice_pipe[1] = pfds[1];
+            int p1[2], p2[2];
+            if (pipe2(p1, O_NONBLOCK | O_CLOEXEC) == 0 &&
+                pipe2(p2, O_NONBLOCK | O_CLOEXEC) == 0) {
+                conn->c2s_pipe[0] = p1[0];
+                conn->c2s_pipe[1] = p1[1];
+                conn->s2c_pipe[0] = p2[0];
+                conn->s2c_pipe[1] = p2[1];
                 conn->use_splice = true;
+            } else {
+                if (p1[0] > -1) close(p1[0]);
+                if (p1[1] > -1) close(p1[1]);
+                if (p2[0] > -1) close(p2[0]);
+                if (p2[1] > -1) close(p2[1]);
             }
         }
 #endif
@@ -497,11 +510,19 @@ create_proxy_conn(struct config *cfg, int cli_sock,
         /* Prepare splice early (Linux) */
 #ifdef __linux__
         if (!conn->use_splice) {
-            int pfds[2];
-            if (pipe2(pfds, O_NONBLOCK | O_CLOEXEC) == 0) {
-                conn->splice_pipe[0] = pfds[0];
-                conn->splice_pipe[1] = pfds[1];
+            int p1[2], p2[2];
+            if (pipe2(p1, O_NONBLOCK | O_CLOEXEC) == 0 &&
+                pipe2(p2, O_NONBLOCK | O_CLOEXEC) == 0) {
+                conn->c2s_pipe[0] = p1[0];
+                conn->c2s_pipe[1] = p1[1];
+                conn->s2c_pipe[0] = p2[0];
+                conn->s2c_pipe[1] = p2[1];
                 conn->use_splice = true;
+            } else {
+                if (p1[0] > -1) close(p1[0]);
+                if (p1[1] > -1) close(p1[1]);
+                if (p2[0] > -1) close(p2[0]);
+                if (p2[1] > -1) close(p2[1]);
             }
         }
 #endif
@@ -591,22 +612,25 @@ static int handle_forwarding_splice(struct proxy_conn *conn,
                                     struct epoll_event *ev) {
     int src_fd, dst_fd;
     int *pipe_fds;
+    size_t *pending;
     ssize_t n_in, n_out;
-
-    pipe_fds = conn->splice_pipe;
 
     if (ev->data.ptr == &conn->magic_client) {
         /* client -> server */
         src_fd = conn->cli_sock;
         dst_fd = conn->svr_sock;
+        pipe_fds = conn->c2s_pipe;
+        pending = &conn->c2s_pending;
     } else {
         /* server -> client */
         src_fd = conn->svr_sock;
         dst_fd = conn->cli_sock;
+        pipe_fds = conn->s2c_pipe;
+        pending = &conn->s2c_pending;
     }
 
     while (1) {
-        size_t to_write = conn->splice_pending;
+        size_t to_write = *pending;
 
         if (to_write == 0) {
             /* Pipe is empty, read from source */
@@ -627,11 +651,7 @@ static int handle_forwarding_splice(struct proxy_conn *conn,
                 conn->state = S_CLOSING;
                 return 0;
             }
-            to_write = n_in;
-            if (src_fd == conn->cli_sock)
-                conn->splice_pending_dir = 1; /* cli -> svr */
-            else
-                conn->splice_pending_dir = 2; /* svr -> cli */
+            to_write = (size_t)n_in;
         }
 
         /* Write to destination */
@@ -640,7 +660,7 @@ static int handle_forwarding_splice(struct proxy_conn *conn,
         if (n_out < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 /* Can't write, so data is now pending */
-                conn->splice_pending = to_write;
+                *pending = to_write;
                 break;
             }
             P_LOG_ERR("splice(out) to fd %d failed: %s", dst_fd,
@@ -651,13 +671,12 @@ static int handle_forwarding_splice(struct proxy_conn *conn,
 
         if ((size_t)n_out < to_write) {
             /* Partial write, update pending and yield to EPOLLOUT */
-            conn->splice_pending = to_write - n_out;
+            *pending = to_write - (size_t)n_out;
             break;
         }
 
         /* Full write */
-        conn->splice_pending = 0;
-        conn->splice_pending_dir = 0;
+        *pending = 0;
     }
 
     return -EAGAIN;

@@ -45,10 +45,11 @@ struct proxy_conn {
     uint32_t magic_server;
 
     bool use_splice;
-    size_t splice_pending;
-    /* Direction of pending splice write: 0=none, 1=cli->svr, 2=svr->cli */
-    int splice_pending_dir;
-    int splice_pipe[2];
+    /* Per-direction splice pipes and pending lengths */
+    int c2s_pipe[2]; /* [0]=read end, [1]=write end */
+    int s2c_pipe[2];
+    size_t c2s_pending;
+    size_t s2c_pending;
     bool cli_in_eof;
     bool svr_in_eof;
     bool cli2svr_shutdown;
