@@ -79,6 +79,7 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 break;
             }
             P_LOG_WARN("recvfrom udp: %s", strerror(errno));
+            c->state = S_CLOSING;
             break;
         }
         if (rn == 0) {
@@ -99,9 +100,14 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             continue; /* Unknown family: drop */
         }
         if (!is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
-            P_LOG_WARN("dropping UDP from unexpected %s (expected %s)",
-                       sockaddr_to_string(&ra),
-                       sockaddr_to_string(&c->peer_addr));
+            static time_t last_warn = 0;
+            time_t now = time(NULL);
+            if (now - last_warn >= 1) {
+                P_LOG_WARN("dropping UDP from unexpected %s (expected %s)",
+                           sockaddr_to_string(&ra),
+                           sockaddr_to_string(&c->peer_addr));
+                last_warn = now;
+            }
             continue;
         }
         /* Handshake ACCEPT path */
@@ -208,6 +214,7 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                 &plen);
 
             if (res < 0) { // Error
+                P_LOG_ERR("AEAD packet handling failed (res=%d)", res);
                 c->state = S_CLOSING;
                 break;
             }
