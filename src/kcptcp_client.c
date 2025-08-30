@@ -102,7 +102,6 @@ static void release_proxy_conn_to_pool(struct proxy_conn *conn);
 static void init_performance_monitoring(void);
 static void dump_performance_stats(void);
 static void update_connection_stats(struct proxy_conn *c, bool connecting);
-static void log_connection_event(struct proxy_conn *c, const char *event, const char *details);
 
 struct cfg_client {
     union sockaddr_inx laddr; /* TCP listen */
@@ -775,16 +774,6 @@ static void update_connection_stats(struct proxy_conn *c, bool connecting) {
             g_perf.active_connections--;
         }
         LOG_CONN_DEBUG(c, "Connection closed");
-    }
-}
-
-static void log_connection_event(struct proxy_conn *c, const char *event, const char *details) {
-    if (!c || !event) return;
-
-    if (details) {
-        LOG_CONN_DEBUG(c, "%s: %s", event, details);
-    } else {
-        LOG_CONN_DEBUG(c, "%s", event);
     }
 }
 
