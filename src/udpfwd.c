@@ -365,6 +365,7 @@ static void destroy_batching_resources(struct mmsghdr *c_msgs,
 /* Rate Limiting and Security Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
+#if ENABLE_RATE_LIMITING
 /* Simple hash function for IP addresses */
 static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
     if (addr->sa.sa_family == AF_INET) {
@@ -375,6 +376,7 @@ static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
     }
     return 0;
 }
+#endif
 
 /* Initialize rate limiter */
 static int init_rate_limiter(unsigned max_pps, unsigned max_bps, unsigned max_per_ip) {
@@ -585,6 +587,7 @@ static void process_backpressure_queue(void) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #ifdef __linux__
+#if ENABLE_ADAPTIVE_BATCHING
 /* Adjust batch size based on recent performance */
 static void adjust_batch_size(void) {
     pthread_mutex_lock(&g_adaptive_batch.lock);
@@ -634,6 +637,7 @@ static void adjust_batch_size(void) {
 
     pthread_mutex_unlock(&g_adaptive_batch.lock);
 }
+#endif /* ENABLE_ADAPTIVE_BATCHING */
 
 /* Get current optimal batch size */
 static int get_optimal_batch_size(void) {
