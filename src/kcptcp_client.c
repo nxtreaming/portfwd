@@ -28,6 +28,7 @@
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "aead.h"
+#include <pthread.h>
 
 /* Configuration constants */
 #define DEFAULT_KEEPALIVE_INTERVAL_MS  30000
@@ -84,11 +85,9 @@ struct conn_pool {
     pthread_cond_t available;        /* Condition variable for blocking allocation */
 };
 
-/* Forward declarations for helper functions */
-static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn);
+/* Forward declarations for basic helper functions */
 static int buffer_ensure_capacity(struct buffer_info *buf, size_t needed, size_t max_size);
 static void secure_zero(void *ptr, size_t len);
-static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn, const char *operation);
 static bool rate_limit_check(struct rate_limiter *rl);
 static int validate_handshake_timing(uint32_t timestamp);
 static int generate_enhanced_hello(struct proxy_conn *conn, const uint8_t *psk, bool has_psk, unsigned char *out_buf, size_t *out_len);
@@ -98,12 +97,6 @@ static int init_conn_pool(void);
 static void destroy_conn_pool(void);
 static struct proxy_conn *alloc_proxy_conn(void);
 static void release_proxy_conn_to_pool(struct proxy_conn *conn);
-
-/* UDP event handling helper functions */
-static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf, size_t ubuf_size, bool *fed_kcp);
-static int handle_handshake_accept(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len);
-static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen);
-static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss);
 
 /* Performance monitoring and logging functions */
 static void init_performance_monitoring(void);
@@ -134,6 +127,14 @@ struct client_ctx {
     struct list_head *conns;
     struct rate_limiter handshake_limiter;  /* Rate limit handshake attempts */
 };
+
+/* Functions that need struct client_ctx */
+static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn);
+static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn, const char *operation);
+static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf, size_t ubuf_size, bool *fed_kcp);
+static int handle_handshake_accept(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len);
+static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen);
+static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss);
 
 /* Global connection pool */
 static struct conn_pool g_conn_pool = {0};
@@ -278,6 +279,7 @@ static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn) {
 
 /* Handle epoll operation errors with proper cleanup */
 static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn, const char *operation) {
+    (void)ctx; /* Unused parameter */
     if (!conn || !operation) return -1;
 
     LOG_CONN_ERR(conn, "epoll %s failed: %s", operation, strerror(errno));
@@ -298,7 +300,7 @@ static bool rate_limit_check(struct rate_limiter *rl) {
     if (!rl) return true;
 
     time_t now = time(NULL);
-    if (now - rl->window_start >= rl->window_size_sec) {
+    if (now - rl->window_start >= (time_t)rl->window_size_sec) {
         rl->window_start = now;
         rl->counter = 0;
     }
@@ -328,6 +330,7 @@ static int validate_handshake_timing(uint32_t timestamp) {
 /* Generate enhanced HELLO message with HMAC authentication */
 static int generate_enhanced_hello(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
                                    unsigned char *out_buf, size_t *out_len) {
+    (void)psk; /* Unused parameter - reserved for future HMAC implementation */
     if (!conn || !out_buf || !out_len) return -1;
 
     if (has_psk && sizeof(struct handshake_hello_v2) <= *out_len) {
