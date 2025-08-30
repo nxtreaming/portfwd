@@ -869,7 +869,6 @@ int main(int argc, char **argv) {
                             /* Not a stealth handshake packet, continue to regular KCP processing */
                         }
                     }
-                    }
 
                     /* Otherwise expect KCP packet for existing conv */
                     if (rn < 24) {
@@ -1088,7 +1087,7 @@ int main(int argc, char **argv) {
                         c->last_active = time(NULL);
                     }
                     continue;
-            }
+                }
 
             /* TCP events for an existing connection */
             if (!tag) {
