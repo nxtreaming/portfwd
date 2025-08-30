@@ -269,6 +269,7 @@ static volatile sig_atomic_t g_shutdown_requested = 0;
 /* Global rate limiter for security */
 static struct rate_limiter g_rate_limiter;
 
+#if ENABLE_BACKPRESSURE_QUEUE
 /* Simple backpressure queue for handling EAGAIN */
 #define BACKPRESSURE_QUEUE_SIZE 1024
 struct backpressure_entry {
@@ -288,6 +289,7 @@ struct backpressure_queue {
 };
 
 static struct backpressure_queue g_backpressure_queue;
+#endif /* ENABLE_BACKPRESSURE_QUEUE */
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Utility Functions */
@@ -499,6 +501,7 @@ static bool validate_packet(const char *data, size_t len, const union sockaddr_i
 /* Backpressure Queue Management */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
+#if ENABLE_BACKPRESSURE_QUEUE
 /* Initialize backpressure queue */
 static int init_backpressure_queue(void) {
     memset(&g_backpressure_queue, 0, sizeof(g_backpressure_queue));
@@ -575,6 +578,7 @@ static void process_backpressure_queue(void) {
 
     pthread_mutex_unlock(&g_backpressure_queue.lock);
 }
+#endif /* ENABLE_BACKPRESSURE_QUEUE */
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Performance Optimization Functions */
