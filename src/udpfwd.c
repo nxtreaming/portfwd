@@ -129,8 +129,6 @@
 #endif
 #endif
 
-
-
 /* Connection pool size */
 #ifndef UDP_PROXY_MAX_CONNS
 #define UDP_PROXY_MAX_CONNS 4096
@@ -828,8 +826,6 @@ static void set_sock_buffers(int sockfd) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Hash Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
-
 
 static uint32_t hash_addr(const union sockaddr_inx *a) {
     /* Use the improved hash function for better distribution */
