@@ -11,29 +11,58 @@
 extern "C" {
 #endif
 
-/* ---------------- Handshake Protocol Structures ---------------- */
-/* Handshake protocol structures */
-struct handshake_hello {
-    uint8_t type;        /* KTP_HS_HELLO */
-    uint8_t version;     /* KCP_HS_VER */
-    uint8_t token[16];   /* Random token */
+/* ---------------- Stealth Handshake Protocol ---------------- */
+/*
+ * Stealth handshake protocol inspired by Shadowsocks:
+ * - No obvious handshake phase
+ * - First packet looks like encrypted data
+ * - Server attempts to decrypt and identify new connections
+ * - Handshake info embedded in first data packet
+ */
+
+/* Stealth handshake payload (encrypted within first packet) */
+struct stealth_handshake_payload {
+    uint32_t magic;      /* Magic number for validation */
     uint32_t timestamp;  /* Unix timestamp (network byte order) */
+    uint8_t token[16];   /* Random token for session identification */
     uint32_t nonce;      /* Additional random nonce */
-    uint8_t hmac[16];    /* HMAC-SHA256 truncated to 16 bytes */
+    uint8_t reserved[8]; /* Reserved for future use, filled with random data */
 } __attribute__((packed));
 
-struct handshake_accept {
-    uint8_t type;        /* KTP_HS_ACCEPT */
-    uint8_t version;     /* KCP_HS_VER */
+/* Stealth handshake response (encrypted) */
+struct stealth_handshake_response {
+    uint32_t magic;      /* Magic number echo */
     uint32_t conv;       /* Conversation ID (network byte order) */
     uint8_t token[16];   /* Echo of client token */
     uint32_t timestamp;  /* Server timestamp */
-    uint8_t hmac[16];    /* HMAC verification */
+    uint8_t reserved[8]; /* Reserved, filled with random data */
 } __attribute__((packed));
 
-/* Handshake buffer size constants */
-#define HELLO_MIN_SIZE                  sizeof(struct handshake_hello)
-#define ACCEPT_BUFFER_SIZE              sizeof(struct handshake_accept)
+/* Magic numbers for stealth handshake */
+#define STEALTH_HANDSHAKE_MAGIC     0x12345678
+#define STEALTH_RESPONSE_MAGIC      0x87654321
+
+/* Buffer sizes */
+#define STEALTH_HANDSHAKE_PAYLOAD_SIZE    sizeof(struct stealth_handshake_payload)
+#define STEALTH_HANDSHAKE_RESPONSE_SIZE   sizeof(struct stealth_handshake_response)
+
+/* Minimum size for stealth handshake packet (payload + some padding) */
+#define STEALTH_HANDSHAKE_MIN_SIZE        (STEALTH_HANDSHAKE_PAYLOAD_SIZE + 16)
+
+/* Stealth handshake helper functions */
+int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *token,
+                                          const uint8_t *initial_data, size_t initial_data_len,
+                                          uint8_t *out_packet, size_t *out_packet_len);
+
+int stealth_handshake_parse_first_packet(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
+                                        struct stealth_handshake_payload *payload,
+                                        uint8_t *out_data, size_t *out_data_len);
+
+int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const uint8_t *token,
+                                     uint8_t *out_packet, size_t *out_packet_len);
+
+int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
+                                    struct stealth_handshake_response *response);
 
 /* Env-controlled stats helpers */
 uint32_t get_stats_interval_ms(void);

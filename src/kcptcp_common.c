@@ -5,11 +5,15 @@
 #include <sys/socket.h>
 #include <unistd.h> /* getopt */
 #include <stdio.h>
+#include <time.h>
+#include <arpa/inet.h>
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <netinet/tcp.h>
 #endif
 #include "common.h"
 #include "3rd/kcp/ikcp.h"
+#include "3rd/chacha20poly1305/chacha20poly1305.h"
+#include "secure_random.h"
 
 /* Env-controlled stats helpers */
 uint32_t get_stats_interval_ms(void) {
@@ -421,4 +425,249 @@ int kcptcp_parse_common_opts(int argc, char **argv,
     if (pos_start)
         *pos_start = optind;
     return 1;
+}
+
+/* ---------------- Stealth Handshake Implementation ---------------- */
+
+/* Create first packet with embedded stealth handshake */
+int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *token,
+                                          const uint8_t *initial_data, size_t initial_data_len,
+                                          uint8_t *out_packet, size_t *out_packet_len) {
+    if (!psk || !token || !out_packet || !out_packet_len) {
+        return -1;
+    }
+
+    /* Create handshake payload */
+    struct stealth_handshake_payload payload;
+    payload.magic = htonl(STEALTH_HANDSHAKE_MAGIC);
+    payload.timestamp = htonl((uint32_t)time(NULL));
+    memcpy(payload.token, token, 16);
+
+    /* Generate random nonce */
+    if (secure_random_bytes((uint8_t *)&payload.nonce, sizeof(payload.nonce)) != 0) {
+        return -1;
+    }
+
+    /* Fill reserved field with random data */
+    if (secure_random_bytes(payload.reserved, sizeof(payload.reserved)) != 0) {
+        return -1;
+    }
+
+    /* Calculate total packet size: payload + initial_data + some random padding */
+    size_t padding_size = 16 + (rand() % 32); /* 16-47 bytes random padding */
+    size_t total_size = sizeof(payload) + initial_data_len + padding_size;
+
+    if (total_size > *out_packet_len) {
+        return -1; /* Buffer too small */
+    }
+
+    /* Create plaintext: payload + initial_data + padding */
+    uint8_t *plaintext = malloc(total_size);
+    if (!plaintext) {
+        return -1;
+    }
+
+    memcpy(plaintext, &payload, sizeof(payload));
+    if (initial_data && initial_data_len > 0) {
+        memcpy(plaintext + sizeof(payload), initial_data, initial_data_len);
+    }
+
+    /* Fill padding with random data */
+    if (secure_random_bytes(plaintext + sizeof(payload) + initial_data_len, padding_size) != 0) {
+        free(plaintext);
+        return -1;
+    }
+
+    /* Generate random nonce for encryption */
+    uint8_t nonce[12];
+    if (secure_random_bytes(nonce, sizeof(nonce)) != 0) {
+        free(plaintext);
+        return -1;
+    }
+
+    /* Encrypt the entire packet using ChaCha20-Poly1305 */
+    uint8_t tag[16];
+    chacha20poly1305_seal(psk, nonce, NULL, 0, plaintext, total_size, out_packet + 12, tag);
+
+    /* Prepend nonce to the packet */
+    memcpy(out_packet, nonce, 12);
+    memcpy(out_packet + 12 + total_size, tag, 16);
+
+    *out_packet_len = 12 + total_size + 16; /* nonce + ciphertext + tag */
+
+    free(plaintext);
+    return 0;
+}
+
+/* Parse first packet and extract stealth handshake payload */
+int stealth_handshake_parse_first_packet(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
+                                        struct stealth_handshake_payload *payload,
+                                        uint8_t *out_data, size_t *out_data_len) {
+    if (!psk || !packet || !payload || packet_len < 28) { /* 12 nonce + 16 tag minimum */
+        return -1;
+    }
+
+    /* Extract nonce and tag */
+    const uint8_t *nonce = packet;
+    const uint8_t *ciphertext = packet + 12;
+    size_t ciphertext_len = packet_len - 28; /* Total - nonce - tag */
+    const uint8_t *tag = packet + 12 + ciphertext_len;
+
+    /* Decrypt the packet */
+    uint8_t *plaintext = malloc(ciphertext_len);
+    if (!plaintext) {
+        return -1;
+    }
+
+    if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len, tag, plaintext) != 0) {
+        free(plaintext);
+        return -1; /* Decryption failed - not a valid stealth handshake */
+    }
+
+    /* Check if we have enough data for the payload */
+    if (ciphertext_len < sizeof(struct stealth_handshake_payload)) {
+        free(plaintext);
+        return -1;
+    }
+
+    /* Extract and validate payload */
+    memcpy(payload, plaintext, sizeof(struct stealth_handshake_payload));
+
+    /* Validate magic number */
+    if (ntohl(payload->magic) != STEALTH_HANDSHAKE_MAGIC) {
+        free(plaintext);
+        return -1; /* Not a stealth handshake packet */
+    }
+
+    /* Validate timestamp (allow 5 minutes skew) */
+    time_t now = time(NULL);
+    time_t msg_time = (time_t)ntohl(payload->timestamp);
+    if (msg_time < now - 300 || msg_time > now + 300) {
+        free(plaintext);
+        return -1; /* Timestamp out of range */
+    }
+
+    /* Extract any additional data after the payload */
+    size_t remaining_len = ciphertext_len - sizeof(struct stealth_handshake_payload);
+    if (out_data && out_data_len && remaining_len > 0) {
+        size_t copy_len = remaining_len < *out_data_len ? remaining_len : *out_data_len;
+        memcpy(out_data, plaintext + sizeof(struct stealth_handshake_payload), copy_len);
+        *out_data_len = copy_len;
+    } else if (out_data_len) {
+        *out_data_len = 0;
+    }
+
+    free(plaintext);
+    return 0;
+}
+
+/* Create stealth handshake response */
+int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const uint8_t *token,
+                                     uint8_t *out_packet, size_t *out_packet_len) {
+    if (!psk || !token || !out_packet || !out_packet_len) {
+        return -1;
+    }
+
+    /* Create response payload */
+    struct stealth_handshake_response response;
+    response.magic = htonl(STEALTH_RESPONSE_MAGIC);
+    response.conv = htonl(conv);
+    memcpy(response.token, token, 16);
+    response.timestamp = htonl((uint32_t)time(NULL));
+
+    /* Fill reserved field with random data */
+    if (secure_random_bytes(response.reserved, sizeof(response.reserved)) != 0) {
+        return -1;
+    }
+
+    /* Add some random padding to make it look like normal data */
+    size_t padding_size = 8 + (rand() % 24); /* 8-31 bytes random padding */
+    size_t total_size = sizeof(response) + padding_size;
+
+    if (total_size + 28 > *out_packet_len) { /* +28 for nonce and tag */
+        return -1; /* Buffer too small */
+    }
+
+    /* Create plaintext: response + padding */
+    uint8_t *plaintext = malloc(total_size);
+    if (!plaintext) {
+        return -1;
+    }
+
+    memcpy(plaintext, &response, sizeof(response));
+    if (secure_random_bytes(plaintext + sizeof(response), padding_size) != 0) {
+        free(plaintext);
+        return -1;
+    }
+
+    /* Generate random nonce for encryption */
+    uint8_t nonce[12];
+    if (secure_random_bytes(nonce, sizeof(nonce)) != 0) {
+        free(plaintext);
+        return -1;
+    }
+
+    /* Encrypt the response */
+    uint8_t tag[16];
+    chacha20poly1305_seal(psk, nonce, NULL, 0, plaintext, total_size, out_packet + 12, tag);
+
+    /* Prepend nonce and append tag */
+    memcpy(out_packet, nonce, 12);
+    memcpy(out_packet + 12 + total_size, tag, 16);
+
+    *out_packet_len = 12 + total_size + 16; /* nonce + ciphertext + tag */
+
+    free(plaintext);
+    return 0;
+}
+
+/* Parse stealth handshake response */
+int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
+                                    struct stealth_handshake_response *response) {
+    if (!psk || !packet || !response || packet_len < 28) { /* 12 nonce + 16 tag minimum */
+        return -1;
+    }
+
+    /* Extract nonce and tag */
+    const uint8_t *nonce = packet;
+    const uint8_t *ciphertext = packet + 12;
+    size_t ciphertext_len = packet_len - 28; /* Total - nonce - tag */
+    const uint8_t *tag = packet + 12 + ciphertext_len;
+
+    /* Decrypt the packet */
+    uint8_t *plaintext = malloc(ciphertext_len);
+    if (!plaintext) {
+        return -1;
+    }
+
+    if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len, tag, plaintext) != 0) {
+        free(plaintext);
+        return -1; /* Decryption failed */
+    }
+
+    /* Check if we have enough data for the response */
+    if (ciphertext_len < sizeof(struct stealth_handshake_response)) {
+        free(plaintext);
+        return -1;
+    }
+
+    /* Extract and validate response */
+    memcpy(response, plaintext, sizeof(struct stealth_handshake_response));
+
+    /* Validate magic number */
+    if (ntohl(response->magic) != STEALTH_RESPONSE_MAGIC) {
+        free(plaintext);
+        return -1; /* Not a stealth handshake response */
+    }
+
+    /* Validate timestamp (allow 5 minutes skew) */
+    time_t now = time(NULL);
+    time_t msg_time = (time_t)ntohl(response->timestamp);
+    if (msg_time < now - 300 || msg_time > now + 300) {
+        free(plaintext);
+        return -1; /* Timestamp out of range */
+    }
+
+    free(plaintext);
+    return 0;
 }

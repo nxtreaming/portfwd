@@ -72,8 +72,9 @@ struct conn_pool {
 static int buffer_ensure_capacity(struct buffer_info *buf, size_t needed, size_t max_size);
 static void secure_zero(void *ptr, size_t len);
 static bool rate_limit_check(struct rate_limiter *rl);
-static int validate_handshake_timing(uint32_t timestamp);
-static int generate_enhanced_hello(struct proxy_conn *conn, const uint8_t *psk, bool has_psk, unsigned char *out_buf, size_t *out_len);
+static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
+                                      const uint8_t *initial_data, size_t initial_data_len,
+                                      unsigned char *out_buf, size_t *out_len);
 
 /* Connection pool management functions */
 static int init_conn_pool(void);
@@ -114,7 +115,7 @@ struct client_ctx {
 static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn);
 static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn, const char *operation);
 static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf, size_t ubuf_size, bool *fed_kcp);
-static int handle_handshake_accept(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len);
+static int handle_stealth_handshake_response(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len);
 static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen);
 static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss);
 
@@ -293,80 +294,27 @@ static bool rate_limit_check(struct rate_limiter *rl) {
     return true;
 }
 
-/* Validate handshake timestamp to prevent replay attacks */
-static int validate_handshake_timing(uint32_t timestamp) {
-    time_t now = time(NULL);
-    time_t msg_time = (time_t)ntohl(timestamp);
 
-    /* Allow 5 minutes clock skew in either direction */
-    const time_t MAX_SKEW = 300;
 
-    if (msg_time < now - MAX_SKEW || msg_time > now + MAX_SKEW) {
-        P_LOG_WARN("Handshake timestamp out of range: msg_time=%ld, now=%ld",
-                   (long)msg_time, (long)now);
-        return -1;
-    }
-    return 0;
-}
-
-/* Simple HMAC implementation using ChaCha20-Poly1305 for authentication */
-static void compute_handshake_hmac(const uint8_t *psk, const uint8_t *data, size_t data_len, uint8_t *hmac_out) {
-    /* Use ChaCha20-Poly1305 as HMAC substitute:
-     * - Use PSK as key
-     * - Use first 12 bytes of data as nonce (padded if needed)
-     * - Compute authentication tag over the data
-     */
-    uint8_t nonce[12];
-    memset(nonce, 0, sizeof(nonce));
-    size_t nonce_len = data_len < 12 ? data_len : 12;
-    memcpy(nonce, data, nonce_len);
-
-    uint8_t tag[16];
-    uint8_t dummy_output[1]; /* We only need the tag */
-
-    /* Use ChaCha20-Poly1305 to compute authentication tag */
-    chacha20poly1305_seal(psk, nonce, NULL, 0, data, data_len, dummy_output, tag);
-
-    /* Copy first 16 bytes of tag as HMAC */
-    memcpy(hmac_out, tag, 16);
-}
-
-/* Generate enhanced HELLO message with HMAC authentication */
-static int generate_enhanced_hello(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
-                                   unsigned char *out_buf, size_t *out_len) {
+/* Generate stealth handshake first packet */
+static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
+                                      const uint8_t *initial_data, size_t initial_data_len,
+                                      unsigned char *out_buf, size_t *out_len) {
     if (!conn || !out_buf || !out_len) return -1;
 
     /* Only support PSK version now */
     if (!has_psk || !psk) {
-        P_LOG_ERR("PSK is required for handshake");
+        P_LOG_ERR("PSK is required for stealth handshake");
         return -1;
     }
 
-    if (sizeof(struct handshake_hello) > *out_len) {
-        P_LOG_ERR("Output buffer too small for HELLO");
+    /* Create stealth handshake packet with embedded payload */
+    if (stealth_handshake_create_first_packet(psk, conn->hs_token, initial_data, initial_data_len,
+                                              out_buf, out_len) != 0) {
+        P_LOG_ERR("Failed to create stealth handshake packet");
         return -1;
     }
 
-    /* PSK version with HMAC */
-    struct handshake_hello *hello = (struct handshake_hello *)out_buf;
-    hello->type = KTP_HS_HELLO;
-    hello->version = KCP_HS_VER;
-    memcpy(hello->token, conn->hs_token, 16);
-    hello->timestamp = htonl((uint32_t)time(NULL));
-
-    /* Generate additional nonce */
-    uint32_t nonce;
-    if (secure_random_bytes((unsigned char *)&nonce, sizeof(nonce)) != 0) {
-        P_LOG_ERR("Failed to generate random nonce");
-        return -1;
-    }
-    hello->nonce = nonce;
-
-    /* Calculate HMAC over the message (excluding HMAC field itself) */
-    size_t hmac_data_len = sizeof(struct handshake_hello) - 16; /* Exclude HMAC field */
-    compute_handshake_hmac(psk, (const uint8_t *)hello, hmac_data_len, hello->hmac);
-
-    *out_len = sizeof(struct handshake_hello);
     return 0;
 }
 
@@ -502,50 +450,35 @@ static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_stora
     return 0;
 }
 
-/* Handle handshake ACCEPT message */
-static int handle_handshake_accept(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len) {
+/* Handle stealth handshake response */
+static int handle_stealth_handshake_response(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len) {
     uint32_t conv;
-    bool valid_accept = false;
+    bool valid_response = false;
 
-    /* Only support enhanced ACCEPT format with PSK */
+    /* Only support PSK stealth handshake */
     if (!ctx->cfg->has_psk || !ctx->cfg->psk) {
-        LOG_CONN_ERR(c, "PSK is required for handshake");
+        LOG_CONN_ERR(c, "PSK is required for stealth handshake");
         return -1; /* Error: close connection */
     }
 
-    if (len < sizeof(struct handshake_accept)) {
-        LOG_CONN_WARN(c, "ACCEPT too short len=%zu, expected=%zu", len, sizeof(struct handshake_accept));
+    /* Try to parse as stealth handshake response */
+    struct stealth_handshake_response response;
+    if (stealth_handshake_parse_response(ctx->cfg->psk, (const uint8_t *)buf, len, &response) != 0) {
+        LOG_CONN_WARN(c, "Failed to parse stealth handshake response; ignore");
         return 1; /* Continue processing other packets */
     }
 
-    struct handshake_accept *accept = (struct handshake_accept *)buf;
-    conv = ntohl(accept->conv);
+    conv = ntohl(response.conv);
 
     /* Validate token */
-    if (memcmp(accept->token, c->hs_token, 16) != 0) {
-        LOG_CONN_WARN(c, "Enhanced ACCEPT token mismatch; ignore");
+    if (memcmp(response.token, c->hs_token, 16) != 0) {
+        LOG_CONN_WARN(c, "Stealth response token mismatch; ignore");
         return 1; /* Continue processing other packets */
     }
 
-    /* Validate timestamp */
-    if (validate_handshake_timing(accept->timestamp) != 0) {
-        LOG_CONN_WARN(c, "Enhanced ACCEPT timestamp validation failed; ignore");
-        return 1; /* Continue processing other packets */
-    }
+    valid_response = true;
 
-    /* Validate HMAC */
-    uint8_t expected_hmac[16];
-    size_t hmac_data_len = sizeof(struct handshake_accept) - 16; /* Exclude HMAC field */
-    compute_handshake_hmac(ctx->cfg->psk, (const uint8_t *)accept, hmac_data_len, expected_hmac);
-
-    if (memcmp(accept->hmac, expected_hmac, 16) != 0) {
-        LOG_CONN_WARN(c, "Enhanced ACCEPT HMAC validation failed; ignore");
-        return 1; /* Continue processing other packets */
-    }
-
-    valid_accept = true;
-
-    if (!valid_accept) {
+    if (!valid_response) {
         return 1; /* Continue processing other packets */
     }
 
@@ -692,16 +625,16 @@ static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char
             continue; /* Drop packet and continue */
         }
 
-        /* Handshake ACCEPT path */
-        if (!c->kcp_ready && rn >= (ssize_t)(1 + 1 + 4 + 16) &&
-            (unsigned char)ubuf[0] == (unsigned char)KTP_HS_ACCEPT &&
-            (unsigned char)ubuf[1] == (unsigned char)KCP_HS_VER) {
-
-            int result = handle_handshake_accept(ctx, c, ubuf, (size_t)rn);
+        /* Stealth handshake response path */
+        if (!c->kcp_ready && rn >= 28) { /* Minimum size for encrypted packet */
+            int result = handle_stealth_handshake_response(ctx, c, ubuf, (size_t)rn);
             if (result < 0) {
                 return -1; /* Error: close connection */
+            } else if (result == 0) {
+                /* Successfully processed stealth handshake response */
+                continue;
             }
-            continue;
+            /* If result == 1, it's not a handshake response, continue to KCP processing */
         }
 
         if (!c->kcp_ready) {
@@ -908,12 +841,13 @@ static void client_handle_accept(struct client_ctx *ctx) {
             free(c);
             continue;
         }
-        /* Send HELLO with PSK authentication */
-        unsigned char hbuf[sizeof(struct handshake_hello)];
+        /* Send stealth handshake packet (looks like encrypted data) */
+        unsigned char hbuf[1024]; /* Larger buffer for stealth packet */
         size_t hbuf_len = sizeof(hbuf);
 
-        if (generate_enhanced_hello(c, ctx->cfg->psk, ctx->cfg->has_psk, hbuf, &hbuf_len) != 0) {
-            P_LOG_ERR("Failed to generate HELLO message");
+        /* For now, send empty initial data - in real usage, this could be the first request */
+        if (generate_stealth_handshake(c, ctx->cfg->psk, ctx->cfg->has_psk, NULL, 0, hbuf, &hbuf_len) != 0) {
+            P_LOG_ERR("Failed to generate stealth handshake packet");
             g_perf.handshake_failures++;
             close(cs);
             close(us);
@@ -927,9 +861,9 @@ static void client_handle_accept(struct client_ctx *ctx) {
                               &c->peer_addr.sa,
                               (socklen_t)sizeof_sockaddr(&c->peer_addr));
         if (sent < 0) {
-            P_LOG_WARN("Failed to send HELLO: %s", strerror(errno));
+            P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
         } else {
-            P_LOG_DEBUG("Sent HELLO with HMAC authentication");
+            P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hbuf_len);
         }
 
         /* Prepare epoll tags */

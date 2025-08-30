@@ -303,43 +303,7 @@ static void conn_limit_release(const union sockaddr_inx *addr) {
     pthread_mutex_unlock(&g_conn_limiter.lock);
 }
 
-/* Simple HMAC implementation using ChaCha20-Poly1305 for authentication */
-static void compute_handshake_hmac(const uint8_t *psk, const uint8_t *data, size_t data_len, uint8_t *hmac_out) {
-    /* Use ChaCha20-Poly1305 as HMAC substitute:
-     * - Use PSK as key
-     * - Use first 12 bytes of data as nonce (padded if needed)
-     * - Compute authentication tag over the data
-     */
-    uint8_t nonce[12];
-    memset(nonce, 0, sizeof(nonce));
-    size_t nonce_len = data_len < 12 ? data_len : 12;
-    memcpy(nonce, data, nonce_len);
 
-    uint8_t tag[16];
-    uint8_t dummy_output[1]; /* We only need the tag */
-
-    /* Use ChaCha20-Poly1305 to compute authentication tag */
-    chacha20poly1305_seal(psk, nonce, NULL, 0, data, data_len, dummy_output, tag);
-
-    /* Copy first 16 bytes of tag as HMAC */
-    memcpy(hmac_out, tag, 16);
-}
-
-/* Validate handshake timestamp to prevent replay attacks */
-static int validate_handshake_timing(uint32_t timestamp) {
-    time_t now = time(NULL);
-    time_t msg_time = (time_t)ntohl(timestamp);
-
-    /* Allow 5 minutes clock skew in either direction */
-    const time_t MAX_SKEW = 300;
-
-    if (msg_time < now - MAX_SKEW || msg_time > now + MAX_SKEW) {
-        P_LOG_WARN("Handshake timestamp out of range: msg_time=%ld, now=%ld",
-                   (long)msg_time, (long)now);
-        return -1;
-    }
-    return 0;
-}
 
 /* Secure conv ID generation */
 static uint32_t generate_secure_conv(void) {
@@ -749,54 +713,33 @@ int main(int argc, char **argv) {
                                    (int)rss.ss_family);
                         continue;
                     }
-                    /* Handshake first: if this is HELLO, allocate conv and
-                     * respond */
-                    if (rn >= 2 &&
-                        (unsigned char)buf[0] == (unsigned char)KTP_HS_HELLO &&
-                        (unsigned char)buf[1] == (unsigned char)KCP_HS_VER) {
-
-                        /* Only support PSK HELLO format */
+                    /* Try stealth handshake first: attempt to decrypt any packet from unknown source */
+                    if (rn >= 28) { /* Minimum size for encrypted packet */
+                        /* Only support PSK stealth handshake */
                         if (!cfg.has_psk || !cfg.psk) {
-                            P_LOG_WARN("PSK is required for handshake, dropping HELLO from %s",
+                            P_LOG_WARN("PSK is required for stealth handshake, dropping packet from %s",
                                        sockaddr_to_string(&ra));
                             continue;
                         }
 
-                        if (rn < 0 || (size_t)rn < HELLO_MIN_SIZE) {
-                            P_LOG_WARN("HELLO too short len=%zd, expected=%zu", rn, HELLO_MIN_SIZE);
-                            continue;
-                        }
+                        /* Try to parse as stealth handshake */
+                        struct stealth_handshake_payload payload;
+                        uint8_t extracted_data[1024];
+                        size_t extracted_data_len = sizeof(extracted_data);
 
-                        /* Parse HELLO */
-                        struct handshake_hello *hello = (struct handshake_hello *)buf;
+                        if (stealth_handshake_parse_first_packet(cfg.psk, (const uint8_t *)buf, (size_t)rn,
+                                                                 &payload, extracted_data, &extracted_data_len) == 0) {
+                            /* Successfully parsed stealth handshake! */
 
-                        /* Validate timestamp */
-                        if (validate_handshake_timing(hello->timestamp) != 0) {
-                            P_LOG_WARN("HELLO timestamp validation failed from %s",
-                                       sockaddr_to_string(&ra));
-                            continue;
-                        }
+                            /* Apply rate limiting */
+                            if (!rate_limit_check_addr(&ra)) {
+                                continue;
+                            }
 
-                        /* Validate HMAC */
-                        uint8_t expected_hmac[16];
-                        size_t hello_hmac_data_len = sizeof(struct handshake_hello) - 16; /* Exclude HMAC field */
-                        compute_handshake_hmac(cfg.psk, (const uint8_t *)hello, hello_hmac_data_len, expected_hmac);
-
-                        if (memcmp(hello->hmac, expected_hmac, 16) != 0) {
-                            P_LOG_WARN("HELLO HMAC validation failed from %s",
-                                       sockaddr_to_string(&ra));
-                            continue;
-                        }
-
-                        /* Apply rate limiting */
-                        if (!rate_limit_check_addr(&ra)) {
-                            continue;
-                        }
-
-                        /* Apply connection limiting */
-                        if (!conn_limit_check(&ra)) {
-                            continue;
-                        }
+                            /* Apply connection limiting */
+                            if (!conn_limit_check(&ra)) {
+                                continue;
+                            }
                         /* Create TCP to target via shared helper */
                         int ts = kcptcp_create_tcp_socket(
                             cfg.taddr.sa.sa_family, cfg.sockbuf_bytes,
@@ -827,8 +770,8 @@ int main(int argc, char **argv) {
                         nc->svr_sock = ts;
                         nc->udp_sock = usock;
                         nc->peer_addr = ra;
-                        /* Extract token from HELLO structure */
-                        memcpy(nc->hs_token, hello->token, 16);
+                            /* Extract token from stealth handshake payload */
+                            memcpy(nc->hs_token, payload.token, 16);
                         nc->last_active = time(NULL);
                         /* Allocate unique conv using secure generation */
                         uint32_t conv_try;
@@ -894,27 +837,38 @@ int main(int argc, char **argv) {
                         list_add_tail(&nc->list, &conns);
                         (void)kcp_map_safe_put(&cmap, nc->conv, nc);
 
-                        /* Send ACCEPT with HMAC */
-                        unsigned char abuf[ACCEPT_BUFFER_SIZE];
-                        struct handshake_accept *accept = (struct handshake_accept *)abuf;
+                            /* Send stealth handshake response */
+                            unsigned char response_buf[1024];
+                            size_t response_len = sizeof(response_buf);
 
-                        accept->type = KTP_HS_ACCEPT;
-                        accept->version = KCP_HS_VER;
-                        accept->conv = htonl(nc->conv);
-                        memcpy(accept->token, nc->hs_token, 16);
-                        accept->timestamp = htonl((uint32_t)time(NULL));
+                            if (stealth_handshake_create_response(cfg.psk, nc->conv, nc->hs_token,
+                                                                 response_buf, &response_len) != 0) {
+                                P_LOG_ERR("Failed to create stealth handshake response");
+                                close(nc->svr_sock);
+                                conn_limit_release(&ra);
+                                free(nc);
+                                continue;
+                            }
 
-                        /* Calculate HMAC over the message (excluding HMAC field itself) */
-                        size_t accept_hmac_data_len = sizeof(struct handshake_accept) - 16; /* Exclude HMAC field */
-                        compute_handshake_hmac(cfg.psk, (const uint8_t *)accept, accept_hmac_data_len, accept->hmac);
+                            (void)sendto(
+                                usock, response_buf, response_len, MSG_DONTWAIT,
+                                &nc->peer_addr.sa,
+                                (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                            P_LOG_INFO("sent stealth handshake response conv=%u for %s (%zu bytes)",
+                                       nc->conv, sockaddr_to_string(&ra), response_len);
 
-                        (void)sendto(
-                            usock, abuf, sizeof(abuf), MSG_DONTWAIT,
-                            &nc->peer_addr.sa,
-                            (socklen_t)sizeof_sockaddr(&nc->peer_addr));
-                        P_LOG_INFO("accept conv=%u for %s with HMAC authentication", nc->conv,
-                                   sockaddr_to_string(&ra));
-                        continue;
+                            /* TODO: Process any extracted initial data if needed */
+                            if (extracted_data_len > 0) {
+                                P_LOG_DEBUG("Extracted %zu bytes of initial data from stealth handshake",
+                                           extracted_data_len);
+                                /* Could forward this data to the target connection */
+                            }
+
+                            continue;
+                        } else {
+                            /* Not a stealth handshake packet, continue to regular KCP processing */
+                        }
+                    }
                     }
 
                     /* Otherwise expect KCP packet for existing conv */
