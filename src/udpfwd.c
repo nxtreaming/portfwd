@@ -203,8 +203,10 @@ static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
 static atomic_uint conn_tbl_len;                /**< Atomic connection count */
 
+#if ENABLE_FINE_GRAINED_LOCKS
 /* Hash table bucket locks for fine-grained locking */
 static pthread_spinlock_t *conn_tbl_locks;
+#endif
 
 /* Connection pool */
 static struct conn_pool g_conn_pool;
@@ -243,12 +245,14 @@ static struct adaptive_batch g_adaptive_batch = {
 static LIST_HEAD(g_lru_list);
 static pthread_mutex_t g_lru_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#if ENABLE_LRU_LOCKS
 /* Segmented LRU update state to avoid O(N) scans */
 static struct {
     unsigned next_bucket;           /* Next bucket to scan in segmented update */
     time_t last_segment_update;     /* Last time we did a segment update */
     unsigned buckets_per_segment;   /* How many buckets to process per segment */
 } g_lru_segment_state = {0, 0, 64};
+#endif
 
 /* Cached current timestamp (monotonic seconds on Linux) for hot paths */
 static atomic_long g_now_ts;                    /**< Atomic timestamp cache */
@@ -1017,8 +1021,8 @@ proxy_conn_get_or_create(const struct config *cfg,
     /* ------------------------------------------ */
 
     /* Add to hash table with bucket lock */
-    unsigned bucket = bucket_index_fun(cli_addr);
 #if ENABLE_FINE_GRAINED_LOCKS
+    unsigned bucket = bucket_index_fun(cli_addr);
     pthread_spin_lock(&conn_tbl_locks[bucket]);
 #endif
     list_add_tail(&conn->list, chain);
@@ -1076,11 +1080,9 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
         return;
     }
 
-    /* Get bucket index for fine-grained locking */
-    unsigned bucket = bucket_index_fun(&conn->cli_addr);
-
     /* Remove from hash table with bucket lock */
 #if ENABLE_FINE_GRAINED_LOCKS
+    unsigned bucket = bucket_index_fun(&conn->cli_addr);
     pthread_spin_lock(&conn_tbl_locks[bucket]);
 #endif
     list_del(&conn->list);
