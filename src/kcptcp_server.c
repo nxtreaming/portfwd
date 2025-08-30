@@ -25,6 +25,7 @@
 #include "aead_protocol.h"
 #include "aead.h"
 #include "anti_replay.h"
+#include "secure_random.h"
 #include "buffer_limits.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
@@ -96,7 +97,6 @@ static struct conn_limiter g_conn_limiter = {0};
 /* Forward declarations */
 static void conn_cleanup_server(struct proxy_conn *conn, int epfd, struct kcp_map_safe *cmap);
 static void secure_zero(void *ptr, size_t len);
-static int buffer_ensure_capacity_server(struct buffer_info *buf, size_t needed, size_t max_size);
 static uint32_t generate_secure_conv(void);
 static bool rate_limit_check_addr(const union sockaddr_inx *addr);
 static bool conn_limit_check(const union sockaddr_inx *addr);
@@ -124,8 +124,6 @@ static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
                (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
 static int handle_system_error(const char *operation, int error_code);
-static int safe_epoll_add(int epfd, int fd, struct epoll_event *ev, const char *desc);
-static int safe_socket_operation(int fd, const char *operation);
 
 /* Connection pool management */
 static int init_conn_pool_server(void);
@@ -140,27 +138,7 @@ static void secure_zero(void *ptr, size_t len) {
     while (len--) *p++ = 0;
 }
 
-static int buffer_ensure_capacity_server(struct buffer_info *buf, size_t needed, size_t max_size) {
-    if (!buf) return -1;
-    if (buf->capacity >= needed) return 0;
 
-    size_t new_cap = buf->capacity ? buf->capacity * 2 : INITIAL_BUFFER_SIZE;
-    if (new_cap < needed) new_cap = needed;
-    if (new_cap > max_size) {
-        P_LOG_WARN("Buffer size limit exceeded: needed=%zu, max=%zu", needed, max_size);
-        return -1;
-    }
-
-    char *new_data = (char *)realloc(buf->data, new_cap);
-    if (!new_data) {
-        P_LOG_ERR("Buffer realloc failed: %s", strerror(errno));
-        return -1;
-    }
-
-    buf->data = new_data;
-    buf->capacity = new_cap;
-    return 0;
-}
 
 /* Unified connection cleanup function */
 static void conn_cleanup_server(struct proxy_conn *conn, int epfd, struct kcp_map_safe *cmap) {
@@ -406,7 +384,9 @@ static int handle_system_error(const char *operation, int error_code) {
 
     switch (error_code) {
         case EAGAIN:
+#if EAGAIN != EWOULDBLOCK
         case EWOULDBLOCK:
+#endif
             /* Non-blocking operation would block - not really an error */
             return 0;
         case EINTR:
@@ -427,42 +407,9 @@ static int handle_system_error(const char *operation, int error_code) {
     }
 }
 
-static int safe_epoll_add(int epfd, int fd, struct epoll_event *ev, const char *desc) {
-    if (epfd < 0 || fd < 0 || !ev || !desc) {
-        P_LOG_ERR("Invalid parameters for epoll add: %s", desc);
-        return -1;
-    }
 
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, ev) < 0) {
-        int err = errno;
-        P_LOG_ERR("Failed to add %s to epoll: %s", desc, strerror(err));
-        return handle_system_error("epoll_add", err);
-    }
 
-    return 0;
-}
 
-static int safe_socket_operation(int fd, const char *operation) {
-    if (fd < 0 || !operation) {
-        P_LOG_ERR("Invalid parameters for socket operation: %s", operation);
-        return -1;
-    }
-
-    /* Validate socket is still valid */
-    int error = 0;
-    socklen_t len = sizeof(error);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0) {
-        P_LOG_ERR("Socket validation failed for %s: %s", operation, strerror(errno));
-        return -1;
-    }
-
-    if (error != 0) {
-        P_LOG_ERR("Socket error detected for %s: %s", operation, strerror(error));
-        return -1;
-    }
-
-    return 0;
-}
 
 /* Connection pool management implementation */
 static int init_conn_pool_server(void) {
