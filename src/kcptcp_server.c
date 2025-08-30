@@ -557,7 +557,7 @@ static void print_usage(const char *prog) {
         "  -N                 enable TCP_NODELAY on outbound TCP to target");
     P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) [REQUIRED]");
     P_LOG_INFO("  -h                 show help");
-    P_LOG_INFO("");
+    P_LOG_INFO(" ");
     P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
 }
 
@@ -762,7 +762,7 @@ int main(int argc, char **argv) {
                             continue;
                         }
 
-                        if (rn < HELLO_MIN_SIZE) {
+                        if (rn < 0 || (size_t)rn < HELLO_MIN_SIZE) {
                             P_LOG_WARN("HELLO too short len=%zd, expected=%zu", rn, HELLO_MIN_SIZE);
                             continue;
                         }
@@ -779,8 +779,8 @@ int main(int argc, char **argv) {
 
                         /* Validate HMAC */
                         uint8_t expected_hmac[16];
-                        size_t hmac_data_len = sizeof(struct handshake_hello) - 16; /* Exclude HMAC field */
-                        compute_handshake_hmac(cfg.psk, (const uint8_t *)hello, hmac_data_len, expected_hmac);
+                        size_t hello_hmac_data_len = sizeof(struct handshake_hello) - 16; /* Exclude HMAC field */
+                        compute_handshake_hmac(cfg.psk, (const uint8_t *)hello, hello_hmac_data_len, expected_hmac);
 
                         if (memcmp(hello->hmac, expected_hmac, 16) != 0) {
                             P_LOG_WARN("HELLO HMAC validation failed from %s",
@@ -905,8 +905,8 @@ int main(int argc, char **argv) {
                         accept->timestamp = htonl((uint32_t)time(NULL));
 
                         /* Calculate HMAC over the message (excluding HMAC field itself) */
-                        size_t hmac_data_len = sizeof(struct handshake_accept) - 16; /* Exclude HMAC field */
-                        compute_handshake_hmac(cfg.psk, (const uint8_t *)accept, hmac_data_len, accept->hmac);
+                        size_t accept_hmac_data_len = sizeof(struct handshake_accept) - 16; /* Exclude HMAC field */
+                        compute_handshake_hmac(cfg.psk, (const uint8_t *)accept, accept_hmac_data_len, accept->hmac);
 
                         (void)sendto(
                             usock, abuf, sizeof(abuf), MSG_DONTWAIT,

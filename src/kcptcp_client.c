@@ -1096,7 +1096,7 @@ static void print_usage(const char *prog) {
     P_LOG_INFO("  -N                 enable TCP_NODELAY on client sockets");
     P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) [REQUIRED]");
     P_LOG_INFO("  -h                 show help");
-    P_LOG_INFO("");
+    P_LOG_INFO(" ");
     P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
 }
 
