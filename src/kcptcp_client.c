@@ -47,24 +47,7 @@
     P_LOG_WARN("conv=%u state=%d: " fmt, \
                (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
-/* Enhanced handshake protocol structures */
-struct handshake_hello_v2 {
-    uint8_t type;        /* KTP_HS_HELLO */
-    uint8_t version;     /* KCP_HS_VER */
-    uint8_t token[16];   /* Random token */
-    uint32_t timestamp;  /* Unix timestamp (network byte order) */
-    uint32_t nonce;      /* Additional random nonce */
-    uint8_t hmac[16];    /* HMAC-SHA256 truncated to 16 bytes */
-} __attribute__((packed));
 
-struct handshake_accept_v2 {
-    uint8_t type;        /* KTP_HS_ACCEPT */
-    uint8_t version;     /* KCP_HS_VER */
-    uint32_t conv;       /* Conversation ID (network byte order) */
-    uint8_t token[16];   /* Echo of client token */
-    uint32_t timestamp;  /* Server timestamp */
-    uint8_t hmac[16];    /* HMAC verification */
-} __attribute__((packed));
 
 /* Rate limiting structure */
 struct rate_limiter {
@@ -326,43 +309,64 @@ static int validate_handshake_timing(uint32_t timestamp) {
     return 0;
 }
 
+/* Simple HMAC implementation using ChaCha20-Poly1305 for authentication */
+static void compute_handshake_hmac(const uint8_t *psk, const uint8_t *data, size_t data_len, uint8_t *hmac_out) {
+    /* Use ChaCha20-Poly1305 as HMAC substitute:
+     * - Use PSK as key
+     * - Use first 12 bytes of data as nonce (padded if needed)
+     * - Compute authentication tag over the data
+     */
+    uint8_t nonce[12];
+    memset(nonce, 0, sizeof(nonce));
+    size_t nonce_len = data_len < 12 ? data_len : 12;
+    memcpy(nonce, data, nonce_len);
+
+    uint8_t tag[16];
+    uint8_t dummy_output[1]; /* We only need the tag */
+
+    /* Use ChaCha20-Poly1305 to compute authentication tag */
+    chacha20poly1305_seal(psk, nonce, NULL, 0, data, data_len, dummy_output, tag);
+
+    /* Copy first 16 bytes of tag as HMAC */
+    memcpy(hmac_out, tag, 16);
+}
+
 /* Generate enhanced HELLO message with HMAC authentication */
 static int generate_enhanced_hello(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
                                    unsigned char *out_buf, size_t *out_len) {
-    (void)psk; /* Unused parameter - reserved for future HMAC implementation */
     if (!conn || !out_buf || !out_len) return -1;
 
-    if (has_psk && sizeof(struct handshake_hello_v2) <= *out_len) {
-        /* Enhanced version with HMAC */
-        struct handshake_hello_v2 *hello = (struct handshake_hello_v2 *)out_buf;
-        hello->type = KTP_HS_HELLO;
-        hello->version = KCP_HS_VER;
-        memcpy(hello->token, conn->hs_token, 16);
-        hello->timestamp = htonl((uint32_t)time(NULL));
-
-        /* Generate additional nonce */
-        uint32_t nonce;
-        if (secure_random_bytes((unsigned char *)&nonce, sizeof(nonce)) != 0) {
-            return -1;
-        }
-        hello->nonce = nonce;
-
-        /* Calculate HMAC over the message (excluding HMAC field itself) */
-        /* For now, use a simple hash - in production, use proper HMAC-SHA256 */
-        memset(hello->hmac, 0, 16);
-        /* TODO: Implement proper HMAC calculation */
-
-        *out_len = sizeof(struct handshake_hello_v2);
-    } else {
-        /* Fallback to simple version */
-        if (*out_len < 1 + 1 + 16) return -1;
-
-        out_buf[0] = (unsigned char)KTP_HS_HELLO;
-        out_buf[1] = (unsigned char)KCP_HS_VER;
-        memcpy(out_buf + 2, conn->hs_token, 16);
-        *out_len = 1 + 1 + 16;
+    /* Only support PSK version now */
+    if (!has_psk || !psk) {
+        P_LOG_ERR("PSK is required for handshake");
+        return -1;
     }
 
+    if (sizeof(struct handshake_hello) > *out_len) {
+        P_LOG_ERR("Output buffer too small for HELLO");
+        return -1;
+    }
+
+    /* PSK version with HMAC */
+    struct handshake_hello *hello = (struct handshake_hello *)out_buf;
+    hello->type = KTP_HS_HELLO;
+    hello->version = KCP_HS_VER;
+    memcpy(hello->token, conn->hs_token, 16);
+    hello->timestamp = htonl((uint32_t)time(NULL));
+
+    /* Generate additional nonce */
+    uint32_t nonce;
+    if (secure_random_bytes((unsigned char *)&nonce, sizeof(nonce)) != 0) {
+        P_LOG_ERR("Failed to generate random nonce");
+        return -1;
+    }
+    hello->nonce = nonce;
+
+    /* Calculate HMAC over the message (excluding HMAC field itself) */
+    size_t hmac_data_len = sizeof(struct handshake_hello) - 16; /* Exclude HMAC field */
+    compute_handshake_hmac(psk, (const uint8_t *)hello, hmac_data_len, hello->hmac);
+
+    *out_len = sizeof(struct handshake_hello);
     return 0;
 }
 
@@ -503,39 +507,43 @@ static int handle_handshake_accept(struct client_ctx *ctx, struct proxy_conn *c,
     uint32_t conv;
     bool valid_accept = false;
 
-    /* Check if this is enhanced ACCEPT format */
-    if (ctx->cfg->has_psk && len >= sizeof(struct handshake_accept_v2)) {
-        struct handshake_accept_v2 *accept = (struct handshake_accept_v2 *)buf;
-        conv = ntohl(accept->conv);
-
-        /* Validate token */
-        if (memcmp(accept->token, c->hs_token, 16) != 0) {
-            LOG_CONN_WARN(c, "Enhanced ACCEPT token mismatch; ignore");
-            return 1; /* Continue processing other packets */
-        }
-
-        /* Validate timestamp */
-        if (validate_handshake_timing(accept->timestamp) != 0) {
-            LOG_CONN_WARN(c, "Enhanced ACCEPT timestamp validation failed; ignore");
-            return 1; /* Continue processing other packets */
-        }
-
-        /* TODO: Validate HMAC */
-        /* For now, accept if token and timestamp are valid */
-        valid_accept = true;
-
-    } else {
-        /* Fallback to simple ACCEPT format */
-        conv = (uint32_t)((unsigned char)buf[2] << 24 |
-                          (unsigned char)buf[3] << 16 |
-                          (unsigned char)buf[4] << 8 |
-                          (unsigned char)buf[5]);
-        if (memcmp(buf + 6, c->hs_token, 16) != 0) {
-            LOG_CONN_WARN(c, "ACCEPT token mismatch; ignore");
-            return 1; /* Continue processing other packets */
-        }
-        valid_accept = true;
+    /* Only support enhanced ACCEPT format with PSK */
+    if (!ctx->cfg->has_psk || !ctx->cfg->psk) {
+        LOG_CONN_ERR(c, "PSK is required for handshake");
+        return -1; /* Error: close connection */
     }
+
+    if (len < sizeof(struct handshake_accept)) {
+        LOG_CONN_WARN(c, "ACCEPT too short len=%zu, expected=%zu", len, sizeof(struct handshake_accept));
+        return 1; /* Continue processing other packets */
+    }
+
+    struct handshake_accept *accept = (struct handshake_accept *)buf;
+    conv = ntohl(accept->conv);
+
+    /* Validate token */
+    if (memcmp(accept->token, c->hs_token, 16) != 0) {
+        LOG_CONN_WARN(c, "Enhanced ACCEPT token mismatch; ignore");
+        return 1; /* Continue processing other packets */
+    }
+
+    /* Validate timestamp */
+    if (validate_handshake_timing(accept->timestamp) != 0) {
+        LOG_CONN_WARN(c, "Enhanced ACCEPT timestamp validation failed; ignore");
+        return 1; /* Continue processing other packets */
+    }
+
+    /* Validate HMAC */
+    uint8_t expected_hmac[16];
+    size_t hmac_data_len = sizeof(struct handshake_accept) - 16; /* Exclude HMAC field */
+    compute_handshake_hmac(ctx->cfg->psk, (const uint8_t *)accept, hmac_data_len, expected_hmac);
+
+    if (memcmp(accept->hmac, expected_hmac, 16) != 0) {
+        LOG_CONN_WARN(c, "Enhanced ACCEPT HMAC validation failed; ignore");
+        return 1; /* Continue processing other packets */
+    }
+
+    valid_accept = true;
 
     if (!valid_accept) {
         return 1; /* Continue processing other packets */
@@ -900,8 +908,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
             free(c);
             continue;
         }
-        /* Send HELLO with enhanced security if PSK is available */
-        unsigned char hbuf[sizeof(struct handshake_hello_v2)];
+        /* Send HELLO with PSK authentication */
+        unsigned char hbuf[sizeof(struct handshake_hello)];
         size_t hbuf_len = sizeof(hbuf);
 
         if (generate_enhanced_hello(c, ctx->cfg->psk, ctx->cfg->has_psk, hbuf, &hbuf_len) != 0) {
@@ -920,8 +928,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
                               (socklen_t)sizeof_sockaddr(&c->peer_addr));
         if (sent < 0) {
             P_LOG_WARN("Failed to send HELLO: %s", strerror(errno));
-        } else if (ctx->cfg->has_psk) {
-            P_LOG_DEBUG("Sent enhanced HELLO with HMAC authentication");
+        } else {
+            P_LOG_DEBUG("Sent HELLO with HMAC authentication");
         }
 
         /* Prepare epoll tags */
@@ -1086,8 +1094,10 @@ static void print_usage(const char *prog) {
     P_LOG_INFO(
         "  -W <rcvwnd>        KCP recv window in packets (default 1024)");
     P_LOG_INFO("  -N                 enable TCP_NODELAY on client sockets");
-    P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305)");
+    P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) [REQUIRED]");
     P_LOG_INFO("  -h                 show help");
+    P_LOG_INFO("");
+    P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
 }
 
 int main(int argc, char **argv) {
@@ -1147,6 +1157,12 @@ int main(int argc, char **argv) {
     }
     if (get_sockaddr_inx_pair(argv[pos + 1], &cfg.raddr, true) < 0) {
         P_LOG_ERR("invalid remote udp addr: %s", argv[pos + 1]);
+        return 2;
+    }
+
+    /* PSK is now required for all connections */
+    if (!cfg.has_psk) {
+        P_LOG_ERR("PSK (-K option) is required for secure handshake");
         return 2;
     }
 

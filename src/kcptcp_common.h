@@ -11,6 +11,30 @@
 extern "C" {
 #endif
 
+/* ---------------- Handshake Protocol Structures ---------------- */
+/* Handshake protocol structures */
+struct handshake_hello {
+    uint8_t type;        /* KTP_HS_HELLO */
+    uint8_t version;     /* KCP_HS_VER */
+    uint8_t token[16];   /* Random token */
+    uint32_t timestamp;  /* Unix timestamp (network byte order) */
+    uint32_t nonce;      /* Additional random nonce */
+    uint8_t hmac[16];    /* HMAC-SHA256 truncated to 16 bytes */
+} __attribute__((packed));
+
+struct handshake_accept {
+    uint8_t type;        /* KTP_HS_ACCEPT */
+    uint8_t version;     /* KCP_HS_VER */
+    uint32_t conv;       /* Conversation ID (network byte order) */
+    uint8_t token[16];   /* Echo of client token */
+    uint32_t timestamp;  /* Server timestamp */
+    uint8_t hmac[16];    /* HMAC verification */
+} __attribute__((packed));
+
+/* Handshake buffer size constants */
+#define HELLO_MIN_SIZE                  sizeof(struct handshake_hello)
+#define ACCEPT_BUFFER_SIZE              sizeof(struct handshake_accept)
+
 /* Env-controlled stats helpers */
 uint32_t get_stats_interval_ms(void);
 bool get_stats_dump_enabled(void);
