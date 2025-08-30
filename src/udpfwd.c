@@ -68,6 +68,8 @@
 #define BATCH_INCREASE_FACTOR 1.2         /* Reduced from 1.5 */
 #define BATCH_DECREASE_FACTOR 0.8         /* Reduced from 0.67 */
 
+#define BATCH_HASH_SIZE 64
+
 /* Performance optimization flags */
 #ifndef DISABLE_ADAPTIVE_BATCHING
 #define ENABLE_ADAPTIVE_BATCHING 1
@@ -92,13 +94,13 @@
 
 /* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
-#define UDP_PROXY_SOCKBUF_CAP (256 * 1024)
+#define UDP_PROXY_SOCKBUF_CAP (2 * 1024 * 1024)  /* Increased from 256KB to 2MB for better throughput */
 #endif
 
 /* Linux-specific batching parameters */
 #ifdef __linux__
 #ifndef UDP_PROXY_BATCH_SZ
-#define UDP_PROXY_BATCH_SZ 16
+#define UDP_PROXY_BATCH_SZ 512  /* Increased from 16 for much better performance */
 #endif
 #ifndef UDP_PROXY_DGRAM_CAP
 /* Max safe UDP payload size: 65535 - 8 (UDP header) - 20 (IPv4 header) */
@@ -233,6 +235,26 @@ static volatile sig_atomic_t g_shutdown_requested = 0;
 
 /* Global rate limiter for security */
 static struct rate_limiter g_rate_limiter;
+
+/* Simple backpressure queue for handling EAGAIN */
+#define BACKPRESSURE_QUEUE_SIZE 1024
+struct backpressure_entry {
+    int sock;
+    char data[UDP_PROXY_DGRAM_CAP];
+    size_t len;
+    union sockaddr_inx dest_addr;
+    socklen_t dest_len;
+};
+
+struct backpressure_queue {
+    struct backpressure_entry entries[BACKPRESSURE_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t lock;
+};
+
+static struct backpressure_queue g_backpressure_queue;
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Utility Functions */
@@ -434,6 +456,87 @@ static bool validate_packet(const char *data, size_t len, const union sockaddr_i
     (void)data; /* Suppress unused parameter warning for now */
     return true;
 #endif
+}
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Backpressure Queue Management */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+/* Initialize backpressure queue */
+static int init_backpressure_queue(void) {
+    memset(&g_backpressure_queue, 0, sizeof(g_backpressure_queue));
+    if (pthread_mutex_init(&g_backpressure_queue.lock, NULL) != 0) {
+        P_LOG_ERR("Failed to initialize backpressure queue mutex");
+        return -1;
+    }
+    return 0;
+}
+
+/* Destroy backpressure queue */
+static void destroy_backpressure_queue(void) {
+    pthread_mutex_destroy(&g_backpressure_queue.lock);
+    memset(&g_backpressure_queue, 0, sizeof(g_backpressure_queue));
+}
+
+/* Add entry to backpressure queue */
+static bool enqueue_backpressure(int sock, const char *data, size_t len,
+                                 const union sockaddr_inx *dest_addr, socklen_t dest_len) {
+    pthread_mutex_lock(&g_backpressure_queue.lock);
+
+    if (g_backpressure_queue.count >= BACKPRESSURE_QUEUE_SIZE) {
+        pthread_mutex_unlock(&g_backpressure_queue.lock);
+        return false; /* Queue full */
+    }
+
+    struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.tail];
+    entry->sock = sock;
+    memcpy(entry->data, data, len);
+    entry->len = len;
+    if (dest_addr) {
+        entry->dest_addr = *dest_addr;
+        entry->dest_len = dest_len;
+    } else {
+        entry->dest_len = 0;
+    }
+
+    g_backpressure_queue.tail = (g_backpressure_queue.tail + 1) % BACKPRESSURE_QUEUE_SIZE;
+    g_backpressure_queue.count++;
+
+    pthread_mutex_unlock(&g_backpressure_queue.lock);
+    return true;
+}
+
+/* Process backpressure queue */
+static void process_backpressure_queue(void) {
+    pthread_mutex_lock(&g_backpressure_queue.lock);
+
+    while (g_backpressure_queue.count > 0) {
+        struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.head];
+
+        ssize_t sent;
+        if (entry->dest_len > 0) {
+            /* UDP sendto */
+            sent = sendto(entry->sock, entry->data, entry->len, 0,
+                         (struct sockaddr *)&entry->dest_addr, entry->dest_len);
+        } else {
+            /* Connected UDP send */
+            sent = send(entry->sock, entry->data, entry->len, 0);
+        }
+
+        if (sent < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                /* Still blocked, stop processing */
+                break;
+            }
+            /* Other error, drop this packet and continue */
+        }
+
+        /* Move to next entry */
+        g_backpressure_queue.head = (g_backpressure_queue.head + 1) % BACKPRESSURE_QUEUE_SIZE;
+        g_backpressure_queue.count--;
+    }
+
+    pthread_mutex_unlock(&g_backpressure_queue.lock);
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -687,14 +790,41 @@ static uint32_t hash_addr(const union sockaddr_inx *a) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
-    /* Move to MRU (tail) and refresh timestamp - thread safe */
+    /* Only update timestamp, defer LRU update to reduce lock contention */
     time_t snap = atomic_load(&g_now_ts);
     conn->last_active = snap ? snap : monotonic_seconds();
 
-    /* Update LRU list with global lock */
+    /* Mark for LRU update instead of doing it immediately */
+    conn->needs_lru_update = true;
+}
+
+/* Batch update LRU for connections that need it */
+static void batch_update_lru(void) {
+    static time_t last_lru_update = 0;
+    time_t now = time(NULL);
+
+    /* Only update LRU every few seconds to reduce overhead */
+    if (now - last_lru_update < 2) {
+        return;
+    }
+    last_lru_update = now;
+
     pthread_mutex_lock(&g_lru_lock);
-    list_del(&conn->lru);
-    list_add_tail(&conn->lru, &g_lru_list);
+
+    /* Walk through hash table and update LRU for marked connections */
+    for (unsigned i = 0; i < g_conn_tbl_hash_size; i++) {
+        struct proxy_conn *conn, *tmp;
+        pthread_spin_lock(&conn_tbl_locks[i]);
+        list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
+            if (conn->needs_lru_update) {
+                list_del(&conn->lru);
+                list_add_tail(&conn->lru, &g_lru_list);
+                conn->needs_lru_update = false;
+            }
+        }
+        pthread_spin_unlock(&conn_tbl_locks[i]);
+    }
+
     pthread_mutex_unlock(&g_lru_lock);
 }
 
@@ -978,6 +1108,10 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
             } batches[UDP_PROXY_BATCH_SZ];
             int num_batches = 0;
 
+            /* Hash table for O(1) batch lookup instead of O(n) linear scan */
+            int batch_hash[BATCH_HASH_SIZE];
+            memset(batch_hash, -1, sizeof(batch_hash));
+
             for (int i = 0; i < n; i++) {
                 union sockaddr_inx *sa =
                     (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
@@ -995,13 +1129,15 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     continue;
                 touch_proxy_conn(conn);
 
-                int batch_idx = -1;
-                for (int k = 0; k < num_batches; k++) {
-                    if (batches[k].sock == conn->svr_sock) {
-                        batch_idx = k;
-                        break;
-                    }
+                /* O(1) batch lookup using hash table instead of O(n) linear scan */
+                int hash_key = conn->svr_sock % BATCH_HASH_SIZE;
+                int batch_idx = batch_hash[hash_key];
+
+                /* Verify hash hit (handle collisions) */
+                if (batch_idx != -1 && batches[batch_idx].sock != conn->svr_sock) {
+                    batch_idx = -1; /* Hash collision, need new batch */
                 }
+
                 if (batch_idx == -1) {
                     int optimal_batch_size = get_optimal_batch_size();
                     if (num_batches >= optimal_batch_size) {
@@ -1015,6 +1151,8 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     batch_idx = num_batches++;
                     batches[batch_idx].sock = conn->svr_sock;
                     batches[batch_idx].count = 0;
+                    /* Update hash table for O(1) future lookups */
+                    batch_hash[hash_key] = batch_idx;
                 }
                 if (batches[batch_idx].count >= get_optimal_batch_size()) {
                     atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
@@ -1046,8 +1184,17 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     if (sent < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK ||
                             errno == EINTR) {
-                            /* Transient backpressure; give up remaining for now */
-                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
+                            /* Try to queue remaining messages instead of dropping */
+                            for (int k = 0; k < remaining; k++) {
+                                struct mmsghdr *msg = &msgp[k];
+                                if (!enqueue_backpressure(b->sock,
+                                    (char *)msg->msg_hdr.msg_iov->iov_base,
+                                    msg->msg_len, NULL, 0)) {
+                                    /* Queue full, count as overflow */
+                                    atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
+                                    break;
+                                }
+                            }
                             break;
                         }
                         P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, remaining=%d",
@@ -1139,7 +1286,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
         g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
 
     for (; iterations < max_iterations; iterations++) {
-        memset(msgs, 0, sizeof(msgs));
+        /* Only initialize what we need instead of expensive full memset */
         for (int i = 0; i < ncap; i++) {
             iovs[i].iov_base = bufs[i];
             iovs[i].iov_len = UDP_PROXY_DGRAM_CAP;
@@ -1148,6 +1295,9 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
             /* For recvmmsg on connected UDP, msg_name must be NULL */
             msgs[i].msg_hdr.msg_name = NULL;
             msgs[i].msg_hdr.msg_namelen = 0;
+            msgs[i].msg_hdr.msg_control = NULL;
+            msgs[i].msg_hdr.msg_controllen = 0;
+            msgs[i].msg_hdr.msg_flags = 0;
         }
 
         int n = recvmmsg(conn->svr_sock, msgs, ncap, 0, NULL);
@@ -1510,6 +1660,14 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    /* Initialize backpressure queue */
+    if (init_backpressure_queue() != 0) {
+        destroy_rate_limiter();
+        destroy_conn_pool();
+        rc = 1;
+        goto cleanup;
+    }
+
     /* Create listening socket */
     lsn_sock = socket(cfg.src_addr.sa.sa_family, SOCK_DGRAM, 0);
     if (lsn_sock < 0) {
@@ -1671,6 +1829,10 @@ int main(int argc, char *argv[]) {
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= 2) {
             proxy_conn_walk_continue(&cfg, 200, epfd);
+            /* Batch update LRU to reduce per-packet overhead */
+            batch_update_lru();
+            /* Process any queued backpressure packets */
+            process_backpressure_queue();
             last_check = current_ts;
         }
 
@@ -1745,6 +1907,7 @@ cleanup:
     conn_tbl_hbase = NULL;
     destroy_conn_pool();
     destroy_rate_limiter();
+    destroy_backpressure_queue();
 #ifdef __linux__
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
 #endif

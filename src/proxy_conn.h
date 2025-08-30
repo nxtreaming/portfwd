@@ -60,6 +60,7 @@ struct proxy_conn {
     int svr_fd;
     time_t last_active;
     struct list_head lru; /* LRU linkage: oldest at head, newest at tail */
+    bool needs_lru_update; /* Flag to batch LRU updates for performance */
 
     /* KCP tunneling fields (used by kcptcp-* binaries) */
     struct IKCPCB *kcp; /* KCP control block */
