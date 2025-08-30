@@ -89,6 +89,24 @@
 #define ENABLE_PACKET_VALIDATION 0
 #endif
 
+#ifndef DISABLE_FINE_GRAINED_LOCKS
+#define ENABLE_FINE_GRAINED_LOCKS 1
+#else
+#define ENABLE_FINE_GRAINED_LOCKS 0
+#endif
+
+#ifndef DISABLE_LRU_LOCKS
+#define ENABLE_LRU_LOCKS 1
+#else
+#define ENABLE_LRU_LOCKS 0
+#endif
+
+#ifndef DISABLE_BACKPRESSURE_QUEUE
+#define ENABLE_BACKPRESSURE_QUEUE 1
+#else
+#define ENABLE_BACKPRESSURE_QUEUE 0
+#endif
+
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
 
@@ -800,6 +818,7 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 
 /* Batch update LRU for connections that need it */
 static void batch_update_lru(void) {
+#if ENABLE_LRU_LOCKS
     static time_t last_lru_update = 0;
     time_t now = time(NULL);
 
@@ -814,7 +833,9 @@ static void batch_update_lru(void) {
     /* Walk through hash table and update LRU for marked connections */
     for (unsigned i = 0; i < g_conn_tbl_hash_size; i++) {
         struct proxy_conn *conn, *tmp;
+#if ENABLE_FINE_GRAINED_LOCKS
         pthread_spin_lock(&conn_tbl_locks[i]);
+#endif
         list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
             if (conn->needs_lru_update) {
                 list_del(&conn->lru);
@@ -822,10 +843,13 @@ static void batch_update_lru(void) {
                 conn->needs_lru_update = false;
             }
         }
+#if ENABLE_FINE_GRAINED_LOCKS
         pthread_spin_unlock(&conn_tbl_locks[i]);
+#endif
     }
 
     pthread_mutex_unlock(&g_lru_lock);
+#endif
 }
 
 static struct proxy_conn *
@@ -920,14 +944,22 @@ proxy_conn_get_or_create(const struct config *cfg,
 
     /* Add to hash table with bucket lock */
     unsigned bucket = bucket_index_fun(cli_addr);
+#if ENABLE_FINE_GRAINED_LOCKS
     pthread_spin_lock(&conn_tbl_locks[bucket]);
+#endif
     list_add_tail(&conn->list, chain);
+#if ENABLE_FINE_GRAINED_LOCKS
     pthread_spin_unlock(&conn_tbl_locks[bucket]);
+#endif
 
     /* Add to LRU list with global lock */
+#if ENABLE_LRU_LOCKS
     pthread_mutex_lock(&g_lru_lock);
+#endif
     list_add_tail(&conn->lru, &g_lru_list);
+#if ENABLE_LRU_LOCKS
     pthread_mutex_unlock(&g_lru_lock);
+#endif
 
     /* Update connection count atomically */
     unsigned new_count = atomic_fetch_add(&conn_tbl_len, 1) + 1;
@@ -968,17 +1000,25 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     unsigned bucket = bucket_index_fun(&conn->cli_addr);
 
     /* Remove from hash table with bucket lock */
+#if ENABLE_FINE_GRAINED_LOCKS
     pthread_spin_lock(&conn_tbl_locks[bucket]);
+#endif
     list_del(&conn->list);
+#if ENABLE_FINE_GRAINED_LOCKS
     pthread_spin_unlock(&conn_tbl_locks[bucket]);
+#endif
 
     /* Update global connection count atomically */
     atomic_fetch_sub(&conn_tbl_len, 1);
 
     /* Remove from LRU list with global LRU lock */
+#if ENABLE_LRU_LOCKS
     pthread_mutex_lock(&g_lru_lock);
+#endif
     list_del(&conn->lru);
+#if ENABLE_LRU_LOCKS
     pthread_mutex_unlock(&g_lru_lock);
+#endif
 
     /* Remove from epoll and close socket */
     if (conn->svr_sock >= 0) {
@@ -1185,6 +1225,7 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                         if (errno == EAGAIN || errno == EWOULDBLOCK ||
                             errno == EINTR) {
                             /* Try to queue remaining messages instead of dropping */
+#if ENABLE_BACKPRESSURE_QUEUE
                             for (int k = 0; k < remaining; k++) {
                                 struct mmsghdr *msg = &msgp[k];
                                 if (!enqueue_backpressure(b->sock,
@@ -1195,6 +1236,10 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                                     break;
                                 }
                             }
+#else
+                            /* Just count as overflow when backpressure queue disabled */
+                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
+#endif
                             break;
                         }
                         P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, remaining=%d",
@@ -1661,12 +1706,14 @@ int main(int argc, char *argv[]) {
     }
 
     /* Initialize backpressure queue */
+#if ENABLE_BACKPRESSURE_QUEUE
     if (init_backpressure_queue() != 0) {
         destroy_rate_limiter();
         destroy_conn_pool();
         rc = 1;
         goto cleanup;
     }
+#endif
 
     /* Create listening socket */
     lsn_sock = socket(cfg.src_addr.sa.sa_family, SOCK_DGRAM, 0);
@@ -1773,6 +1820,11 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
+        INIT_LIST_HEAD(&conn_tbl_hbase[i]);
+    }
+
+#if ENABLE_FINE_GRAINED_LOCKS
     /* Allocate fine-grained locks for hash table buckets */
     conn_tbl_locks = malloc(sizeof(pthread_spinlock_t) * g_conn_tbl_hash_size);
     if (!conn_tbl_locks) {
@@ -1784,7 +1836,6 @@ int main(int argc, char *argv[]) {
     }
 
     for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
-        INIT_LIST_HEAD(&conn_tbl_hbase[i]);
         if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) != 0) {
             P_LOG_ERR("Failed to initialize hash table lock %d", i);
             /* Clean up already initialized locks */
@@ -1799,6 +1850,7 @@ int main(int argc, char *argv[]) {
             goto cleanup;
         }
     }
+#endif
     atomic_store(&conn_tbl_len, 0);
 
     last_check = monotonic_seconds();
@@ -1832,7 +1884,9 @@ int main(int argc, char *argv[]) {
             /* Batch update LRU to reduce per-packet overhead */
             batch_update_lru();
             /* Process any queued backpressure packets */
+#if ENABLE_BACKPRESSURE_QUEUE
             process_backpressure_queue();
+#endif
             last_check = current_ts;
         }
 
@@ -1895,6 +1949,7 @@ cleanup:
     epoll_close_comp(epfd);
 
     /* Destroy hash table locks */
+#if ENABLE_FINE_GRAINED_LOCKS
     if (conn_tbl_locks) {
         for (unsigned i = 0; i < g_conn_tbl_hash_size; i++) {
             pthread_spin_destroy(&conn_tbl_locks[i]);
@@ -1902,12 +1957,15 @@ cleanup:
         free((void *)conn_tbl_locks);
         conn_tbl_locks = NULL;
     }
+#endif
 
     free(conn_tbl_hbase);
     conn_tbl_hbase = NULL;
     destroy_conn_pool();
     destroy_rate_limiter();
+#if ENABLE_BACKPRESSURE_QUEUE
     destroy_backpressure_queue();
+#endif
 #ifdef __linux__
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
 #endif
