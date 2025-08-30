@@ -85,5 +85,6 @@ static inline int ep_add_or_mod(int epfd, int sock, struct epoll_event *ev) {
 #define P_LOG_ERR(fmt, ...) LOG_MSG(LOG_ERR, "ERROR: " fmt, ##__VA_ARGS__)
 #define P_LOG_WARN(fmt, ...) LOG_MSG(LOG_WARNING, "WARN: " fmt, ##__VA_ARGS__)
 #define P_LOG_INFO(fmt, ...) LOG_MSG(LOG_INFO, fmt, ##__VA_ARGS__)
+#define P_LOG_DEBUG(fmt, ...) LOG_MSG(LOG_DEBUG, "DEBUG: " fmt, ##__VA_ARGS__)
 
 #endif /* __PORTFWD_COMMON_H__ */
