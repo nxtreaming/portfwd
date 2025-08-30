@@ -1180,59 +1180,59 @@ int main(int argc, char **argv) {
         /* Timers and cleanup */
         uint32_t now = kcp_now_ms();
 
-        struct proxy_conn *pos, *tmp;
-        list_for_each_entry_safe(pos, tmp, &conns, list) {
-            (void)kcp_update_flush(pos, now);
+        struct proxy_conn *conn, *tmp;
+        list_for_each_entry_safe(conn, tmp, &conns, list) {
+            (void)kcp_update_flush(conn, now);
             /* If server TCP got EOF, wait until all buffered client->server
              * data is flushed before closing */
-            if (pos->svr_in_eof && pos->state != S_CLOSING) {
-                bool tcp_buf_empty = (pos->request.dlen == pos->request.rpos);
-                int kcp_unsent = pos->kcp ? ikcp_waitsnd(pos->kcp) : 0;
-                bool udp_backlog_empty = (pos->udp_backlog.dlen == 0);
+            if (conn->svr_in_eof && conn->state != S_CLOSING) {
+                bool tcp_buf_empty = (conn->request.dlen == conn->request.rpos);
+                int kcp_unsent = conn->kcp ? ikcp_waitsnd(conn->kcp) : 0;
+                bool udp_backlog_empty = (conn->udp_backlog.dlen == 0);
                 if (tcp_buf_empty && kcp_unsent == 0 && udp_backlog_empty) {
-                    pos->state = S_CLOSING;
+                    conn->state = S_CLOSING;
                 }
             }
             /* Idle timeout (e.g., 180s) */
             time_t ct = time(NULL);
             const time_t IDLE_TO = 180;
-            if (pos->state != S_CLOSING && pos->last_active &&
-                (ct - pos->last_active) > IDLE_TO) {
-                P_LOG_INFO("idle timeout, conv=%u", pos->conv);
-                pos->state = S_CLOSING;
+            if (conn->state != S_CLOSING && conn->last_active &&
+                (ct - conn->last_active) > IDLE_TO) {
+                P_LOG_INFO("idle timeout, conv=%u", conn->conv);
+                conn->state = S_CLOSING;
             }
             /* Rekey timeout enforcement */
-            if (pos->state != S_CLOSING && pos->has_session_key &&
-                pos->rekey_in_progress) {
-                if (now >= pos->rekey_deadline_ms) {
+            if (conn->state != S_CLOSING && conn->has_session_key &&
+                conn->rekey_in_progress) {
+                if (now >= conn->rekey_deadline_ms) {
                     P_LOG_ERR("rekey timeout, closing conv=%u (svr)",
-                              pos->conv);
-                    pos->state = S_CLOSING;
+                              conn->conv);
+                    conn->state = S_CLOSING;
                 }
             }
             /* Periodic runtime stats logging (~5s, configurable) */
-            if (pos->kcp && get_stats_enabled()) {
+            if (conn->kcp && get_stats_enabled()) {
                 uint64_t now_ms = now;
-                if (pos->last_stat_ms == 0) {
-                    pos->last_stat_ms = now_ms;
-                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
-                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
-                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
-                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
-                    pos->last_kcp_xmit = pos->kcp->xmit;
-                    pos->last_rekeys_initiated = pos->rekeys_initiated;
-                    pos->last_rekeys_completed = pos->rekeys_completed;
-                } else if (now_ms - pos->last_stat_ms >= get_stats_interval_ms()) {
-                    uint64_t dt = now_ms - pos->last_stat_ms;
-                    uint64_t d_tcp_rx = pos->tcp_rx_bytes - pos->last_tcp_rx_bytes;
-                    uint64_t d_tcp_tx = pos->tcp_tx_bytes - pos->last_tcp_tx_bytes;
-                    uint64_t d_kcp_tx = pos->kcp_tx_bytes - pos->last_kcp_tx_bytes;
-                    uint64_t d_kcp_rx = pos->kcp_rx_bytes - pos->last_kcp_rx_bytes;
-                    uint32_t d_xmit = pos->kcp->xmit - pos->last_kcp_xmit;
+                if (conn->last_stat_ms == 0) {
+                    conn->last_stat_ms = now_ms;
+                    conn->last_tcp_rx_bytes = conn->tcp_rx_bytes;
+                    conn->last_tcp_tx_bytes = conn->tcp_tx_bytes;
+                    conn->last_kcp_tx_bytes = conn->kcp_tx_bytes;
+                    conn->last_kcp_rx_bytes = conn->kcp_rx_bytes;
+                    conn->last_kcp_xmit = conn->kcp->xmit;
+                    conn->last_rekeys_initiated = conn->rekeys_initiated;
+                    conn->last_rekeys_completed = conn->rekeys_completed;
+                } else if (now_ms - conn->last_stat_ms >= get_stats_interval_ms()) {
+                    uint64_t dt = now_ms - conn->last_stat_ms;
+                    uint64_t d_tcp_rx = conn->tcp_rx_bytes - conn->last_tcp_rx_bytes;
+                    uint64_t d_tcp_tx = conn->tcp_tx_bytes - conn->last_tcp_tx_bytes;
+                    uint64_t d_kcp_tx = conn->kcp_tx_bytes - conn->last_kcp_tx_bytes;
+                    uint64_t d_kcp_rx = conn->kcp_rx_bytes - conn->last_kcp_rx_bytes;
+                    uint32_t d_xmit = conn->kcp->xmit - conn->last_kcp_xmit;
                     uint32_t d_rekey_i =
-                        pos->rekeys_initiated - pos->last_rekeys_initiated;
+                        conn->rekeys_initiated - conn->last_rekeys_initiated;
                     uint32_t d_rekey_c =
-                        pos->rekeys_completed - pos->last_rekeys_completed;
+                        conn->rekeys_completed - conn->last_rekeys_completed;
                     double sec = (double)dt / 1000.0;
                     double tcp_in_mbps =
                         sec > 0 ? (double)d_tcp_rx * 8.0 / (sec * 1e6) : 0.0;
@@ -1246,37 +1246,37 @@ int main(int argc, char **argv) {
                         "stats conv=%u: TCP in=%.3f Mbps out=%.3f Mbps | "
                         "KCP payload in=%.3f Mbps out=%.3f Mbps | KCP "
                         "xmit_delta=%u RTT=%dms | rekey i=%u c=%u",
-                        pos->conv, tcp_in_mbps, tcp_out_mbps, kcp_in_mbps,
-                        kcp_out_mbps, d_xmit, pos->kcp->rx_srtt, d_rekey_i,
+                        conn->conv, tcp_in_mbps, tcp_out_mbps, kcp_in_mbps,
+                        kcp_out_mbps, d_xmit, conn->kcp->rx_srtt, d_rekey_i,
                         d_rekey_c);
-                    pos->last_stat_ms = now_ms;
-                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
-                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
-                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
-                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
-                    pos->last_kcp_xmit = pos->kcp->xmit;
-                    pos->last_rekeys_initiated = pos->rekeys_initiated;
-                    pos->last_rekeys_completed = pos->rekeys_completed;
+                    conn->last_stat_ms = now_ms;
+                    conn->last_tcp_rx_bytes = conn->tcp_rx_bytes;
+                    conn->last_tcp_tx_bytes = conn->tcp_tx_bytes;
+                    conn->last_kcp_tx_bytes = conn->kcp_tx_bytes;
+                    conn->last_kcp_rx_bytes = conn->kcp_rx_bytes;
+                    conn->last_kcp_xmit = conn->kcp->xmit;
+                    conn->last_rekeys_initiated = conn->rekeys_initiated;
+                    conn->last_rekeys_completed = conn->rekeys_completed;
                 }
             }
-            if (pos->state == S_CLOSING) {
+            if (conn->state == S_CLOSING) {
                 if (get_stats_dump_enabled()) {
                     P_LOG_INFO(
                         "stats total conv=%u: tcp_rx=%llu tcp_tx=%llu "
                         "udp_rx=%llu udp_tx=%llu kcp_rx_msgs=%llu "
                         "kcp_tx_msgs=%llu kcp_rx_bytes=%llu "
                         "kcp_tx_bytes=%llu rekeys_i=%u rekeys_c=%u",
-                        pos->conv, (unsigned long long)pos->tcp_rx_bytes,
-                        (unsigned long long)pos->tcp_tx_bytes,
-                        (unsigned long long)pos->udp_rx_bytes,
-                        (unsigned long long)pos->udp_tx_bytes,
-                        (unsigned long long)pos->kcp_rx_msgs,
-                        (unsigned long long)pos->kcp_tx_msgs,
-                        (unsigned long long)pos->kcp_rx_bytes,
-                        (unsigned long long)pos->kcp_tx_bytes,
-                        pos->rekeys_initiated, pos->rekeys_completed);
+                        conn->conv, (unsigned long long)conn->tcp_rx_bytes,
+                        (unsigned long long)conn->tcp_tx_bytes,
+                        (unsigned long long)conn->udp_rx_bytes,
+                        (unsigned long long)conn->udp_tx_bytes,
+                        (unsigned long long)conn->kcp_rx_msgs,
+                        (unsigned long long)conn->kcp_tx_msgs,
+                        (unsigned long long)conn->kcp_rx_bytes,
+                        (unsigned long long)conn->kcp_tx_bytes,
+                        conn->rekeys_initiated, conn->rekeys_completed);
                 }
-                conn_cleanup_server(pos, epfd, &cmap);
+                conn_cleanup_server(conn, epfd, &cmap);
             }
         }
     }
