@@ -52,9 +52,9 @@
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 60
 #define DEFAULT_HASH_TABLE_SIZE 4093
-#define MIN_BATCH_SIZE 4
+#define MIN_BATCH_SIZE 64              /* Increased from 4 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
-#define BATCH_ADJUST_INTERVAL_SEC 5
+#define BATCH_ADJUST_INTERVAL_SEC 30   /* Reduced frequency from 5 to 30 seconds */
 #define RATE_LIMIT_WINDOW_SEC 1
 
 /* Hash function constants */
@@ -62,11 +62,30 @@
 #define FNV_OFFSET_32 0x811c9dc5
 #define GOLDEN_RATIO_32 0x9e3779b9
 
-/* Adaptive batch sizing thresholds */
-#define BATCH_HIGH_UTILIZATION_RATIO 0.8
-#define BATCH_LOW_UTILIZATION_RATIO 0.3
-#define BATCH_INCREASE_FACTOR 1.5
-#define BATCH_DECREASE_FACTOR 0.67
+/* Adaptive batch sizing thresholds - less aggressive */
+#define BATCH_HIGH_UTILIZATION_RATIO 0.9  /* Increased from 0.8 */
+#define BATCH_LOW_UTILIZATION_RATIO 0.1   /* Decreased from 0.3 */
+#define BATCH_INCREASE_FACTOR 1.2         /* Reduced from 1.5 */
+#define BATCH_DECREASE_FACTOR 0.8         /* Reduced from 0.67 */
+
+/* Performance optimization flags */
+#ifndef DISABLE_ADAPTIVE_BATCHING
+#define ENABLE_ADAPTIVE_BATCHING 1
+#else
+#define ENABLE_ADAPTIVE_BATCHING 0
+#endif
+
+#ifndef DISABLE_RATE_LIMITING
+#define ENABLE_RATE_LIMITING 1
+#else
+#define ENABLE_RATE_LIMITING 0
+#endif
+
+#ifndef DISABLE_PACKET_VALIDATION
+#define ENABLE_PACKET_VALIDATION 1
+#else
+#define ENABLE_PACKET_VALIDATION 0
+#endif
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
@@ -185,7 +204,7 @@ struct adaptive_batch {
 };
 
 static struct adaptive_batch g_adaptive_batch = {
-    .current_size = UDP_PROXY_BATCH_SZ,
+    .current_size = UDP_PROXY_BATCH_SZ,  /* Start with full batch size */
     .min_size = MIN_BATCH_SIZE,
     .max_size = MAX_BATCH_SIZE,
     .total_packets = 0,
@@ -326,6 +345,11 @@ static void destroy_rate_limiter(void) {
 
 /* Check if packet is allowed by rate limiter */
 static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size) {
+#if !ENABLE_RATE_LIMITING
+    (void)addr;
+    (void)packet_size;
+    return true; /* Rate limiting disabled at compile time */
+#else
     if (g_rate_limiter.max_pps == 0 && g_rate_limiter.max_bps == 0 &&
         g_rate_limiter.max_per_ip == 0) {
         return true; /* No limits configured */
@@ -383,10 +407,17 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
 
     pthread_mutex_unlock(&g_rate_limiter.lock);
     return true;
+#endif
 }
 
 /* Validate packet size and content */
 static bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
+#if !ENABLE_PACKET_VALIDATION
+    (void)data;
+    (void)len;
+    (void)src;
+    return true; /* Packet validation disabled at compile time */
+#else
     /* Check packet size limits */
     if (len < 1 || len > UDP_PROXY_DGRAM_CAP) {
         P_LOG_WARN("Invalid packet size %zu from %s (min=1, max=%d)",
@@ -402,6 +433,7 @@ static bool validate_packet(const char *data, size_t len, const union sockaddr_i
 
     (void)data; /* Suppress unused parameter warning for now */
     return true;
+#endif
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -461,13 +493,21 @@ static void adjust_batch_size(void) {
 
 /* Get current optimal batch size */
 static int get_optimal_batch_size(void) {
+#if ENABLE_ADAPTIVE_BATCHING
     return g_adaptive_batch.current_size;
+#else
+    return UDP_PROXY_BATCH_SZ; /* Use fixed batch size for maximum performance */
+#endif
 }
 
 /* Record batch statistics */
 static void record_batch_stats(int packets_in_batch) {
+#if ENABLE_ADAPTIVE_BATCHING
     atomic_fetch_add(&g_adaptive_batch.total_packets, packets_in_batch);
     atomic_fetch_add(&g_adaptive_batch.total_batches, 1);
+#else
+    (void)packets_in_batch; /* Suppress unused parameter warning */
+#endif
 }
 #endif
 
@@ -1038,12 +1078,14 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
         }
 
         /* Periodically adjust batch size based on performance */
+#if ENABLE_ADAPTIVE_BATCHING
         static time_t last_adjust_check = 0;
         time_t now = time(NULL);
         if (now - last_adjust_check >= BATCH_ADJUST_INTERVAL_SEC) {
             adjust_batch_size();
             last_adjust_check = now;
         }
+#endif
 
         return;
     }

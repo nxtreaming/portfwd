@@ -28,6 +28,13 @@ tcpfwd: $(BUILD_DIR)/tcpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
 udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)
 
+# High-performance version with optimizations disabled
+udpfwd-fast: $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o udpfwd-fast $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)
+
+$(BUILD_DIR)/udpfwd-fast.o: udpfwd.c
+	$(CC) $(CFLAGS) -DDISABLE_ADAPTIVE_BATCHING -DDISABLE_RATE_LIMITING -DDISABLE_PACKET_VALIDATION -c -o $@ $<
+
 # KCP-based TCP-over-UDP binaries with AEAD support
 KCPOBJS = $(BUILD_DIR)/kcp_common.o $(BUILD_DIR)/3rd/kcp/ikcp.o
 AEADOBJS = $(BUILD_DIR)/anti_replay.o $(BUILD_DIR)/aead_protocol.o $(BUILD_DIR)/aead.o $(BUILD_DIR)/secure_random.o $(BUILD_DIR)/3rd/chacha20poly1305/chacha20poly1305.o
