@@ -215,6 +215,7 @@ static int g_conn_pool_capacity = UDP_PROXY_MAX_CONNS;
 #ifdef __linux__
 static int g_batch_sz_runtime = UDP_PROXY_BATCH_SZ;
 
+#if ENABLE_ADAPTIVE_BATCHING
 /* Dynamic batch sizing */
 struct adaptive_batch {
     int current_size;
@@ -235,6 +236,7 @@ static struct adaptive_batch g_adaptive_batch = {
     .last_adjust = 0,
     .lock = PTHREAD_MUTEX_INITIALIZER
 };
+#endif /* ENABLE_ADAPTIVE_BATCHING */
 #endif
 
 /* Global LRU list for O(1) oldest selection - protected by mutex */
