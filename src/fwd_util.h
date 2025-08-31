@@ -59,14 +59,16 @@ struct proxy_stats {
 struct conn_limit_entry {
     union sockaddr_inx addr;
     uint32_t count;
+    time_t first_seen;
+    time_t last_seen;
 };
 
 struct conn_limiter {
     pthread_mutex_t lock;
     struct conn_limit_entry entries[CONN_LIMIT_HASH_SIZE];
-    uint32_t total_connections;
-    uint32_t max_total;
-    uint32_t max_per_ip;
+    int total_connections;
+    int max_total;
+    int max_per_ip;
 };
 
 // Global signal-safe flag for graceful shutdown

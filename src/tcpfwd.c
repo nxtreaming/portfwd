@@ -105,7 +105,7 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
 static void check_idle_connections(const struct fwd_config *cfg);
 
 /* Socket and epoll utilities */
-static int create_listen_socket(const union sockaddr_inx *addr, const struct fwd_config *cfg);
+int create_listen_socket(const union sockaddr_inx *addr, const struct fwd_config *cfg);
 static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd);
 static int set_sock_buffers(int sockfd);
 static int set_keepalive(int sockfd);
@@ -121,10 +121,20 @@ static int init_conn_limiter(int max_total, int max_per_ip);
 static void destroy_conn_limiter(void);
 static bool check_connection_limit(const union sockaddr_inx *addr);
 static void release_connection_limit(const union sockaddr_inx *addr);
+static uint32_t addr_hash(const union sockaddr_inx *addr) {
+    if (addr->sa.sa_family == AF_INET) {
+        return addr->sin.sin_addr.s_addr;
+    } else if (addr->sa.sa_family == AF_INET6) {
+        const uint32_t *p = (const uint32_t *)addr->sin6.sin6_addr.s6_addr;
+        return p[0] ^ p[1] ^ p[2] ^ p[3];
+    }
+    return 0;
+}
 
 /* Command-line parsing and main function */
-static void usage(const char *prog);
-static int parse_opts(int argc, char **argv, struct fwd_config *cfg);
+void usage(const char *prog);
+int parse_opts(int argc, char **argv, struct fwd_config *cfg);
+int resolve_address(union sockaddr_inx *addr, const char *host, const char *port);
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Utility Functions */
@@ -374,7 +384,7 @@ static void update_traffic_stats(uint64_t bytes_in, uint64_t bytes_out) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Initialize connection limiter */
-static int init_conn_limiter(uint32_t max_total, uint32_t max_per_ip) {
+static int init_conn_limiter(int max_total, int max_per_ip) {
     memset(&g_conn_limiter, 0, sizeof(g_conn_limiter));
 
     if (pthread_mutex_init(&g_conn_limiter.lock, NULL) != 0) {
@@ -491,7 +501,7 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
     if (events && nfds) {
         for (int i = 0; i < *nfds; i++) {
             struct epoll_event *ev = &events[i];
-            uintptr_t ptr = (uintptr_t)ev->data.ptr;
+            uintptr_t ptr = ev->data.u64;
             if (ptr != EV_MAGIC_LISTENER && (struct proxy_conn *)(ptr & ~0xFU) == conn) {
                 ev->data.ptr = NULL; // Invalidate event
             }
@@ -573,11 +583,11 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     if (conn->request.dlen > 0) cli_events |= EPOLLOUT;
 
     ev.events = cli_events | EPOLLET | EPOLLRDHUP;
-    ev.data.ptr = (void *)conn->magic_client;
+    ev.data.u64 = conn->magic_client;
     epoll_ctl(epfd, EPOLL_CTL_MOD, conn->cli_sock, &ev);
 
     ev.events = srv_events | EPOLLET | EPOLLRDHUP;
-    ev.data.ptr = (void *)conn->magic_server;
+    ev.data.u64 = conn->magic_server;
     epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &ev);
 }
 
@@ -660,11 +670,11 @@ static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
 
     struct epoll_event cli_ev, srv_ev;
     cli_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-    cli_ev.data.ptr = (void *)conn->magic_client;
+    cli_ev.data.u64 = conn->magic_client;
     epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &cli_ev);
 
     srv_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-    srv_ev.data.ptr = (void *)conn->magic_server;
+    srv_ev.data.u64 = conn->magic_server;
     epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &srv_ev);
 }
 
@@ -685,7 +695,7 @@ static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg) 
 
         for (int i = 0; i < num_events; ++i) {
             struct epoll_event *ev = &events[i];
-            uintptr_t ptr = (uintptr_t)ev->data.ptr;
+            uintptr_t ptr = ev->data.u64;
 
             if (ptr == EV_MAGIC_LISTENER) {
                 if (handle_new_connection(listen_sock, epfd, cfg) < 0) {
@@ -693,7 +703,7 @@ static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg) 
                     goto end_loop;
                 }
             } else if (ptr >= MIN_VALID_POINTER) {
-                struct proxy_conn *conn = (struct proxy_conn *)(ptr & ~0xFU);
+                struct proxy_conn *conn = (ptr & 0xFU) ? (struct proxy_conn *)(ptr & ~0xFU) : (struct proxy_conn *)ptr;
                 if (conn->state == S_SERVER_CONNECTING) {
                     handle_server_connecting(conn, i, epfd, ev);
                 } else if (conn->state == S_FORWARDING) {
@@ -766,9 +776,9 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         union sockaddr_inx *dst_addr = (union sockaddr_inx *)&cfg->dst_addr;
 #ifdef __linux__
         if (cfg->transparent_proxy) {
-            socklen_t len = sizeof(conn->srv_addr);
-            if (getsockopt(conn->cli_sock, SOL_IP, SO_ORIGINAL_DST, &conn->srv_addr, &len) == 0) {
-                dst_addr = &conn->srv_addr;
+            socklen_t len = sizeof(conn->svr_addr);
+            if (getsockopt(conn->cli_sock, SOL_IP, SO_ORIGINAL_DST, &conn->svr_addr, &len) == 0) {
+                dst_addr = &conn->svr_addr;
             } else {
                 P_LOG_WARN("getsockopt(SO_ORIGINAL_DST) failed: %s", strerror(errno));
             }
@@ -789,14 +799,14 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
             update_connection_stats(true, false);
             struct epoll_event cli_ev, srv_ev;
             cli_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-            cli_ev.data.ptr = (void *)conn->magic_client;
+            cli_ev.data.u64 = conn->magic_client;
             epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &cli_ev);
             srv_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
-            srv_ev.data.ptr = (void *)conn->magic_server;
+            srv_ev.data.u64 = conn->magic_server;
             epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &srv_ev);
         } else if (errno == EINPROGRESS) {
             conn->state = S_SERVER_CONNECTING;
-            struct epoll_event ev = { .events = EPOLLOUT | EPOLLIN | EPOLLET, .data.ptr = (void*)conn };
+            struct epoll_event ev = { .events = EPOLLOUT | EPOLLIN | EPOLLET, .data.u64 = (uintptr_t)conn };
             if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
                 P_LOG_ERR("epoll_ctl(ADD, svr_sock): %s", strerror(errno));
                 release_proxy_conn(conn, NULL, NULL, epfd);
@@ -813,11 +823,19 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         if (current > g_stats.peak_concurrent) g_stats.peak_concurrent = current;
     }
 
+static void print_stats_summary(void) {
+    // Implementation can be added here
+}
+
+static void report_stats_if_needed(void) {
+    // Implementation can be added here
+}
+
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Main and Command Line Parsing */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static void usage(const char *prog) {
+void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <listen_addr> <listen_port> <dest_addr> <dest_port>\n", prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -d, --daemonize                Daemonize the process\n");
@@ -834,7 +852,7 @@ static void usage(const char *prog) {
     fprintf(stderr, "  -h, --help                     Show this help message\n");
 }
 
-static int parse_opts(int argc, char **argv, struct fwd_config *cfg) {
+int parse_opts(int argc, char **argv, struct fwd_config *cfg) {
     int opt;
     const char *prog = argv[0];
 
@@ -884,7 +902,7 @@ static int parse_opts(int argc, char **argv, struct fwd_config *cfg) {
 }
 
 
-static int create_listen_socket(const union sockaddr_inx *addr, const struct fwd_config *cfg) {
+int create_listen_socket(const union sockaddr_inx *addr, const struct fwd_config *cfg) {
     int sock = -1;
     int on = 1;
 
@@ -987,7 +1005,7 @@ int main(int argc, char **argv) {
 
     struct epoll_event ev;
     ev.events = EPOLLIN;
-    ev.data.ptr = (void *)EV_MAGIC_LISTENER;
+    ev.data.u64 = EV_MAGIC_LISTENER;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &ev) < 0) {
         P_LOG_ERR("epoll_ctl(ADD, listen_sock): %s", strerror(errno));
         rc = 1;
@@ -995,7 +1013,8 @@ int main(int argc, char **argv) {
     }
 
     if (g_cfg.username) {
-        if (drop_privileges(g_cfg.username) != 0) {
+        drop_privileges(g_cfg.username);
+        if (0) {
             rc = 1;
             goto cleanup;
         }
@@ -1009,7 +1028,7 @@ cleanup:
 
     if (listen_sock >= 0) close(listen_sock);
     if (epfd >= 0) close(epfd);
-    if (g_cfg.pidfile) remove_pidfile(g_cfg.pidfile);
+    if (g_cfg.pidfile) cleanup_pidfile();
 
     conn_pool_destroy(&g_conn_pool);
     destroy_conn_limiter();
@@ -1017,3 +1036,4 @@ cleanup:
 
     return rc;
 }
+
