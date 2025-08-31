@@ -857,11 +857,41 @@ int main(int argc, char **argv) {
                             P_LOG_INFO("sent stealth handshake response conv=%u for %s (%zu bytes)",
                                        nc->conv, sockaddr_to_string(&ra), response_len);
 
-                            /* TODO: Process any extracted initial data if needed */
+                            /* Forward any extracted initial payload to target TCP */
                             if (extracted_data_len > 0) {
                                 P_LOG_DEBUG("Extracted %zu bytes of initial data from stealth handshake",
                                            extracted_data_len);
-                                /* Could forward this data to the target connection */
+                                /* Buffer initial data to be sent once connect completes */
+                                size_t need = nc->request.dlen + extracted_data_len;
+                                size_t freecap = (nc->request.capacity > nc->request.dlen)
+                                                     ? (nc->request.capacity - nc->request.dlen)
+                                                     : 0;
+                                if (freecap < extracted_data_len) {
+                                    size_t ncap = nc->request.capacity ? nc->request.capacity * 2
+                                                                       : INITIAL_BUFFER_SIZE;
+                                    if (ncap < need)
+                                        ncap = need;
+                                    if (!buffer_size_check(nc->request.capacity, ncap, MAX_TCP_BUFFER_SIZE)) {
+                                        P_LOG_WARN("Initial data buffer exceeds limit; dropping extracted data");
+                                    } else {
+                                        char *np = (char *)realloc(nc->request.data, ncap);
+                                        if (!np) {
+                                            P_LOG_WARN("Failed to alloc request buffer for initial data; dropping");
+                                        } else {
+                                            nc->request.data = np;
+                                            nc->request.capacity = ncap;
+                                            memcpy(nc->request.data + nc->request.dlen, extracted_data, extracted_data_len);
+                                            nc->request.dlen += extracted_data_len;
+                                        }
+                                    }
+                                } else {
+                                    memcpy(nc->request.data + nc->request.dlen, extracted_data, extracted_data_len);
+                                    nc->request.dlen += extracted_data_len;
+                                }
+                                /* Ensure EPOLLOUT is enabled so data flushes when connect finishes */
+                                if (kcptcp_ep_register_tcp(epfd, nc->svr_sock, nc, true) < 0) {
+                                    LOG_CONN_WARN(nc, "Failed to enable TCP write events for initial data");
+                                }
                             }
 
                             continue;

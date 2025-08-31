@@ -845,8 +845,27 @@ static void client_handle_accept(struct client_ctx *ctx) {
         unsigned char hbuf[1024]; /* Larger buffer for stealth packet */
         size_t hbuf_len = sizeof(hbuf);
 
-        /* For now, send empty initial data - in real usage, this could be the first request */
-        if (generate_stealth_handshake(c, ctx->cfg->psk, ctx->cfg->has_psk, NULL, 0, hbuf, &hbuf_len) != 0) {
+        /* Try to opportunistically embed initial TCP data to remove handshake signature */
+        unsigned char init_buf[1024];
+        size_t init_len = 0;
+        for (;;) {
+            ssize_t rn = recv(cs, (char *)init_buf + init_len, sizeof(init_buf) - init_len, MSG_DONTWAIT);
+            if (rn > 0) {
+                init_len += (size_t)rn;
+                c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX from client */
+                if (init_len >= sizeof(init_buf)) {
+                    break;
+                }
+                /* loop to drain immediately available bytes */
+                continue;
+            }
+            break; /* EAGAIN/WOULDBLOCK or error/EOF -> stop */
+        }
+
+        const uint8_t *init_ptr = (init_len > 0) ? init_buf : NULL;
+        size_t init_ptr_len = (init_len > 0) ? init_len : 0;
+
+        if (generate_stealth_handshake(c, ctx->cfg->psk, ctx->cfg->has_psk, init_ptr, init_ptr_len, hbuf, &hbuf_len) != 0) {
             P_LOG_ERR("Failed to generate stealth handshake packet");
             g_perf.handshake_failures++;
             close(cs);

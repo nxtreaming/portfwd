@@ -454,7 +454,12 @@ int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *tok
     }
 
     /* Calculate total packet size: payload + initial_data + some random padding */
-    size_t padding_size = 16 + (rand() % 32); /* 16-47 bytes random padding */
+    /* Use secure randomness for padding length to avoid deterministic patterns */
+    uint8_t pad_rnd = 0;
+    if (secure_random_bytes(&pad_rnd, 1) != 0) {
+        return -1;
+    }
+    size_t padding_size = 16 + (size_t)(pad_rnd % 32); /* 16-47 bytes random padding */
     size_t total_size = sizeof(payload) + initial_data_len + padding_size;
 
     if (total_size > *out_packet_len) {
@@ -581,7 +586,13 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const u
     }
 
     /* Add some random padding to make it look like normal data */
-    size_t padding_size = 8 + (rand() % 24); /* 8-31 bytes random padding */
+    /* Use secure randomness for padding length to avoid deterministic patterns */
+    uint8_t pad_rnd = 0;
+    if (secure_random_bytes(&pad_rnd, 1) != 0) {
+        free(plaintext);
+        return -1;
+    }
+    size_t padding_size = 8 + (size_t)(pad_rnd % 24); /* 8-31 bytes random padding */
     size_t total_size = sizeof(response) + padding_size;
 
     if (total_size + 28 > *out_packet_len) { /* +28 for nonce and tag */
