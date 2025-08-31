@@ -253,76 +253,6 @@ static int safe_close(int fd) {
     }
 }
 
-/* Handle accept errors with proper recovery strategy */
-static int handle_accept_errors(int listen_sock) {
-    static int consecutive_errors = 0;
-    static time_t last_error_time = 0;
-    time_t now = time(NULL);
-
-    (void)listen_sock; /* Suppress unused parameter warning */
-
-    /* Reset error count if enough time has passed */
-    if (now - last_error_time > ACCEPT_ERROR_RESET_INTERVAL) {
-        consecutive_errors = 0;
-    }
-
-    /* Handle different error types */
-    switch (errno) {
-    case EAGAIN:
-#if EAGAIN != EWOULDBLOCK
-    case EWOULDBLOCK:
-#endif
-        /* Normal case - no more connections to accept */
-        consecutive_errors = 0;
-        return 0;
-
-    case EMFILE:
-    case ENFILE:
-        /* File descriptor limit reached */
-        P_LOG_ERR("File descriptor limit reached: %s", strerror(errno));
-        consecutive_errors++;
-        last_error_time = now;
-        return -1;
-
-    case ENOBUFS:
-    case ENOMEM:
-        /* System resource exhaustion */
-        P_LOG_ERR("System resource exhaustion: %s", strerror(errno));
-        consecutive_errors++;
-        last_error_time = now;
-        return -1;
-
-    case ECONNABORTED:
-    case EPROTO:
-        /* Connection aborted by client - not fatal */
-        P_LOG_WARN("Connection aborted: %s", strerror(errno));
-        return 0;
-
-    default:
-        /* Other errors */
-        consecutive_errors++;
-        last_error_time = now;
-        P_LOG_ERR("accept() error: %s", strerror(errno));
-        break;
-    }
-
-    /* Check if we have too many consecutive errors */
-    if (consecutive_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS) {
-        P_LOG_ERR("Too many consecutive accept errors (%d), stopping",
-                  consecutive_errors);
-        return -2; /* Fatal error */
-    }
-
-    P_LOG_WARN("Accept error %d of %d: %s", consecutive_errors,
-               MAX_CONSECUTIVE_ACCEPT_ERRORS, strerror(errno));
-
-    /* Brief delay to avoid CPU spinning */
-    if (consecutive_errors > 3) {
-        usleep(ACCEPT_ERROR_DELAY_US);
-    }
-
-    return -1;
-}
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Statistics Functions */
@@ -820,10 +750,10 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         int64_t current = __sync_fetch_and_add(&g_stats.current_active, 1) + 1;
         if ((uint64_t)current > 0 && (uint64_t)current > g_stats.peak_concurrent) g_stats.peak_concurrent = (uint64_t)current;
 
+    }
     return 0;
 }
 
-{{ ... }}
 static void print_stats_summary(void) {
     // Implementation can be added here
 }
@@ -950,7 +880,7 @@ int main(int argc, char **argv) {
     int epfd = -1;
     int rc = 0;
 
-    init_fwd_config(&g_cfg);
+    memset(&g_cfg, 0, sizeof(g_cfg));
 
     if (parse_opts(argc, argv, &g_cfg) != 0) {
         return 1;
