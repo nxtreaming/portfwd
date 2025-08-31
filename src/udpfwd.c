@@ -14,8 +14,10 @@
 #define _GNU_SOURCE 1
 
 #include "common.h"
-#include "list.h"
+#include "conn_pool.h"
+#include "fwd_util.h"
 #include "proxy_conn.h"
+#include "list.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,21 +185,6 @@ struct rate_limiter {
     unsigned max_per_ip;
 };
 
-/**
- * @brief Thread-safe connection pool for UDP proxy connections
- *
- * Provides atomic allocation and deallocation of connection objects
- * with mutex protection for thread safety.
- */
-struct conn_pool {
-    struct proxy_conn *connections; /**< Pre-allocated connection array */
-    struct proxy_conn *freelist;    /**< Linked list of available connections */
-    int capacity;                   /**< Total pool capacity */
-    atomic_int used_count;    /**< Currently allocated connections (atomic) */
-    int high_water_mark;      /**< Peak usage for monitoring */
-    pthread_mutex_t lock;     /**< Thread safety mutex */
-    pthread_cond_t available; /**< Condition variable for blocking allocation */
-};
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Global Variables */
@@ -273,8 +260,6 @@ static _Atomic uint64_t g_stat_hash_collisions;
 static _Atomic uint64_t g_stat_lru_immediate_updates;
 static _Atomic uint64_t g_stat_lru_deferred_updates;
 
-/* Signal-safe shutdown flag */
-static volatile sig_atomic_t g_shutdown_requested = 0;
 
 /* Global rate limiter for security */
 static struct rate_limiter g_rate_limiter;
@@ -336,8 +321,6 @@ static int safe_close(int fd) {
 static uint32_t hash_addr(const union sockaddr_inx *a);
 
 /* Connection management */
-static struct proxy_conn *alloc_proxy_conn(void);
-static void release_proxy_conn_to_pool(struct proxy_conn *conn);
 static void proxy_conn_walk_continue(const struct config *cfg,
                                      unsigned walk_max, int epfd);
 static bool proxy_conn_evict_one(int epfd);
@@ -722,51 +705,32 @@ static uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
     return hash;
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Connection Pool Management */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
-static int init_conn_pool(void) {
-    g_conn_pool.capacity =
-        (g_conn_pool_capacity > 0) ? g_conn_pool_capacity : UDP_PROXY_MAX_CONNS;
-    g_conn_pool.connections =
-        malloc(sizeof(struct proxy_conn) * (size_t)g_conn_pool.capacity);
-    if (!g_conn_pool.connections) {
-        P_LOG_ERR("Failed to allocate connection pool");
-        return -1;
-    }
-
-    /* Initialize mutex and condition variable */
-    if (pthread_mutex_init(&g_conn_pool.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize connection pool mutex");
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        return -1;
-    }
-    if (pthread_cond_init(&g_conn_pool.available, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize connection pool condition variable");
-        pthread_mutex_destroy(&g_conn_pool.lock);
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        return -1;
-    }
-
-    g_conn_pool.freelist = NULL;
-    for (int i = 0; i < g_conn_pool.capacity; i++) {
-        struct proxy_conn *conn = &g_conn_pool.connections[i];
-        conn->next = g_conn_pool.freelist;
-        g_conn_pool.freelist = conn;
-    }
-    atomic_store(&g_conn_pool.used_count, 0);
-    g_conn_pool.high_water_mark = 0;
-    P_LOG_INFO("Connection pool initialized with %d connections",
-               g_conn_pool.capacity);
-    return 0;
-}
 
 /* Small helper to check if an unsigned value is a power of two */
 static inline bool is_power_of_two(unsigned v) {
     return v && ((v & (v - 1)) == 0);
+}
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Connection Pool Management */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
+/**
+ * @brief Initializes a newly allocated proxy connection.
+ * @param conn A pointer to the connection object from the pool.
+ * @return The initialized connection object, or NULL on failure.
+ */
+static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
+    if (!conn) {
+        return NULL;
+    }
+
+    /* Zero out the memory and set default values */
+    memset(conn, 0, sizeof(*conn));
+    conn->svr_sock = -1;
+    /* Initialize other fields as needed */
+
+    return conn;
 }
 
 /* Bucket index strategies (selected once at init) */
@@ -778,74 +742,6 @@ static unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa) {
 static unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h % g_conn_tbl_hash_size;
-}
-
-static void destroy_conn_pool(void) {
-    if (g_conn_pool.connections) {
-        pthread_mutex_destroy(&g_conn_pool.lock);
-        pthread_cond_destroy(&g_conn_pool.available);
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        g_conn_pool.freelist = NULL;
-        g_conn_pool.capacity = 0;
-        atomic_store(&g_conn_pool.used_count, 0);
-        g_conn_pool.high_water_mark = 0;
-        P_LOG_INFO("Connection pool destroyed.");
-    }
-}
-
-static struct proxy_conn *alloc_proxy_conn(void) {
-    struct proxy_conn *conn;
-
-    pthread_mutex_lock(&g_conn_pool.lock);
-
-    if (!g_conn_pool.freelist) {
-        pthread_mutex_unlock(&g_conn_pool.lock);
-        P_LOG_WARN("Connection pool exhausted!");
-        return NULL;
-    }
-
-    conn = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn->next;
-
-    int used = atomic_fetch_add(&g_conn_pool.used_count, 1) + 1;
-    if (used > g_conn_pool.high_water_mark) {
-        g_conn_pool.high_water_mark = used;
-    }
-
-    pthread_mutex_unlock(&g_conn_pool.lock);
-
-    assert(used <= g_conn_pool.capacity);
-    memset(conn, 0, sizeof(*conn));
-    return conn;
-}
-
-static void release_proxy_conn_to_pool(struct proxy_conn *conn) {
-    if (!conn) {
-        P_LOG_WARN("Attempted to release NULL connection");
-        return;
-    }
-
-    pthread_mutex_lock(&g_conn_pool.lock);
-
-    conn->next = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn;
-
-    int used = atomic_fetch_sub(&g_conn_pool.used_count, 1) - 1;
-    assert(used >= 0);
-
-    pthread_cond_signal(&g_conn_pool.available);
-    pthread_mutex_unlock(&g_conn_pool.lock);
-}
-
-static void set_sock_buffers(int sockfd) {
-    int sz = g_sockbuf_cap_runtime;
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) < 0) {
-        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
-    }
-    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz)) < 0) {
-        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
-    }
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -1029,9 +925,9 @@ proxy_conn_get_or_create(const struct config *cfg,
     set_sock_buffers(svr_sock);
 
     /* Allocate session data for the connection */
-    if ((conn = alloc_proxy_conn()) == NULL) {
-        P_LOG_ERR("malloc(conn): %s", strerror(errno));
-        goto err;
+    if (!(conn = init_proxy_conn(conn_pool_alloc(&g_conn_pool)))) {
+        P_LOG_ERR("conn_pool_alloc: failed");
+        goto err_unlock;
     }
     conn->svr_sock = svr_sock;
     conn->cli_addr = *cli_addr;
@@ -1082,14 +978,15 @@ proxy_conn_get_or_create(const struct config *cfg,
     conn->last_active = monotonic_seconds();
     return conn;
 
-err:
+err_unlock:
     if (svr_sock >= 0) {
         if (safe_close(svr_sock) < 0) {
             P_LOG_WARN("close(svr_sock=%d): %s", svr_sock, strerror(errno));
         }
     }
+err:
     if (conn)
-        release_proxy_conn_to_pool(conn);
+        conn_pool_release(&g_conn_pool, conn);
     return NULL;
 }
 
@@ -1142,7 +1039,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
         conn->svr_sock = -1;
     }
 
-    release_proxy_conn_to_pool(conn);
+    conn_pool_release(&g_conn_pool, conn);
 }
 
 static void proxy_conn_walk_continue(const struct config *cfg,
@@ -1635,12 +1532,8 @@ static void show_help(const char *prog) {
     P_LOG_INFO("  %s 0.0.0.0:10000 10.0.0.1:20000", prog);
     P_LOG_INFO("  %s [::]:10000 [2001:db8::1]:20000", prog);
     P_LOG_INFO("Options:");
-    P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)", 60);
-    P_LOG_INFO("  -d               run in background");
-    P_LOG_INFO("  -o               IPv6 listener accepts IPv6 only (sets "
-               "IPV6_V6ONLY)");
-    P_LOG_INFO("  -r, --reuse-addr set SO_REUSEADDR before binding local port");
-    P_LOG_INFO("  -R, --reuse-port set SO_REUSEPORT before binding local port");
+    P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)",
+               DEFAULT_CONN_TIMEOUT_SEC);
     P_LOG_INFO(
         "  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d)",
         UDP_PROXY_SOCKBUF_CAP);
@@ -1652,40 +1545,41 @@ static void show_help(const char *prog) {
     P_LOG_INFO("  -H <size>        hash table size (default: %d, recommend >= "
                "max_conns)",
                DEFAULT_HASH_TABLE_SIZE);
-    P_LOG_INFO("  -p <pidfile>     write PID to file");
+    P_LOG_INFO("Common options: -d (daemon), -r (reuse_addr), -R (reuse_port), "
+               "-6 (v6only), -p <pidfile>, -i <max_per_ip>");
 }
 
 int main(int argc, char *argv[]) {
     /* Local variables */
     int opt, b_true = 1, lsn_sock = -1, epfd = -1, i, rc = 0;
     struct config cfg;
+    struct fwd_config fwd_cfg;
+    int new_optind;
     struct epoll_event ev, events[MAX_EVENTS];
     char s_addr1[50] = "", s_addr2[50] = "";
     time_t last_check;
 
-    /* Initialize configuration with defaults */
+    new_optind = parse_common_args(argc, argv, &fwd_cfg);
+    if (new_optind < 0) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    optind = new_optind;
+
     memset(&cfg, 0, sizeof(cfg));
+
+    cfg.daemonize = fwd_cfg.daemonize;
+    cfg.reuse_addr = fwd_cfg.reuse_addr;
+    cfg.reuse_port = fwd_cfg.reuse_port;
+    cfg.v6only = fwd_cfg.v6only;
+    cfg.pidfile = fwd_cfg.pidfile;
+    // Note: max_per_ip is handled inside the udpfwd-specific loop for now.
+
+    /* Set default values */
     cfg.proxy_conn_timeo = DEFAULT_CONN_TIMEOUT_SEC;
     cfg.conn_tbl_hash_size = DEFAULT_HASH_TABLE_SIZE;
-    /* Security defaults - 0 means no limit */
-    cfg.max_connections_per_ip = 0;
-    cfg.max_packets_per_second = 0;
-    cfg.max_bytes_per_second = 0;
-    cfg.max_packet_size = UDP_PROXY_DGRAM_CAP;
-    cfg.min_packet_size = 1;
 
-#ifdef __linux__
-    /* Linux batching resources (allocated at runtime) */
-    struct mmsghdr *c_msgs = NULL;              /* client -> server messages */
-    struct iovec *c_iov = NULL;                 /* client I/O vectors */
-    struct sockaddr_storage *c_addrs = NULL;    /* client addresses */
-    char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = NULL; /* client buffers */
-    struct mmsghdr *s_msgs = NULL;              /* server messages */
-    struct iovec *s_iovs = NULL;                /* server I/O vectors */
-#endif
-
-    /* Parse command line arguments */
-    while ((opt = getopt(argc, argv, "t:dhorp:H:RS:C:B:")) != -1) {
+    while ((opt = getopt(argc, argv, "t:S:C:B:H:")) != -1) {
         switch (opt) {
         case 't': {
             char *end = NULL;
@@ -1702,22 +1596,6 @@ int main(int argc, char *argv[]) {
             }
             break;
         }
-        case 'd':
-            cfg.daemonize = true;
-            break;
-        case 'h':
-            show_help(argv[0]);
-            rc = 0;
-            goto cleanup;
-        case 'o':
-            cfg.v6only = true;
-            break;
-        case 'r':
-            cfg.reuse_addr = true;
-            break;
-        case 'R':
-            cfg.reuse_port = true;
-            break;
         case 'S': {
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
@@ -1767,9 +1645,6 @@ int main(int argc, char *argv[]) {
 #endif
             break;
         }
-        case 'p':
-            cfg.pidfile = optarg;
-            break;
         case 'H': {
             char *end = NULL;
             unsigned long v = strtoul(optarg, &end, 10);
@@ -1820,7 +1695,8 @@ int main(int argc, char *argv[]) {
     openlog("udpfwd", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
     /* Initialize connection pool */
-    if (init_conn_pool() != 0) {
+    int capacity = (g_conn_pool_capacity > 0) ? g_conn_pool_capacity : UDP_PROXY_MAX_CONNS;
+    if (conn_pool_init(&g_conn_pool, capacity, sizeof(struct proxy_conn)) != 0) {
         rc = 1;
         goto cleanup;
     }
@@ -1908,18 +1784,24 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    if (cfg.daemonize && do_daemonize() != 0) {
-        rc = 1;
-        goto cleanup;
-    }
-    if (cfg.pidfile) {
-        if (write_pidfile(cfg.pidfile) < 0) {
-            rc = 1;
-            goto cleanup;
+    if (fwd_cfg.daemonize) {
+        if (do_daemonize() != 0) {
+            return 1; // do_daemonize logs errors
         }
     }
 
-    setup_signal_handlers();
+    if (fwd_cfg.pidfile) {
+        if (create_pid_file(fwd_cfg.pidfile) != 0) {
+            return 1;
+        }
+    }
+
+    /* Set up signal handlers */
+    if (setup_shutdown_signals() != 0) {
+        P_LOG_ERR("Failed to setup signal handlers");
+        rc = 1;
+        goto cleanup;
+    }
 
     /* Initialize the connection table */
     g_conn_tbl_hash_size = cfg.conn_tbl_hash_size;
@@ -2034,7 +1916,7 @@ int main(int argc, char *argv[]) {
             goto cleanup;
         }
 
-        if (g_state.terminate)
+        if (g_shutdown_requested)
             break;
 
         /* Process events */

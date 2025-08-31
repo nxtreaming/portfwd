@@ -34,6 +34,7 @@
 #include "common.h"
 #include "list.h"
 #include "proxy_conn.h"
+#include "fwd_util.h"
 
 #ifdef __linux__
 #include <netinet/tcp.h>
@@ -142,7 +143,6 @@
 struct config {
     union sockaddr_inx src_addr;
     union sockaddr_inx dst_addr;
-    const char *pidfile;
     bool daemonize;
     bool base_addr_mode;
     bool reuse_addr;
@@ -225,22 +225,6 @@ struct proxy_stats {
     pthread_mutex_t lock; /**< Mutex for non-atomic operations */
 };
 
-/**
- * @brief Thread-safe connection pool with mutex protection
- *
- * Pre-allocates connection objects to avoid malloc/free overhead
- * during high-frequency connection establishment. Provides thread-safe
- * allocation and deallocation with optional blocking when pool is exhausted.
- */
-struct conn_pool {
-    struct proxy_conn *connections; /**< Pre-allocated connection array */
-    struct proxy_conn *freelist;    /**< Linked list of available connections */
-    int capacity;                   /**< Total pool capacity */
-    int used_count;                 /**< Currently allocated connections */
-    int high_water_mark;            /**< Peak usage for monitoring */
-    pthread_mutex_t lock;           /**< Thread safety mutex */
-    pthread_cond_t available; /**< Condition variable for blocking allocation */
-};
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Global Variables */
@@ -261,54 +245,6 @@ static int g_ka_intvl = TCP_PROXY_KEEPALIVE_INTVL;
 static int g_ka_cnt = TCP_PROXY_KEEPALIVE_CNT;
 static int g_backpressure_wm = TCP_PROXY_BACKPRESSURE_WM;
 
-/* Signal-safe flag for graceful shutdown */
-static volatile sig_atomic_t g_shutdown_requested = 0;
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Signal Handling */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
-/* Signal-safe shutdown handler */
-static void handle_shutdown_signal(int sig) {
-    (void)sig; /* Unused parameter */
-    g_shutdown_requested = 1;
-}
-
-/* Setup signal handlers for graceful shutdown */
-static int setup_shutdown_signals(void) {
-    struct sigaction sa;
-
-    /* Block signals during handler execution */
-    sigemptyset(&sa.sa_mask);
-    sigaddset(&sa.sa_mask, SIGTERM);
-    sigaddset(&sa.sa_mask, SIGINT);
-    sigaddset(&sa.sa_mask, SIGQUIT);
-
-    sa.sa_handler = handle_shutdown_signal;
-    sa.sa_flags = SA_RESTART; /* Restart interrupted system calls */
-
-    if (sigaction(SIGTERM, &sa, NULL) < 0) {
-        P_LOG_ERR("sigaction(SIGTERM): %s", strerror(errno));
-        return -1;
-    }
-    if (sigaction(SIGINT, &sa, NULL) < 0) {
-        P_LOG_ERR("sigaction(SIGINT): %s", strerror(errno));
-        return -1;
-    }
-    if (sigaction(SIGQUIT, &sa, NULL) < 0) {
-        P_LOG_ERR("sigaction(SIGQUIT): %s", strerror(errno));
-        return -1;
-    }
-
-    /* Ignore SIGPIPE - we handle EPIPE explicitly */
-    sa.sa_handler = SIG_IGN;
-    if (sigaction(SIGPIPE, &sa, NULL) < 0) {
-        P_LOG_ERR("sigaction(SIGPIPE): %s", strerror(errno));
-        return -1;
-    }
-
-    return 0;
-}
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Function Declarations */
@@ -433,6 +369,30 @@ static int set_tcp_nodelay(int sockfd) {
 static int safe_close(int fd) {
     if (fd < 0)
         return 0;
+    for (;;) {
+        if (close(fd) == 0)
+            return 0;
+        if (errno == EINTR)
+            continue;
+        return -1;
+    }
+}
+
+static int safe_close_with_daemonize(int fd) {
+    if (fd < 0)
+        return 0;
+    if (fwd_cfg.daemonize) {
+        if (do_daemonize() != 0) {
+            return 1; // do_daemonize logs errors
+        }
+    }
+
+    if (fwd_cfg.pidfile) {
+        if (create_pid_file(fwd_cfg.pidfile) != 0) {
+            return 1;
+        }
+    }
+
     for (;;) {
         if (close(fd) == 0)
             return 0;
@@ -600,7 +560,7 @@ static void print_stats_summary(void) {
                g_stats.accept_errors, g_stats.connect_errors,
                g_stats.forward_errors, g_stats.resource_errors,
                g_stats.limit_rejections);
-    P_LOG_INFO("Pool: used=%d, capacity=%d, high_water=%d",
+    P_LOG_INFO("Pool: used=%zu, capacity=%zu, high_water=%zu",
                g_conn_pool.used_count, g_conn_pool.capacity,
                g_conn_pool.high_water_mark);
 }
@@ -730,85 +690,11 @@ static void release_connection_limit(const union sockaddr_inx *addr) {
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Connection Pool Management */
+/* Connection Management */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static int init_conn_pool(void) {
-    g_conn_pool.capacity = (g_conn_pool_capacity > 0)
-                               ? g_conn_pool_capacity
-                               : TCP_PROXY_CONN_POOL_SIZE;
-    g_conn_pool.connections =
-        malloc(sizeof(struct proxy_conn) * (size_t)g_conn_pool.capacity);
-    if (!g_conn_pool.connections) {
-        P_LOG_ERR("Failed to allocate connection pool");
-        return -1;
-    }
-
-    /* Initialize mutex and condition variable */
-    if (pthread_mutex_init(&g_conn_pool.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize connection pool mutex");
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        return -1;
-    }
-    if (pthread_cond_init(&g_conn_pool.available, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize connection pool condition variable");
-        pthread_mutex_destroy(&g_conn_pool.lock);
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        return -1;
-    }
-
-    g_conn_pool.freelist = NULL;
-    for (int i = 0; i < g_conn_pool.capacity; i++) {
-        struct proxy_conn *conn = &g_conn_pool.connections[i];
-        conn->next = g_conn_pool.freelist;
-        g_conn_pool.freelist = conn;
-    }
-    g_conn_pool.used_count = 0;
-    g_conn_pool.high_water_mark = 0;
-    P_LOG_INFO("Connection pool initialized with %d connections",
-               g_conn_pool.capacity);
-    return 0;
-}
-
-static void destroy_conn_pool(void) {
-    if (g_conn_pool.connections) {
-        pthread_mutex_destroy(&g_conn_pool.lock);
-        pthread_cond_destroy(&g_conn_pool.available);
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        g_conn_pool.freelist = NULL;
-        g_conn_pool.capacity = 0;
-        g_conn_pool.used_count = 0;
-        g_conn_pool.high_water_mark = 0;
-        P_LOG_INFO("Connection pool destroyed");
-    }
-}
-
-static inline struct proxy_conn *alloc_proxy_conn(void) {
-    struct proxy_conn *conn;
-
-    pthread_mutex_lock(&g_conn_pool.lock);
-
-    if (!g_conn_pool.freelist) {
-        pthread_mutex_unlock(&g_conn_pool.lock);
-        P_LOG_WARN("Connection pool exhausted!");
-        return NULL;
-    }
-
-    conn = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn->next;
-    g_conn_pool.used_count++;
-
-    if (g_conn_pool.used_count > g_conn_pool.high_water_mark) {
-        g_conn_pool.high_water_mark = g_conn_pool.used_count;
-    }
-
-    pthread_mutex_unlock(&g_conn_pool.lock);
-
-    memset(conn, 0x0, sizeof(*conn));
-
+static void init_proxy_conn(struct proxy_conn *conn) {
+    memset(conn, 0, sizeof(*conn));
     conn->cli_sock = -1;
     conn->svr_sock = -1;
 #ifdef __linux__
@@ -816,14 +702,9 @@ static inline struct proxy_conn *alloc_proxy_conn(void) {
     conn->c2s_pipe[1] = -1;
     conn->s2c_pipe[0] = -1;
     conn->s2c_pipe[1] = -1;
-    conn->c2s_pending = 0;
-    conn->s2c_pending = 0;
-    conn->use_splice = false;
 #endif
     conn->magic_client = EV_MAGIC_CLIENT;
     conn->magic_server = EV_MAGIC_SERVER;
-
-    return conn;
 }
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -946,13 +827,8 @@ static void release_proxy_conn(struct proxy_conn *conn,
     /* Update connection statistics */
     __sync_fetch_and_sub(&g_stats.current_active, 1);
 
-    /* Return connection to pool with thread safety */
-    pthread_mutex_lock(&g_conn_pool.lock);
-    conn->next = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn;
-    g_conn_pool.used_count--;
-    pthread_cond_signal(&g_conn_pool.available);
-    pthread_mutex_unlock(&g_conn_pool.lock);
+    /* Return connection to the generic pool */
+    conn_pool_release(&g_conn_pool, conn);
 }
 
 /**
@@ -1715,8 +1591,9 @@ static int handle_new_connection(int listen_sock, int epfd,
         /* Update accept statistics */
         __sync_fetch_and_add(&g_stats.total_accepted, 1);
 
-        struct proxy_conn *conn = create_proxy_conn(cfg, cli_sock, &cli_addr);
+        struct proxy_conn *conn = conn_pool_alloc(&g_conn_pool);
         if (conn) {
+            init_proxy_conn(conn);
             set_conn_epoll_fds(conn, epfd);
             update_connection_stats(true, false); /* Successfully connected */
         } else {
@@ -1741,7 +1618,7 @@ static int proxy_loop(int epfd, int listen_sock, struct config *cfg) {
         return 1;
     }
 
-    while (!g_state.terminate && !g_shutdown_requested) {
+    while (!g_shutdown_requested) {
         int nfds = epoll_wait(epfd, events, events_size, 1000);
         if (nfds < 0) {
             if (errno == EINTR)
@@ -1922,20 +1799,18 @@ static void show_help(const char *prog) {
     P_LOG_INFO("Usage: %s [options] <src_addr> <dst_addr>", prog);
     P_LOG_INFO("  <src_addr>, <dst_addr>    -- IPv4/IPv6 address with port, "
                "e.g. 127.0.0.1:8080, [::1]:8080");
-    P_LOG_INFO("  -d, --daemonize           -- detach and run in background");
-    P_LOG_INFO("  -p, --pidfile <path>      -- create PID file at <path>");
-    P_LOG_INFO("  -b, --base-addr-mode      -- use src_addr as base for "
-               "dst_addr (for load balancing)");
+    P_LOG_INFO("Options:");
+    P_LOG_INFO("  -d                        -- Run as a daemon.");
+    P_LOG_INFO("  -r                        -- Set SO_REUSEADDR on listener socket.");
+    P_LOG_INFO("  -R                        -- Set SO_REUSEPORT on listener socket.");
+    P_LOG_INFO("  -6                        -- Set IPV6_V6ONLY on listener socket.");
+    P_LOG_INFO("  -P <path>                 -- Path to PID file.");
+    P_LOG_INFO("  -i <limit>                -- Max connections per source IP (default: unlimited).");
+    P_LOG_INFO("  -b                        -- Use base address mode for transparent proxying.");
     P_LOG_INFO(
-        "  -r, --reuse-addr          -- set SO_REUSEADDR on listener socket");
-    P_LOG_INFO(
-        "  -R, --reuse-port          -- set SO_REUSEPORT on listener socket");
-    P_LOG_INFO(
-        "  -6, --v6only              -- set IPV6_V6ONLY on listener socket");
-    P_LOG_INFO(
-        "  -C <pool_size>            -- connection pool size (default: %d)",
+        "  -C <pool_size>            -- Connection pool size (default: %d)",
         TCP_PROXY_CONN_POOL_SIZE);
-    P_LOG_INFO("  -U <userbuf_bytes>        -- per-direction user buffer size "
+    P_LOG_INFO("  -U <userbuf_bytes>        -- Per-direction user buffer size "
                "(default: %d)",
                TCP_PROXY_USERBUF_CAP);
     P_LOG_INFO(
@@ -1950,11 +1825,9 @@ static void show_help(const char *prog) {
     P_LOG_INFO("  -K <ka_cnt>               -- TCP keepalive probe count "
                "(default: %d)",
                TCP_PROXY_KEEPALIVE_CNT);
-    P_LOG_INFO("  -M <max_conn>             -- maximum total connections "
-               "(default: unlimited)");
-    P_LOG_INFO("  -P <max_per_ip>           -- maximum connections per IP "
-               "(default: unlimited)");
-    P_LOG_INFO("  -h, --help                -- show this help");
+    P_LOG_INFO("  -M <max_conn>             -- Maximum total connections "
+               "(default: unlimited).");
+    P_LOG_INFO("  -h, --help                -- Show this help.");
 }
 
 int main(int argc, char *argv[]) {
@@ -1963,34 +1836,32 @@ int main(int argc, char *argv[]) {
     struct config cfg;
     int listen_sock = -1, epfd = -1;
     uint32_t magic_listener = EV_MAGIC_LISTENER;
+    struct fwd_config fwd_cfg;
+    int opt;
 
     /* Initialize configuration with defaults */
     memset(&cfg, 0, sizeof(cfg));
-    cfg.reuse_addr = true;
     cfg.max_connections = 0; /* 0 = no limit */
-    cfg.max_per_ip = 0;      /* 0 = no limit */
 
-    /* Parse command line arguments */
-    int opt;
-    while ((opt = getopt(argc, argv, "dp:brR6hC:U:S:I:N:K:M:P:")) != -1) {
+    /* Parse common arguments first */
+    int new_optind = parse_common_args(argc, argv, &fwd_cfg);
+    if (new_optind < 0) {
+        return 1; /* Error message is printed by parse_common_args */
+    }
+    optind = new_optind;
+
+    /* Transfer common config into local config */
+    cfg.daemonize = fwd_cfg.daemonize;
+    cfg.reuse_addr = fwd_cfg.reuse_addr;
+    cfg.reuse_port = fwd_cfg.reuse_port;
+    cfg.v6only = fwd_cfg.v6only;
+    cfg.max_per_ip = fwd_cfg.max_per_ip;
+
+    /* Parse tcpfwd-specific arguments */
+    while ((opt = getopt(argc, argv, "bC:U:S:I:N:K:M:h")) != -1) {
         switch (opt) {
-        case 'd':
-            cfg.daemonize = true;
-            break;
-        case 'p':
-            cfg.pidfile = optarg;
-            break;
         case 'b':
             cfg.base_addr_mode = true;
-            break;
-        case 'r':
-            cfg.reuse_addr = true;
-            break;
-        case 'R':
-            cfg.reuse_port = true;
-            break;
-        case '6':
-            cfg.v6only = true;
             break;
         case 'C': {
             char *end = NULL;
@@ -2095,26 +1966,14 @@ int main(int argc, char *argv[]) {
             }
             break;
         }
-        case 'P': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v < 0) {
-                P_LOG_WARN("invalid -P value '%s', keeping default %d", optarg,
-                           cfg.max_per_ip);
-            } else {
-                if (v > MAX_PER_IP_CONNECTIONS_LIMIT)
-                    v = MAX_PER_IP_CONNECTIONS_LIMIT;
-                cfg.max_per_ip = (int)v;
-            }
-            break;
-        }
         case 'h':
             show_help(argv[0]);
             return 0;
         case '?':
             return 1;
         default:
-            break;
+            /* Should not happen */
+            return 1;
         }
     }
 
@@ -2135,49 +1994,45 @@ int main(int argc, char *argv[]) {
     /* Initialize logging */
     openlog("tcpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
+    /* Daemonize if requested, must be done before creating PID file */
+    if (fwd_cfg.daemonize) {
+        if (do_daemonize() != 0) {
+            return 1; // Error logged in do_daemonize
+        }
+    }
+
+    /* Create PID file if requested */
+    if (fwd_cfg.pidfile) {
+        if (create_pid_file(fwd_cfg.pidfile) != 0) {
+            return 1; // Error logged in create_pid_file
+        }
+    }
+
     /* Recompute backpressure WM if userbuf changed */
     g_backpressure_wm = (g_userbuf_cap_runtime * 3) / 4;
 
     /* Initialize statistics system */
     if (init_stats() != 0) {
-        closelog();
-        return 1;
+        goto cleanup;
     }
 
     /* Initialize connection pool */
-    if (init_conn_pool() != 0) {
-        destroy_stats();
-        closelog();
-        return 1;
+    g_conn_pool_capacity = (g_conn_pool_capacity > 0) ? g_conn_pool_capacity : TCP_PROXY_CONN_POOL_SIZE;
+    if (conn_pool_init(&g_conn_pool, (size_t)g_conn_pool_capacity, sizeof(struct proxy_conn)) < 0) {
+        P_LOG_ERR("Failed to initialize connection pool");
+        goto cleanup;
     }
 
     /* Initialize connection limiter */
     if (init_conn_limiter(cfg.max_connections, cfg.max_per_ip) != 0) {
-        destroy_conn_pool();
-        destroy_stats();
-        closelog();
-        return 1;
-    }
-
-    /* Daemonize if requested */
-    if (cfg.daemonize && do_daemonize() != 0)
         goto cleanup;
-
-    /* Write PID file if specified */
-    if (cfg.pidfile) {
-        if (write_pidfile(cfg.pidfile) < 0) {
-            rc = 1;
-            goto cleanup;
-        }
     }
 
     /* Set up signal handlers */
     if (setup_shutdown_signals() != 0) {
         P_LOG_ERR("Failed to setup signal handlers");
-        rc = 1;
         goto cleanup;
     }
-    setup_signal_handlers();
 
     /* Create listening socket */
     listen_sock = socket(cfg.src_addr.sa.sa_family, SOCK_STREAM, 0);

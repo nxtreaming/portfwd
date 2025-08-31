@@ -30,20 +30,12 @@ union sockaddr_inx {
 };
 
 struct app_state {
-    const char *pidfile;
-    int pidfile_fd;
-    volatile sig_atomic_t terminate;
     bool daemonized;
 };
 
 extern struct app_state g_state;
 
-void on_signal(int sig);
-void cleanup_pidfile(void);
-int write_pidfile(const char *path);
-int do_daemonize(void);
 
-void setup_signal_handlers(void);
 void set_nonblock(int fd);
 void *addr_of_sockaddr(const union sockaddr_inx *addr);
 const unsigned short *port_of_sockaddr(const union sockaddr_inx *addr);
