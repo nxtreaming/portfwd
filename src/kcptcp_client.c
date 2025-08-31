@@ -1,4 +1,4 @@
-#include <stdio.h>
+﻿#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -69,7 +69,6 @@ struct conn_pool {
 };
 
 /* Forward declarations for basic helper functions */
-static int buffer_ensure_capacity(struct buffer_info *buf, size_t needed, size_t max_size);
 static void secure_zero(void *ptr, size_t len);
 static bool rate_limit_check(struct rate_limiter *rl);
 static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
@@ -271,27 +270,6 @@ static void secure_zero(void *ptr, size_t len) {
     while (len--) *p++ = 0;
 }
 
-static int buffer_ensure_capacity(struct buffer_info *buf, size_t needed, size_t max_size) {
-    if (!buf) return -1;
-    if (buf->capacity >= needed) return 0;
-
-    size_t new_cap = buf->capacity ? buf->capacity * 2 : INITIAL_BUFFER_SIZE;
-    if (new_cap < needed) new_cap = needed;
-    if (new_cap > max_size) {
-        P_LOG_WARN("Buffer size limit exceeded: needed=%zu, max=%zu", needed, max_size);
-        return -1;
-    }
-
-    char *new_data = (char *)realloc(buf->data, new_cap);
-    if (!new_data) {
-        P_LOG_ERR("Buffer realloc failed: %s", strerror(errno));
-        return -1;
-    }
-
-    buf->data = new_data;
-    buf->capacity = new_cap;
-    return 0;
-}
 
 /* Unified connection cleanup function */
 static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn) {
@@ -650,7 +628,7 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Backpressure: buffer and enable EPOLLOUT */
             size_t need = c->response.dlen + (size_t)plen;
-            if (buffer_ensure_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
+            if (ensure_buffer_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
                 P_LOG_WARN("Response buffer size limit exceeded, closing connection");
                 return -1; /* Error: close connection */
             }
@@ -671,7 +649,7 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
         /* Short write: buffer remaining and enable EPOLLOUT */
         size_t rem = (size_t)plen - (size_t)wn;
         size_t need = c->response.dlen + rem;
-        if (buffer_ensure_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
+        if (ensure_buffer_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
             P_LOG_WARN("Response buffer size limit exceeded, closing connection");
             return -1; /* Error: close connection */
         }
@@ -937,7 +915,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
             P_LOG_ERR("Failed to generate secure random token");
             close(cs);
             close(us);
-            free(c);
+            release_proxy_conn_to_pool(c);
             continue;
         }
         /* Determine effective aggregation profile for this listen port */
@@ -951,6 +929,9 @@ static void client_handle_accept(struct client_ctx *ctx) {
         uint32_t eff_max_ms = ctx->cfg->agg_max_ms;
         uint32_t eff_max_bytes = ctx->cfg->agg_max_bytes;
         compute_agg_profile(ctx->cfg, lport, &eff_min_ms, &eff_max_ms, &eff_max_bytes);
+        /* Cap by MTU-derived embed capacity to avoid fragmentation */
+        uint32_t mtu_cap = kcptcp_stealth_embed_cap_from_mtu(ctx->kopts ? ctx->kopts->mtu : 1350);
+        if (eff_max_bytes > mtu_cap) eff_max_bytes = mtu_cap;
         c->hs_agg_max_bytes_eff = eff_max_bytes;
 
         /* Pre-drain any immediately available TCP bytes into buffer */
@@ -962,11 +943,11 @@ static void client_handle_accept(struct client_ctx *ctx) {
                 if (rn > 0) {
                     c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
                     size_t need = c->request.dlen + (size_t)rn;
-                    if (buffer_ensure_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
+                    if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
                         P_LOG_WARN("Request buffer size limit exceeded, closing connection");
                         close(cs);
                         close(us);
-                        free(c);
+                        release_proxy_conn_to_pool(c);
                         drop_conn = true;
                         break;
                     }
@@ -998,7 +979,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
                 free(utag);
             close(cs);
             close(us);
-            free(c);
+            release_proxy_conn_to_pool(c);
             continue;
         }
         ctag->conn = c;
@@ -1015,7 +996,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
             close(us);
             free(ctag);
             free(utag);
-            free(c);
+            release_proxy_conn_to_pool(c);
             continue;
         }
         if (kcptcp_ep_register_rw(ctx->epfd, us, utag, false) < 0) {
@@ -1025,7 +1006,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
             close(us);
             free(ctag);
             free(utag);
-            free(c);
+            release_proxy_conn_to_pool(c);
             continue;
         }
 
@@ -1091,7 +1072,7 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
             if (!c->kcp_ready) {
                 /* buffer until KCP ready */
                 size_t need = c->request.dlen + (size_t)rn;
-                if (buffer_ensure_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
+                if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
                     P_LOG_WARN("Request buffer size limit exceeded, closing connection");
                     c->state = S_CLOSING;
                     break;
@@ -1392,59 +1373,7 @@ int main(int argc, char **argv) {
             }
             if (pos->kcp)
                 (void)kcp_update_flush(pos, now);
-            /* Periodic runtime stats logging (~5s, configurable) */
-            if (pos->kcp && get_stats_enabled()) {
-                uint64_t now_ms = now;
-                if (pos->last_stat_ms == 0) {
-                    pos->last_stat_ms = now_ms;
-                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
-                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
-                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
-                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
-                    pos->last_kcp_xmit = pos->kcp->xmit;
-                    pos->last_rekeys_initiated = pos->rekeys_initiated;
-                    pos->last_rekeys_completed = pos->rekeys_completed;
-                } else if (now_ms - pos->last_stat_ms >=
-                           get_stats_interval_ms()) {
-                    uint64_t dt = now_ms - pos->last_stat_ms;
-                    uint64_t d_tcp_rx =
-                        pos->tcp_rx_bytes - pos->last_tcp_rx_bytes;
-                    uint64_t d_tcp_tx =
-                        pos->tcp_tx_bytes - pos->last_tcp_tx_bytes;
-                    uint64_t d_kcp_tx =
-                        pos->kcp_tx_bytes - pos->last_kcp_tx_bytes;
-                    uint64_t d_kcp_rx =
-                        pos->kcp_rx_bytes - pos->last_kcp_rx_bytes;
-                    uint32_t d_xmit = pos->kcp->xmit - pos->last_kcp_xmit;
-                    uint32_t d_rekey_i =
-                        pos->rekeys_initiated - pos->last_rekeys_initiated;
-                    uint32_t d_rekey_c =
-                        pos->rekeys_completed - pos->last_rekeys_completed;
-                    double sec = (double)dt / 1000.0;
-                    double tcp_in_mbps =
-                        sec > 0 ? (double)d_tcp_rx * 8.0 / (sec * 1e6) : 0.0;
-                    double tcp_out_mbps =
-                        sec > 0 ? (double)d_tcp_tx * 8.0 / (sec * 1e6) : 0.0;
-                    double kcp_in_mbps =
-                        sec > 0 ? (double)d_kcp_rx * 8.0 / (sec * 1e6) : 0.0;
-                    double kcp_out_mbps =
-                        sec > 0 ? (double)d_kcp_tx * 8.0 / (sec * 1e6) : 0.0;
-                    P_LOG_INFO("stats conv=%u: TCP in=%.3f Mbps out=%.3f Mbps "
-                               "| KCP payload in=%.3f Mbps out=%.3f Mbps | KCP "
-                               "xmit_delta=%u RTT=%dms | rekey i=%u c=%u",
-                               pos->conv, tcp_in_mbps, tcp_out_mbps,
-                               kcp_in_mbps, kcp_out_mbps, d_xmit,
-                               pos->kcp->rx_srtt, d_rekey_i, d_rekey_c);
-                    pos->last_stat_ms = now_ms;
-                    pos->last_tcp_rx_bytes = pos->tcp_rx_bytes;
-                    pos->last_tcp_tx_bytes = pos->tcp_tx_bytes;
-                    pos->last_kcp_tx_bytes = pos->kcp_tx_bytes;
-                    pos->last_kcp_rx_bytes = pos->kcp_rx_bytes;
-                    pos->last_kcp_xmit = pos->kcp->xmit;
-                    pos->last_rekeys_initiated = pos->rekeys_initiated;
-                    pos->last_rekeys_completed = pos->rekeys_completed;
-                }
-            }
+            kcptcp_maybe_log_stats(pos, now);
             /* If we received FIN earlier and output buffer has drained,
              * shutdown(WRITE) */
             if (pos->svr_in_eof && !pos->svr2cli_shutdown &&
@@ -1479,21 +1408,7 @@ int main(int argc, char **argv) {
                 }
             }
             if (pos->state == S_CLOSING) {
-                if (get_stats_dump_enabled()) {
-                    P_LOG_INFO("stats total conv=%u: tcp_rx=%llu tcp_tx=%llu "
-                               "udp_rx=%llu udp_tx=%llu kcp_rx_msgs=%llu "
-                               "kcp_tx_msgs=%llu kcp_rx_bytes=%llu "
-                               "kcp_tx_bytes=%llu rekeys_i=%u rekeys_c=%u",
-                               pos->conv, (unsigned long long)pos->tcp_rx_bytes,
-                               (unsigned long long)pos->tcp_tx_bytes,
-                               (unsigned long long)pos->udp_rx_bytes,
-                               (unsigned long long)pos->udp_tx_bytes,
-                               (unsigned long long)pos->kcp_rx_msgs,
-                               (unsigned long long)pos->kcp_tx_msgs,
-                               (unsigned long long)pos->kcp_rx_bytes,
-                               (unsigned long long)pos->kcp_tx_bytes,
-                               pos->rekeys_initiated, pos->rekeys_completed);
-                }
+                kcptcp_log_total_stats(pos);
                 update_connection_stats(pos, false);
                 conn_cleanup(&cctx, pos);
             }

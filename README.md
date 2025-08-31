@@ -69,6 +69,8 @@ User-space TCP/UDP port forwarding services
   - PSK `-K` is required. AEAD (ChaCha20-Poly1305) and stealth handshake are always enabled with the PSK.
   - Stealth handshake: the first UDP packet looks like encrypted data and can embed the first TCP bytes.
   - Aggregation (`-g/-G/-P`) adds a small randomized delay to gather initial TCP bytes to mimic normal traffic.
+    - Effective embed cap is MTU-aware: the actual first-packet embed size is bounded by a budget computed from the KCP MTU to avoid fragmentation (i.e., `embed <= min(-G, MTU budget)`).
+    - If no early TCP bytes arrive within the aggregation window, the client still sends a stealth packet with random padding.
 
 ### kcptcp-server (KCP/UDP to TCP server)
 
@@ -96,6 +98,7 @@ User-space TCP/UDP port forwarding services
   Notes:
   - Listens on a UDP address, accepts KCP sessions, and bridges to a target TCP service.
   - PSK must match the client; stealth handshake response can be jittered with `-j` to mimic normal traffic timing.
+  - Default jitter window is 5–20ms. Set `-j 0-0` to disable jitter.
 
 ## Examples
 
@@ -140,6 +143,37 @@ Notes:
   - `-P csv:22,2222` to disable aggregation on specific ports (e.g., SSH).
 - Server-side stealth jitter:
   - `-j 5-25` to add small jitter before sending handshake response.
+
+#### Deterministic conv (optional)
+
+By default the server derives the KCP conversation ID (conv) from the PSK and the client token during the stealth handshake. This binds the session identity to the key material and reduces metadata randomness.
+
+- Disable via env var on the server:
+
+```sh
+PFWD_DETERMINISTIC_CONV=0 kcptcp-server ...
+```
+
+When disabled, the server uses secure random conv IDs with a uniqueness check.
+
+#### Stealth handshake notes
+
+- Client aggregates early TCP bytes (if any) for a short window and embeds up to the MTU-aware cap into the first UDP packet.
+- The first UDP packet always looks like encrypted payload (no plaintext headers). If there is nothing to embed, random padding is used.
+- Server can jitter the handshake response (`-j`) to avoid an immediate request/response signature.
+- Per-port client profiles (`-P`) can turn aggregation off for interactive ports (e.g., `-P csv:22,2222`) or use built-in heuristics (`-P auto`).
+
+##### MTU budget for first‑packet embed
+
+- Formula (application payload embedded into the first UDP packet):
+  - `embed_budget ≈ KCP_MTU - (nonce 12 + tag 16 + payload 36 + padding)`
+  - Payload is the stealth handshake header (36 bytes); padding is random 16–47 bytes.
+  - Therefore: `embed_budget ∈ [KCP_MTU - 111, KCP_MTU - 80]`
+- Typical ranges (bytes):
+  - KCP_MTU=1200 → 1089–1120
+  - KCP_MTU=1350 → 1239–1270 (default build)
+  - KCP_MTU=1480 → 1369–1400
+- The client takes `min(-G, MTU budget)` when embedding early TCP bytes to avoid fragmentation.
 
 ### Generate a secure PSK
 

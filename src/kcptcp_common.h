@@ -68,12 +68,25 @@ int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, 
 uint32_t get_stats_interval_ms(void);
 bool get_stats_dump_enabled(void);
 bool get_stats_enabled(void);
+/* Per-connection periodic stats logging using last_* snapshots inside proxy_conn. */
+void kcptcp_maybe_log_stats(struct proxy_conn *c, uint64_t now_ms);
+/* One-shot dump of totals for a connection when closing */
+void kcptcp_log_total_stats(struct proxy_conn *c);
+/* Env toggle: deterministic conv derivation (default: enabled). */
+bool kcptcp_deterministic_conv_enabled(void);
 
 /* Socket buffer sizing (no-op if bytes <= 0) */
 void set_sock_buffers_sz(int sockfd, int bytes);
 
 /* PSK parsing */
 bool parse_psk_hex32(const char *hex, uint8_t out[32]);
+
+/* Shared buffer growth helper (returns 0 on success, -1 on error/limit) */
+int ensure_buffer_capacity(struct buffer_info *buf, size_t needed,
+                           size_t max_size);
+
+/* Compute safe embed cap for stealth first-packet based on MTU */
+uint32_t kcptcp_stealth_embed_cap_from_mtu(int mtu);
 
 /* AEAD sequence window helpers (shared by client/server) */
 bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win,
