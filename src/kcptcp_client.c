@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -28,6 +28,7 @@
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "aead.h"
+#include "fwd_util.h"
 #include <pthread.h>
 
 /* Configuration constants */
@@ -1305,13 +1306,15 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.daemonize) {
-        if (do_daemonize() != 0)
+        if (cfg.daemonize && do_daemonize() != 0)
             return 1;
         g_state.daemonized = true;
     }
-    setup_signal_handlers();
+    if (init_signals() != 0) {
+        return 1;
+    }
     if (cfg.pidfile) {
-        if (write_pidfile(cfg.pidfile) != 0) {
+        if (create_pid_file(cfg.pidfile) != 0) {
             P_LOG_ERR("failed to write pidfile: %s", cfg.pidfile);
             return 1;
         }
@@ -1368,7 +1371,7 @@ int main(int argc, char **argv) {
     cctx.handshake_limiter.window_size_sec = 60;
 
     /* Event loop: accept TCP, bridge via KCP over UDP */
-    while (!g_state.terminate) {
+    while (!g_shutdown_requested) {
         /* Compute dynamic timeout from all KCP connections */
         int timeout_ms = kcptcp_compute_kcp_timeout_ms(&conns, 1000);
 

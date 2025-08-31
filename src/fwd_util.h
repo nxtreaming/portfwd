@@ -100,5 +100,6 @@ void init_fwd_config(struct fwd_config *cfg);
 int parse_common_args(int argc, char **argv, struct fwd_config *cfg);
 int get_sockaddr_inx(const char *str, union sockaddr_inx *addr, bool is_source);
 int resolve_address(union sockaddr_inx *addr, const char *host, const char *port_str);
+void cleanup_pidfile(void);
 
 #endif // FWD_UTIL_H
