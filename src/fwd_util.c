@@ -14,10 +14,6 @@
 #include <pwd.h>
 #include <grp.h>
 
-// For logging before daemonization or when syslog is not used
-#define P_LOG_ERR(fmt, ...) fprintf(stderr, "ERROR: " fmt "\n", ##__VA_ARGS__)
-#define P_LOG_WARN(fmt, ...) fprintf(stderr, "WARN: " fmt "\n", ##__VA_ARGS__)
-#define P_LOG_INFO(fmt, ...) fprintf(stderr, "INFO: " fmt "\n", ##__VA_ARGS__)
 
 // Global signal-safe flag for graceful shutdown
 volatile sig_atomic_t g_shutdown_requested = 0;
@@ -57,7 +53,7 @@ int do_daemonize(void) {
 }
 
 /* Setup signal handlers for graceful shutdown */
-void init_signals(void) {
+int init_signals(void) {
     struct sigaction sa;
 
     /* Block signals during handler execution */
@@ -179,7 +175,7 @@ int create_pid_file(const char *filepath) {
 void init_fwd_config(struct fwd_config *cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->max_total_connections = -1; // Default: no limit
-    cfg->max_per_ip = 0; // Default: no limit
+    cfg->max_per_ip_connections = 0; // Default: no limit
 }
 
 int parse_common_args(int argc, char **argv, struct fwd_config *cfg) {
@@ -196,19 +192,19 @@ int parse_common_args(int argc, char **argv, struct fwd_config *cfg) {
             cfg->daemonize = true;
             break;
         case 'r':
-            cfg->reuse_addr = true;
+            cfg->reuse_addr = 1;
             break;
         case 'R':
-            cfg->reuse_port = true;
+            cfg->reuse_port = 1;
             break;
         case '6':
-            cfg->v6only = true;
+            cfg->v6only = 1;
             break;
         case 'P':
             cfg->pidfile = optarg;
             break;
         case 'i':
-            cfg->max_per_ip = (unsigned int)atoi(optarg);
+            cfg->max_per_ip_connections = (unsigned int)atoi(optarg);
             break;
         case '?':
             // getopt() prints an error message to stderr.

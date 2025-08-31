@@ -20,7 +20,10 @@ struct fwd_config {
     const char *username;
     bool daemonize;
     bool transparent_proxy;
-    bool use_splice; /* zero-copy */
+    bool use_splice;
+    int reuse_addr;
+    int reuse_port;
+    int v6only;
 
     /* Connection limits */
     int max_total_connections;
@@ -75,7 +78,7 @@ struct conn_limiter {
 extern volatile sig_atomic_t g_shutdown_requested;
 
 // Setup signal handlers for graceful shutdown
-void init_signals(void);
+int init_signals(void);
 
 // PID file management
 int create_pid_file(const char *path);
