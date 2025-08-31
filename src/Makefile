@@ -52,8 +52,8 @@ KCPTCPOBJS = $(BUILD_DIR)/kcptcp_common.o
 kcptcp-client: $(BUILD_DIR)/kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o kcptcp-client $(BUILD_DIR)/kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O) $(LDFLAGS)
 
-kcptcp-server: $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o kcptcp-server $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)
+kcptcp-server: $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o kcptcp-server $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O) $(LDFLAGS)
 
 # Convenience aliases: allow underscored targets too
 .PHONY: kcptcp_client kcptcp_server

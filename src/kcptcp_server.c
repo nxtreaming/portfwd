@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
@@ -19,6 +19,7 @@
 #endif
 #include "common.h"
 #include "proxy_conn.h"
+#include "fwd_util.h"
 #include "kcp_common.h"
 #include "kcptcp_common.h"
 #include "kcp_map.h"
@@ -681,9 +682,11 @@ int main(int argc, char **argv) {
             return 1;
         g_state.daemonized = true;
     }
-    setup_signal_handlers();
+    if (init_signals() != 0) {
+        return 1;
+    }
     if (cfg.pidfile) {
-        if (write_pidfile(cfg.pidfile) != 0) {
+        if (create_pid_file(cfg.pidfile) != 0) {
             P_LOG_ERR("failed to write pidfile: %s", cfg.pidfile);
             return 1;
         }
@@ -726,7 +729,7 @@ int main(int argc, char **argv) {
     kcp_opts_apply_overrides(&kopts, kcp_mtu, kcp_nd, kcp_it, kcp_rs, kcp_nc,
                              kcp_snd, kcp_rcv);
 
-    while (!g_state.terminate) {
+    while (!g_shutdown_requested) {
         /* Compute timeout from all KCP sessions */
         int timeout_ms = kcptcp_compute_kcp_timeout_ms(&conns, 1000);
 
