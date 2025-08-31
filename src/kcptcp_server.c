@@ -97,6 +97,26 @@ static void kcp_map_safe_free(struct kcp_map_safe *cmap);
 static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap, uint32_t conv);
 static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv, struct proxy_conn *c);
 static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
+static uint32_t generate_secure_conv(void);
+static bool rate_limit_check_addr(const union sockaddr_inx *addr);
+static bool conn_limit_check(const union sockaddr_inx *addr);
+static void conn_limit_release(const union sockaddr_inx *addr);
+static size_t addr_hash(const union sockaddr_inx *addr);
+static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev, struct proxy_conn *conn);
+static uint32_t derive_conv_from_psk_token(const uint8_t psk[32], const uint8_t token[16]);
+
+/* Enhanced error handling */
+#define LOG_CONN_ERR(conn, fmt, ...)                                                               \
+    P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
+/* Enhanced error handling functions */
+
+#define LOG_CONN_WARN(conn, fmt, ...)                                                              \
+    P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
+#define LOG_CONN_INFO(conn, fmt, ...)                                                              \
+    P_LOG_INFO("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
 static void remove_pid_file(const char *pidfile) {
     if (pidfile) {
         if (unlink(pidfile) != 0) {
@@ -128,25 +148,6 @@ static void print_usage(const char *prog) {
     printf("  --kcp-sndwnd <wnd>         Set KCP send window size\n");
     printf("  --kcp-rcvwnd <wnd>         Set KCP receive window size\n");
 }
-static uint32_t generate_secure_conv(void);
-static bool rate_limit_check_addr(const union sockaddr_inx *addr);
-static bool conn_limit_check(const union sockaddr_inx *addr);
-static void conn_limit_release(const union sockaddr_inx *addr);
-static size_t addr_hash(const union sockaddr_inx *addr);
-static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev, struct proxy_conn *conn);
-static uint32_t derive_conv_from_psk_token(const uint8_t psk[32], const uint8_t token[16]);
-
-/* Enhanced error handling */
-#define LOG_CONN_ERR(conn, fmt, ...)                                                               \
-    P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
-
-/* Enhanced error handling functions */
-
-#define LOG_CONN_WARN(conn, fmt, ...)                                                              \
-    P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
-
-#define LOG_CONN_INFO(conn, fmt, ...)                                                              \
-    P_LOG_INFO("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
 /* Safe epoll add/modify wrapper for server */
 static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,

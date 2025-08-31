@@ -268,6 +268,23 @@ struct backpressure_queue {
 static struct backpressure_queue g_backpressure_queue;
 #endif /* ENABLE_BACKPRESSURE_QUEUE */
 
+/* Hash functions */
+static uint32_t hash_addr(const union sockaddr_inx *a);
+
+/* Connection management */
+static void proxy_conn_walk_continue(unsigned walk_max, int epfd);
+static bool proxy_conn_evict_one(int epfd);
+
+/* Data handling */
+static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
+#ifdef __linux__
+static void handle_client_data(int listen_sock, int epfd, struct mmsghdr *c_msgs,
+                               struct mmsghdr *s_msgs, struct iovec *s_iovs,
+                               char (*c_bufs)[UDP_PROXY_DGRAM_CAP]);
+#else
+static void handle_client_data(int listen_sock, int epfd);
+#endif
+
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Utility Functions */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -294,27 +311,6 @@ static int safe_close(int fd) {
         return -1;
     }
 }
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Function Declarations */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
-/* Hash functions */
-static uint32_t hash_addr(const union sockaddr_inx *a);
-
-/* Connection management */
-static void proxy_conn_walk_continue(unsigned walk_max, int epfd);
-static bool proxy_conn_evict_one(int epfd);
-
-/* Data handling */
-static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
-#ifdef __linux__
-static void handle_client_data(int listen_sock, int epfd, struct mmsghdr *c_msgs,
-                               struct mmsghdr *s_msgs, struct iovec *s_iovs,
-                               char (*c_bufs)[UDP_PROXY_DGRAM_CAP]);
-#else
-static void handle_client_data(int listen_sock, int epfd);
-#endif
 
 /* Linux batching support */
 #ifdef __linux__

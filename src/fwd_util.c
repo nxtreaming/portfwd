@@ -17,6 +17,9 @@
 // Global signal-safe flag for graceful shutdown
 volatile sig_atomic_t g_shutdown_requested = 0;
 
+static int g_pidfile_fd = -1;
+static const char *g_pidfile_path = NULL;
+
 /* Signal-safe shutdown handler */
 static void handle_shutdown_signal(int sig) {
     (void)sig; /* Unused parameter */
@@ -90,9 +93,6 @@ int init_signals(void) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* PID File Management */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
-static int g_pidfile_fd = -1;
-static const char *g_pidfile_path = NULL;
 
 void cleanup_pidfile(void) {
     if (g_pidfile_fd >= 0) {

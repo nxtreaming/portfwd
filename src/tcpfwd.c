@@ -119,6 +119,15 @@ static int init_conn_limiter(int max_total, int max_per_ip);
 static void destroy_conn_limiter(void);
 static bool check_connection_limit(const union sockaddr_inx *addr);
 static void release_connection_limit(const union sockaddr_inx *addr);
+/* Command-line parsing and main function */
+void usage(const char *prog);
+int parse_opts(int argc, char **argv, struct fwd_config *cfg);
+int resolve_address(union sockaddr_inx *addr, const char *host, const char *port);
+
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+/* Utility Functions */
+/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
+
 static uint32_t addr_hash(const union sockaddr_inx *addr) {
     if (addr->sa.sa_family == AF_INET) {
         return addr->sin.sin_addr.s_addr;
@@ -128,15 +137,6 @@ static uint32_t addr_hash(const union sockaddr_inx *addr) {
     }
     return 0;
 }
-
-/* Command-line parsing and main function */
-void usage(const char *prog);
-int parse_opts(int argc, char **argv, struct fwd_config *cfg);
-int resolve_address(union sockaddr_inx *addr, const char *host, const char *port);
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Utility Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static int set_sock_buffers(int sockfd) {
     int sz = g_sockbuf_cap_runtime;

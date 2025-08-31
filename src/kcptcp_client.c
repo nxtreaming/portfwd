@@ -644,7 +644,8 @@ static void dump_performance_stats(void) {
     time_t uptime = now - g_perf.start_time;
     time_t since_last = now - g_perf.last_stats_dump;
 
-    if (since_last < 60) { /* Dump stats every minute at most */
+    if (since_last < 60) {
+        /* Dump stats every minute at most */
         return;
     }
 
@@ -734,12 +735,14 @@ static void client_handle_udp_events(struct client_ctx *ctx, struct proxy_conn *
             int res = aead_protocol_handle_incoming_packet(c, ubuf, got, ctx->cfg->psk,
                                                            ctx->cfg->has_psk, &payload, &plen);
 
-            if (res < 0) { // Error
+            if (res < 0) {
+                // Error
                 P_LOG_ERR("AEAD packet handling failed (res=%d)", res);
                 c->state = S_CLOSING;
                 break;
             }
-            if (res > 0) { // Control packet handled
+            if (res > 0) {
+                // Control packet handled
                 if (c->svr_in_eof && !c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
                     shutdown(c->cli_sock, SHUT_WR);
                     c->svr2cli_shutdown = true;
