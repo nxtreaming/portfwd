@@ -28,6 +28,7 @@
 #include "anti_replay.h"
 #include "secure_random.h"
 #include "buffer_limits.h"
+#include "outer_obfs.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
 #include "fwd_util.h"
@@ -906,7 +907,7 @@ int main(int argc, char **argv) {
                     /* Feed KCP */
                     c->udp_rx_bytes += (uint64_t)rn; /* Stats: UDP RX */
                     if (c->kcp) {
-                        (void)ikcp_input(c->kcp, buf, (long)rn);
+                        (void)ikcp_input(c->kcp, (const char *)inner, (long)ilen);
                     } else {
                         P_LOG_WARN("drop UDP for conv=%u with no KCP", conv);
                         continue;
