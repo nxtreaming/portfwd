@@ -46,28 +46,6 @@
 #define MAX_CONV_GENERATION_ATTEMPTS 100
 
 /* Security structures */
-struct rate_limiter_entry {
-    union sockaddr_inx addr;
-    time_t last_time;
-    size_t count;
-};
-
-struct rate_limiter {
-    struct rate_limiter_entry entries[HASH_TABLE_SIZE];
-    size_t num_entries;
-    pthread_mutex_t lock;
-};
-
-struct conn_limiter_entry {
-    union sockaddr_inx addr;
-    size_t count;
-};
-
-struct conn_limiter {
-    struct conn_limiter_entry ip_counts[HASH_TABLE_SIZE];
-    size_t total_connections;
-    pthread_mutex_t lock;
-};
 
 struct cfg_server {
     union sockaddr_inx laddr; /* UDP listen address */
@@ -85,25 +63,13 @@ struct cfg_server {
     const char *pidfile;
 };
 
-
-/* Thread-safe KCP map wrapper */
-struct kcp_map_safe {
-    struct kcp_map map;
-    pthread_rwlock_t lock;
-};
-
-
-extern struct conn_pool g_conn_pool;
-static const size_t DEFAULT_CONN_POOL_SIZE = 2048;
-
 /* Global security objects */
-static struct rate_limiter g_rate_limiter = {0};
 static struct conn_limiter g_conn_limiter = {0};
 
 /* Forward declarations */
 static void conn_cleanup_server(struct proxy_conn *conn, int epfd,
                                 struct kcp_map_safe *cmap);
-static void secure_zero(void *ptr, size_t len);
+static void remove_pid_file(const char *pidfile);
 static uint32_t generate_secure_conv(void);
 static bool rate_limit_check_addr(const union sockaddr_inx *addr);
 static bool conn_limit_check(const union sockaddr_inx *addr);
@@ -113,8 +79,6 @@ static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,
                                  struct proxy_conn *conn);
 static uint32_t derive_conv_from_psk_token(const uint8_t psk[32],
                                            const uint8_t token[16]);
-static void print_usage(const char *prog_name);
-static bool kcptcp_deterministic_conv_enabled(void);
 
 /* Thread-safe KCP map operations */
 static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets);
@@ -167,7 +131,6 @@ static uint32_t derive_conv_from_psk_token(const uint8_t psk[32],
         v = 1; /* avoid 0 */
     return v;
 }
-
 
 /* Safe memory management functions */
 static void secure_zero(void *ptr, size_t len) {
@@ -472,33 +435,6 @@ static int handle_system_error(const char *operation, int error_code) {
     }
 }
 
-static void print_usage(const char *prog_name) {
-    fprintf(stderr, "Usage: %s [options] <listen-udp-addr> <target-tcp-addr>\n", prog_name);
-    fprintf(stderr, "\nOptions:\n");
-    fprintf(stderr, "  -h, --help                 Show this help message and exit\n");
-    fprintf(stderr, "  -K, --psk <psk>            Pre-shared key for AEAD encryption (required)\n");
-    fprintf(stderr, "  --hs-jitter-min <ms>       Min handshake response jitter in ms (default: 0)\n");
-    fprintf(stderr, "  --hs-jitter-max <ms>       Max handshake response jitter in ms (default: 100)\n");
-    fprintf(stderr, "  -d, --daemonize            Run in the background\n");
-    fprintf(stderr, "  -p, --pidfile <file>       Write PID to a file\n");
-    fprintf(stderr, "  --reuse-addr               Enable SO_REUSEADDR\n");
-    fprintf(stderr, "  --reuse-port               Enable SO_REUSEPORT\n");
-    fprintf(stderr, "  --v6only                   Enable IPV6_V6ONLY\n");
-    fprintf(stderr, "  --sockbuf <bytes>          Set socket buffer size (SO_SNDBUF, SO_RCVBUF)\n");
-    fprintf(stderr, "  --tcp-nodelay              Enable TCP_NODELAY on target sockets\n");
-    fprintf(stderr, "\nKCP Options:\n");
-    fprintf(stderr, "  --kcp-mtu <mtu>            Set KCP MTU (default: 1400)\n");
-    fprintf(stderr, "  --kcp-nodelay <0|1>        Enable/disable KCP nodelay mode\n");
-    fprintf(stderr, "  --kcp-interval <ms>        Set KCP update interval\n");
-    fprintf(stderr, "  --kcp-resend <0|1|2>       Set KCP fast resend mode\n");
-    fprintf(stderr, "  --kcp-nc <0|1>             Enable/disable congestion control\n");
-    fprintf(stderr, "  --kcp-sndwnd <wnd>         Set KCP send window size\n");
-    fprintf(stderr, "  --kcp-rcvwnd <wnd>         Set KCP receive window size\n");
-}
-
-static bool kcptcp_deterministic_conv_enabled(void) {
-    return true; /* Or based on some config */
-}
 
 int main(int argc, char **argv) {
     int rc = 1;
@@ -550,8 +486,8 @@ int main(int argc, char **argv) {
     cfg.has_psk = opts.has_psk;
     if (opts.has_psk)
         memcpy(cfg.psk, opts.psk, 32);
-    cfg.rsp_jitter_min_ms = opts.hs_rsp_jitter_min_ms;
-    cfg.rsp_jitter_max_ms = opts.hs_rsp_jitter_max_ms;
+    cfg.hs_rsp_jitter_min_ms = opts.hs_rsp_jitter_min_ms;
+    cfg.hs_rsp_jitter_max_ms = opts.hs_rsp_jitter_max_ms;
 
     kcp_mtu = opts.kcp_mtu;
     kcp_nd = opts.kcp_nd;
@@ -855,7 +791,7 @@ int main(int argc, char **argv) {
                             /* Apply small response jitter to look like normal
                              * traffic */
                             uint32_t jitter = rand_between(
-                                cfg.rsp_jitter_min_ms, cfg.rsp_jitter_max_ms);
+                                cfg.hs_rsp_jitter_min_ms, cfg.hs_rsp_jitter_max_ms);
                             if (jitter == 0) {
                                 (void)sendto(
                                     usock, response_buf, response_len,
@@ -1232,17 +1168,3 @@ cleanup:
     return rc;
 }
 
-void print_usage(const char *progname) {
-    printf("Usage: %s [options]\n", progname);
-    printf("Options:\n");
-    printf("  -h, --help             Show this help message and exit\n");
-    printf("  -v, --version          Show version number and exit\n");
-    printf("  -c, --config <file>    Specify configuration file\n");
-    printf("  -p, --pidfile <file>   Specify pid file\n");
-    printf("  -l, --log-level <level> Specify log level (0-5)\n");
-    printf("  -f, --foreground       Run in foreground\n");
-}
-
-bool kcptcp_deterministic_conv_enabled(void) {
-    return false; /* TODO: implement me */
-}
