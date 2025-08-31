@@ -31,15 +31,15 @@ udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BU
 	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
 # High-performance version with optimizations disabled
-udpfwd-fast: $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o udpfwd-fast $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)
+udpfwd-fast: $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o udpfwd-fast $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
 $(BUILD_DIR)/udpfwd-fast.o: udpfwd.c
 	$(CC) $(CFLAGS) -DDISABLE_ADAPTIVE_BATCHING -DDISABLE_RATE_LIMITING -DDISABLE_PACKET_VALIDATION -c -o $@ $<
 
 # Ultra-fast version with minimal locking
-udpfwd-ultra: $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o udpfwd-ultra $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)
+udpfwd-ultra: $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o udpfwd-ultra $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
 $(BUILD_DIR)/udpfwd-ultra.o: udpfwd.c
 	$(CC) $(CFLAGS) -DDISABLE_ADAPTIVE_BATCHING -DDISABLE_RATE_LIMITING -DDISABLE_PACKET_VALIDATION -DDISABLE_FINE_GRAINED_LOCKS -DDISABLE_LRU_LOCKS -DDISABLE_BACKPRESSURE_QUEUE -c -o $@ $<
