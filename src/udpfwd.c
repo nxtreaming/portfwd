@@ -148,7 +148,6 @@
 /* Data Structures */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-
 /**
  * @brief Rate limiting structure for DoS protection
  */
@@ -681,7 +680,6 @@ static uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
 
     return hash;
 }
-
 
 /* Small helper to check if an unsigned value is a power of two */
 static inline bool is_power_of_two(unsigned v) {
