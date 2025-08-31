@@ -69,9 +69,6 @@
 
 #define LISTEN_BACKLOG 128
 
-#define EV_MAGIC_LISTENER 0xdeadbeefU
-#define EV_MAGIC_CLIENT 0xfeedfaceU
-#define EV_MAGIC_SERVER 0xbaadcafeU
 
 #define MIN_VALID_POINTER 4096
 

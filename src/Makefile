@@ -27,8 +27,8 @@ FWD_OBJS = $(BUILD_DIR)/tcpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $
 tcpfwd: $(FWD_OBJS)
 	$(CC) $(CFLAGS) -o tcpfwd $(FWD_OBJS) $(LDFLAGS)
 
-udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)
+udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
 # High-performance version with optimizations disabled
 udpfwd-fast: $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)

@@ -40,6 +40,8 @@ struct fwd_config {
 
     /* Timeouts */
     int idle_timeout;
+    unsigned proxy_conn_timeo;
+    unsigned conn_tbl_hash_size;
 };
 
 struct proxy_stats {

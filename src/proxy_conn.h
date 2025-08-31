@@ -1,6 +1,11 @@
 #ifndef __PORTFWD_PROXY_CONN_H__
 #define __PORTFWD_PROXY_CONN_H__
 
+#define EV_MAGIC_LISTENER ((uintptr_t)0xdeadbeefdeadbeef)
+#define EV_MAGIC_CLIENT   ((uintptr_t)0xcafebabecafebabe)
+#define EV_MAGIC_SERVER   ((uintptr_t)0xfeedfacefeedface)
+
+
 #include "list.h"
 #include "anti_replay.h"
 #include <stdint.h>

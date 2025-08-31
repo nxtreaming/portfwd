@@ -147,23 +147,6 @@
 /* Data Structures */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-struct config {
-    union sockaddr_inx src_addr;
-    union sockaddr_inx dst_addr;
-    const char *pidfile;
-    unsigned proxy_conn_timeo;
-    unsigned conn_tbl_hash_size;
-    bool daemonize;
-    bool v6only;
-    bool reuse_addr;
-    bool reuse_port;
-    /* Security limits */
-    unsigned max_connections_per_ip;
-    unsigned max_packets_per_second;
-    unsigned max_bytes_per_second;
-    size_t max_packet_size;
-    size_t min_packet_size;
-};
 
 /**
  * @brief Rate limiting structure for DoS protection
@@ -260,6 +243,8 @@ static _Atomic uint64_t g_stat_hash_collisions;
 static _Atomic uint64_t g_stat_lru_immediate_updates;
 static _Atomic uint64_t g_stat_lru_deferred_updates;
 
+/* Global config */
+static struct fwd_config g_cfg;
 
 /* Global rate limiter for security */
 static struct rate_limiter g_rate_limiter;
@@ -328,13 +313,12 @@ static bool proxy_conn_evict_one(int epfd);
 /* Data handling */
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
 #ifdef __linux__
-static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int epfd,
+static void handle_client_data(int listen_sock, int epfd,
                                struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
                                struct iovec *s_iovs,
                                char (*c_bufs)[UDP_PROXY_DGRAM_CAP]);
 #else
-static void handle_client_data(const struct fwd_config *cfg, int lsn_sock,
-                               int epfd);
+static void handle_client_data(int listen_sock, int epfd);
 #endif
 
 /* Linux batching support */
@@ -844,8 +828,7 @@ static void segmented_update_lru(void) {
 }
 
 static struct proxy_conn *
-proxy_conn_get_or_create(const struct fwd_config *cfg,
-                         const union sockaddr_inx *cli_addr, int epfd) {
+proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
     struct list_head *chain = &conn_tbl_hbase[bucket_index_fun(cli_addr)];
     struct proxy_conn *conn = NULL;
     int svr_sock = -1;
@@ -869,7 +852,8 @@ proxy_conn_get_or_create(const struct fwd_config *cfg,
     unsigned current_conn_count = atomic_load(&conn_tbl_len);
     if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
         /* First, try to recycle any timed-out connections */
-        proxy_conn_walk_continue(cfg, current_conn_count, epfd);
+        proxy_conn_walk_continue(current_conn_count, epfd);
+
 
         /* Reload count after cleanup */
         current_conn_count = atomic_load(&conn_tbl_len);
@@ -903,20 +887,19 @@ proxy_conn_get_or_create(const struct fwd_config *cfg,
 
     /* ------------------------------------------ */
     /* Establish the server-side connection */
-    if ((svr_sock = socket(cfg->dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
+    if ((svr_sock = socket(g_cfg.dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
         P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
         goto err;
     }
     /* Connect to real server. */
-    if (connect(svr_sock, (struct sockaddr *)&cfg->dst_addr,
-                sizeof_sockaddr(&cfg->dst_addr)) != 0) {
+    if (connect(svr_sock, (struct sockaddr *)&g_cfg.dst_addr,
+                sizeof_sockaddr(&g_cfg.dst_addr)) != 0) {
         /* Error occurs, drop the session. */
         P_LOG_WARN("Connection failed: %s", strerror(errno));
         goto err;
     }
     set_nonblock(svr_sock);
-    set_sock_buffers(svr_sock);
-
+    
     /* Allocate session data for the connection */
     if (!(conn = init_proxy_conn(conn_pool_alloc(&g_conn_pool)))) {
         P_LOG_ERR("conn_pool_alloc: failed");
@@ -1035,8 +1018,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     conn_pool_release(&g_conn_pool, conn);
 }
 
-static void proxy_conn_walk_continue(const struct fwd_config *cfg,
-                                     unsigned walk_max, int epfd) {
+static void proxy_conn_walk_continue(unsigned walk_max, int epfd) {
     unsigned walked = 0;
     time_t now = atomic_load(&g_now_ts);
     if (now == 0) {
@@ -1056,7 +1038,7 @@ static void proxy_conn_walk_continue(const struct fwd_config *cfg,
         long diff = (long)(now - oldest->last_active);
         if (diff < 0)
             diff = 0;
-        if ((unsigned)diff <= cfg->proxy_conn_timeo) {
+        if ((unsigned)diff <= g_cfg.proxy_conn_timeo) {
             break; /* oldest not expired -> none later are expired */
         }
 
@@ -1111,12 +1093,12 @@ static bool proxy_conn_evict_one(int epfd) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #ifdef __linux__
-static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int epfd,
+static void handle_client_data(int lsn_sock, int epfd,
                                struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
                                struct iovec *s_iovs,
                                char (*c_bufs)[UDP_PROXY_DGRAM_CAP]) {
 #else
-static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int epfd) {
+static void handle_client_data(int lsn_sock, int epfd) {
 #endif
     struct proxy_conn *conn;
 
@@ -1165,7 +1147,7 @@ static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int e
                     continue; /* Drop rate-limited packet */
                 }
 
-                if (!(conn = proxy_conn_get_or_create(cfg, sa, epfd)))
+                if (!(conn = proxy_conn_get_or_create(sa, epfd)))
                     continue;
                 touch_proxy_conn(conn);
 
@@ -1316,7 +1298,7 @@ static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int e
         return; /* Drop rate-limited packet */
     }
 
-    if (!(conn = proxy_conn_get_or_create(cfg, &cli_addr, epfd)))
+    if (!(conn = proxy_conn_get_or_create(&cli_addr, epfd)))
         return;
 
     /* refresh activity */
@@ -1543,10 +1525,9 @@ static void show_help(const char *prog) {
 
 int main(int argc, char *argv[]) {
     int rc = 1;
-    struct fwd_config fwd_config;
     int listen_sock = -1, epfd = -1, i;
     time_t last_check = 0;
-    uint32_t magic_listener = EV_MAGIC_LISTENER;
+    struct epoll_event ev, events[MAX_EVENTS];
 
 #ifdef __linux__
     struct mmsghdr *c_msgs = NULL, *s_msgs = NULL;
@@ -1555,11 +1536,11 @@ int main(int argc, char *argv[]) {
     char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = {0};
 #endif
 
-    init_fwd_config(&fwd_config);
-    fwd_config.proxy_conn_timeo = DEFAULT_CONN_TIMEOUT_SEC;
-    fwd_config.conn_tbl_hash_size = DEFAULT_HASH_TABLE_SIZE;
+    memset(&g_cfg, 0, sizeof(g_cfg));
+    g_cfg.proxy_conn_timeo = DEFAULT_CONN_TIMEOUT_SEC;
+    g_cfg.conn_tbl_hash_size = DEFAULT_HASH_TABLE_SIZE;
 
-    int new_optind = parse_common_args(argc, argv, &fwd_config);
+    int new_optind = parse_common_args(argc, argv, &g_cfg);
     if (new_optind < 0) {
         show_help(argv[0]);
         return 1;
@@ -1574,11 +1555,11 @@ int main(int argc, char *argv[]) {
             unsigned long v = strtoul(optarg, &end, 10);
             if (end == optarg || *end != '\0') {
                 P_LOG_WARN("invalid -t value '%s', keeping default %u", optarg,
-                           fwd_config.proxy_conn_timeo);
+                           g_cfg.proxy_conn_timeo);
             } else {
                 if (v == 0) v = 1;
                 if (v > 86400UL) v = 86400UL;
-                fwd_config.proxy_conn_timeo = (unsigned)v;
+                g_cfg.proxy_conn_timeo = (unsigned)v;
             }
             break;
         }
@@ -1630,12 +1611,12 @@ int main(int argc, char *argv[]) {
             unsigned long v = strtoul(optarg, &end, 10);
             if (end == optarg || *end != '\0') {
                 P_LOG_WARN("invalid -H value '%s', keeping default %u", optarg,
-                           fwd_config.conn_tbl_hash_size);
+                           g_cfg.conn_tbl_hash_size);
             } else {
                 if (v == 0) v = 4093UL;
                 if (v < 64UL) v = 64UL;
                 if (v > (1UL << 20)) v = (1UL << 20);
-                fwd_config.conn_tbl_hash_size = (unsigned)v;
+                g_cfg.conn_tbl_hash_size = (unsigned)v;
             }
             break;
         }
@@ -1648,17 +1629,17 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (get_sockaddr_inx(argv[optind], &fwd_config.src_addr, true) != 0) return 1;
-    if (get_sockaddr_inx(argv[optind + 1], &fwd_config.dst_addr, false) != 0) return 1;
+    if (get_sockaddr_inx(argv[optind], &g_cfg.listen_addr, true) != 0) return 1;
+    if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0) return 1;
 
     openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
-    if (fwd_config.daemonize) {
+    if (g_cfg.daemonize) {
         if (do_daemonize() != 0) return 1;
     }
 
-    if (fwd_config.pidfile) {
-        if (create_pid_file(fwd_config.pidfile) != 0) return 1;
+    if (g_cfg.pidfile) {
+        if (create_pid_file(g_cfg.pidfile) != 0) return 1;
     }
 
     if (conn_pool_init(&g_conn_pool, g_conn_pool_capacity,
@@ -1667,22 +1648,19 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    if (init_conn_limiter(fwd_config.max_total_connections, fwd_config.max_per_ip) != 0) {
-        goto cleanup;
-    }
-
-    if (setup_shutdown_signals() != 0) {
+    if (init_signals() != 0) {
         P_LOG_ERR("setup_shutdown_signals: failed");
+        rc = 1;
         goto cleanup;
     }
 
-    listen_sock = socket(fwd_config.src_addr.sa.sa_family, SOCK_DGRAM, 0);
+    listen_sock = socket(g_cfg.listen_addr.sa.sa_family, SOCK_DGRAM, 0);
     if (listen_sock < 0) {
         P_LOG_ERR("socket(): %s", strerror(errno));
         goto cleanup;
     }
 
-    if (fwd_config.reuse_addr) {
+    if (g_cfg.reuse_addr) {
         int on = 1;
         if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) <
             0) {
@@ -1691,7 +1669,7 @@ int main(int argc, char *argv[]) {
     }
 
 #ifdef SO_REUSEPORT
-    if (fwd_config.reuse_port) {
+    if (g_cfg.reuse_port) {
         int on = 1;
         if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) <
             0) {
@@ -1700,18 +1678,25 @@ int main(int argc, char *argv[]) {
     }
 #endif
 
-    if (fwd_config.src_addr.sa.sa_family == AF_INET6 && fwd_config.v6only) {
+    if (g_cfg.listen_addr.sa.sa_family == AF_INET6 && g_cfg.v6only) {
         int on = 1;
         (void)setsockopt(listen_sock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
     }
 
-    if (bind(listen_sock, &fwd_config.src_addr.sa, sizeof_sockaddr(&fwd_config.src_addr)) < 0) {
+    if (bind(listen_sock, &g_cfg.listen_addr.sa, sizeof_sockaddr(&g_cfg.listen_addr)) < 0) {
         P_LOG_ERR("bind(): %s", strerror(errno));
         goto cleanup;
     }
 
     set_nonblock(listen_sock);
-    set_sock_buffers(listen_sock);
+    if (g_sockbuf_cap_runtime > 0) {
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime, sizeof(g_sockbuf_cap_runtime)) < 0) {
+            P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
+        }
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime, sizeof(g_sockbuf_cap_runtime)) < 0) {
+            P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
+        }
+    }
 
 #ifdef EPOLL_CLOEXEC
     epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -1724,7 +1709,7 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
-    g_conn_tbl_hash_size = fwd_config.conn_tbl_hash_size;
+    g_conn_tbl_hash_size = g_cfg.conn_tbl_hash_size;
     if (g_conn_tbl_hash_size < 64) g_conn_tbl_hash_size = 64;
     if (g_conn_tbl_hash_size > (1u << 20)) g_conn_tbl_hash_size = (1u << 20);
 
@@ -1769,7 +1754,7 @@ int main(int argc, char *argv[]) {
 #endif
 
     /* epoll loop */
-    ev.data.ptr = NULL;
+    ev.data.ptr = &magic_listener;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
 #ifdef EPOLLEXCLUSIVE
     ev.events |= EPOLLEXCLUSIVE;
@@ -1787,7 +1772,7 @@ int main(int argc, char *argv[]) {
 
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= 2) {
-            proxy_conn_walk_continue(&fwd_config, 200, epfd);
+            proxy_conn_walk_continue(200, epfd);
             /* Segmented LRU update to reduce per-packet overhead */
             segmented_update_lru();
             /* Process any queued backpressure packets */
@@ -1820,7 +1805,7 @@ int main(int argc, char *argv[]) {
             struct epoll_event *evp = &events[i];
             struct proxy_conn *conn;
 
-            if (evp->data.ptr == NULL) {
+            if (evp->data.ptr == &magic_listener) {
                 /* Data from client */
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
                     P_LOG_ERR("listener: EPOLLERR/HUP");
@@ -1828,10 +1813,9 @@ int main(int argc, char *argv[]) {
                     goto cleanup;
                 }
 #ifdef __linux__
-                handle_client_data(&fwd_config, listen_sock, epfd, c_msgs, s_msgs, s_iovs,
-                                   c_bufs);
+                handle_client_data(listen_sock, epfd, c_msgs, s_msgs, s_iovs, c_bufs);
 #else
-                handle_client_data(&fwd_config, listen_sock, epfd);
+                handle_client_data(listen_sock, epfd);
 #endif
             } else {
                 /* Data from server */
@@ -1841,16 +1825,16 @@ int main(int argc, char *argv[]) {
                     release_proxy_conn(conn, epfd);
                     continue;
                 }
-                handle_server_data(conn, lsn_sock, epfd);
+                handle_server_data(conn, listen_sock, epfd);
             }
         }
     }
 
 cleanup:
     /* Cleanup resources */
-    if (lsn_sock >= 0) {
-        if (safe_close(lsn_sock) < 0) {
-            P_LOG_WARN("close(lsn_sock=%d): %s", lsn_sock, strerror(errno));
+    if (listen_sock >= 0) {
+        if (safe_close(listen_sock) < 0) {
+            P_LOG_WARN("close(listen_sock=%d): %s", listen_sock, strerror(errno));
         }
     }
     epoll_close_comp(epfd);
@@ -1868,7 +1852,7 @@ cleanup:
 
     free(conn_tbl_hbase);
     conn_tbl_hbase = NULL;
-    destroy_conn_pool();
+    conn_pool_destroy(&g_conn_pool);
     destroy_rate_limiter();
 #if ENABLE_BACKPRESSURE_QUEUE
     destroy_backpressure_queue();
