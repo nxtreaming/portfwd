@@ -306,8 +306,7 @@ static int safe_close(int fd) {
 static uint32_t hash_addr(const union sockaddr_inx *a);
 
 /* Connection management */
-static void proxy_conn_walk_continue(const struct fwd_config *cfg,
-                                     unsigned walk_max, int epfd);
+static void proxy_conn_walk_continue(unsigned walk_max, int epfd);
 static bool proxy_conn_evict_one(int epfd);
 
 /* Data handling */
@@ -878,9 +877,9 @@ proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
     if (!warned_high_water && g_conn_pool.capacity > 0 &&
         conn_tbl_len >= (unsigned)((g_conn_pool.capacity * 9) / 10)) {
         P_LOG_WARN(
-            "UDP conn table high-water: %u/%d (~%d%%). Consider raising -C or "
+            "UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or "
             "reducing -t.",
-            conn_tbl_len, g_conn_pool.capacity,
+            conn_tbl_len, (unsigned)g_conn_pool.capacity,
             (int)((conn_tbl_len * 100) / (unsigned)g_conn_pool.capacity));
         warned_high_water = true;
     }
@@ -1528,6 +1527,7 @@ int main(int argc, char *argv[]) {
     int listen_sock = -1, epfd = -1, i;
     time_t last_check = 0;
     struct epoll_event ev, events[MAX_EVENTS];
+    uint32_t magic_listener = EV_MAGIC_LISTENER;
 
 #ifdef __linux__
     struct mmsghdr *c_msgs = NULL, *s_msgs = NULL;
