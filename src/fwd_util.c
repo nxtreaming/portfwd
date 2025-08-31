@@ -18,8 +18,6 @@
 // Global signal-safe flag for graceful shutdown
 volatile sig_atomic_t g_shutdown_requested = 0;
 
-// Forward declaration
-static int resolve_address(union sockaddr_inx *addr, const char *host, const char *port_str);
 
 /* Signal-safe shutdown handler */
 static void handle_shutdown_signal(int sig) {
