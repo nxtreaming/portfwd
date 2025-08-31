@@ -98,5 +98,6 @@ void drop_privileges(const char *username);
  */
 void init_fwd_config(struct fwd_config *cfg);
 int parse_common_args(int argc, char **argv, struct fwd_config *cfg);
+int get_sockaddr_inx(const char *str, union sockaddr_inx *addr, bool is_source);
 
 #endif // FWD_UTIL_H

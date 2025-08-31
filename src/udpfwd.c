@@ -1527,7 +1527,7 @@ int main(int argc, char *argv[]) {
     int listen_sock = -1, epfd = -1, i;
     time_t last_check = 0;
     struct epoll_event ev, events[MAX_EVENTS];
-    uint32_t magic_listener = EV_MAGIC_LISTENER;
+    uintptr_t magic_listener = EV_MAGIC_LISTENER;
 
 #ifdef __linux__
     struct mmsghdr *c_msgs = NULL, *s_msgs = NULL;
