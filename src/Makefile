@@ -46,7 +46,7 @@ $(BUILD_DIR)/udpfwd-ultra.o: udpfwd.c
 
 # KCP-based TCP-over-UDP binaries with AEAD support
 KCPOBJS = $(BUILD_DIR)/kcp_common.o $(BUILD_DIR)/3rd/kcp/ikcp.o
-AEADOBJS = $(BUILD_DIR)/anti_replay.o $(BUILD_DIR)/aead_protocol.o $(BUILD_DIR)/aead.o $(BUILD_DIR)/secure_random.o $(BUILD_DIR)/3rd/chacha20poly1305/chacha20poly1305.o
+AEADOBJS = $(BUILD_DIR)/anti_replay.o $(BUILD_DIR)/aead_protocol.o $(BUILD_DIR)/aead.o $(BUILD_DIR)/secure_random.o $(BUILD_DIR)/outer_obfs.o $(BUILD_DIR)/3rd/chacha20poly1305/chacha20poly1305.o
 KCPTCPOBJS = $(BUILD_DIR)/kcptcp_common.o
 
 kcptcp-client: $(BUILD_DIR)/kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O)

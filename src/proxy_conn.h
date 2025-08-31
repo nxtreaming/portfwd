@@ -77,6 +77,9 @@ struct proxy_conn {
     bool use_kcp;                   /* Marks connection as using KCP path */
     bool kcp_tx_pending;            /* Pending KCP flush due to EAGAIN/backpressure */
     struct buffer_info udp_backlog; /* Pending UDP datagram to retry sendto() */
+    /* Configured PSK (for outer obfuscation) */
+    bool cfg_has_psk;
+    uint8_t cfg_psk[32];
     /* Handshake */
     unsigned char hs_token[16]; /* 128-bit token echoed by server in ACCEPT */
     bool kcp_ready;             /* becomes true after ACCEPT and ikcp_create */

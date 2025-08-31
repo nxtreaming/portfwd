@@ -20,6 +20,7 @@
 #include "common.h"
 #include "proxy_conn.h"
 #include "kcptcp_common.h"
+#include "outer_obfs.h"
 #include "kcp_common.h"
 #include "aead_protocol.h"
 #include "anti_replay.h"
@@ -45,6 +46,9 @@
 
 #define LOG_CONN_WARN(conn, fmt, ...)                                                              \
     P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
+#define LOG_CONN_DEBUG(conn, fmt, ...)                                                             \
+    P_LOG_DEBUG("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
 /* Rate limiting structure */
 struct rate_limiter {
@@ -102,8 +106,6 @@ static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn,
                               const char *operation);
 static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf,
                               size_t ubuf_size, bool *fed_kcp);
-static int handle_stealth_handshake_response(struct client_ctx *ctx, struct proxy_conn *c,
-                                             const char *buf, size_t len);
 static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen);
 static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss);
 
@@ -429,11 +431,8 @@ static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_stora
 /* Handle stealth handshake response */
 static int handle_stealth_handshake_response(struct client_ctx *ctx, struct proxy_conn *c,
                                              const char *buf, size_t len) {
-    uint32_t conv;
-    bool valid_response = false;
-
     /* Only support PSK stealth handshake */
-    if (!ctx->cfg->has_psk || !ctx->cfg->psk) {
+    if (!ctx->cfg->has_psk) {
         LOG_CONN_ERR(c, "PSK is required for stealth handshake");
         return -1; /* Error: close connection */
     }
@@ -442,46 +441,38 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
     struct stealth_handshake_response response;
     if (stealth_handshake_parse_response(ctx->cfg->psk, (const uint8_t *)buf, len, &response) !=
         0) {
-        LOG_CONN_WARN(c, "Failed to parse stealth handshake response; ignore");
+        LOG_CONN_DEBUG(c, "Failed to parse stealth handshake response; ignore");
         return 1; /* Continue processing other packets */
     }
-
-    conv = ntohl(response.conv);
 
     /* Validate token */
     if (memcmp(response.token, c->hs_token, 16) != 0) {
-        LOG_CONN_WARN(c, "Stealth response token mismatch; ignore");
+        LOG_CONN_DEBUG(c, "Stealth response token mismatch; ignore");
         return 1; /* Continue processing other packets */
     }
 
-    valid_response = true;
-
-    if (!valid_response) {
-        return 1; /* Continue processing other packets */
-    }
-
-    c->conv = conv;
+    c->conv = ntohl(response.conv);
     /* Derive session key if PSK provided */
-    if (ctx->cfg->has_psk) {
-        if (derive_session_key_from_psk((const uint8_t *)ctx->cfg->psk, c->hs_token, c->conv,
-                                        c->session_key) == 0) {
-            c->has_session_key = true;
-            /* Initialize nonce base and counters */
-            memcpy(c->nonce_base, c->session_key, 12);
-            c->send_seq = 0;
-            /* Initialize anti-replay detector */
-            anti_replay_init(&c->replay_detector);
-            c->recv_seq = 0;
-            c->recv_win = UINT32_MAX; /* uninitialized */
-            c->recv_win_mask = 0ULL;
-            c->epoch = 0;
-            c->rekey_in_progress = false;
-        } else {
-            P_LOG_ERR("session key derivation failed");
-            return -1; /* Error: close connection */
-        }
+    if (derive_session_key_from_psk((const uint8_t *)ctx->cfg->psk, c->hs_token, c->conv,
+                                    c->session_key) != 0) {
+        P_LOG_ERR("session key derivation failed");
+        return -1; /* Error: close connection */
     }
+    c->has_session_key = true;
+    /* Initialize nonce base and counters */
+    memcpy(c->nonce_base, c->session_key, 12);
+    c->send_seq = 0;
+    /* Initialize anti-replay detector */
+    anti_replay_init(&c->replay_detector);
+    c->recv_seq = 0;
+    c->recv_win = UINT32_MAX; /* uninitialized */
+    c->recv_win_mask = 0ULL;
+    c->epoch = 0;
+    c->rekey_in_progress = false;
 
+    /* pass PSK to proxy_conn for outer obfs */
+    c->cfg_has_psk = ctx->cfg->has_psk;
+    if (c->cfg_has_psk) memcpy(c->cfg_psk, ctx->cfg->psk, 32);
     if (kcp_setup_conn(c, c->udp_sock, &c->peer_addr, c->conv, ctx->kopts) != 0) {
         P_LOG_ERR("kcp_setup_conn failed after ACCEPT");
         return -1; /* Error: close connection */
@@ -489,7 +480,7 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
 
     c->kcp_ready = true;
     c->next_ka_ms = kcp_now_ms() + DEFAULT_KEEPALIVE_INTERVAL_MS;
-    P_LOG_INFO("handshake ACCEPT: conv=%u", c->conv);
+    P_LOG_INFO("stealth handshake established: conv=%u", c->conv);
 
     /* Update performance counters */
     g_perf.handshake_successes++;
@@ -497,6 +488,10 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
 
     /* Flush any buffered request data */
     if (c->request.dlen > c->request.rpos) {
+        if (!c->has_session_key) {
+            LOG_CONN_ERR(c, "Missing session key before flushing buffered data");
+            return -1; /* Safety guard: should never happen */
+        }
         size_t remain = c->request.dlen - c->request.rpos;
         if (aead_protocol_send_data(c, c->request.data + c->request.rpos, (int)remain,
                                     ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
@@ -507,12 +502,16 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
 
     /* If TCP already EOF, send FIN now */
     if (c->cli_in_eof) {
+        if (!c->has_session_key) {
+            LOG_CONN_ERR(c, "Missing session key before sending FIN");
+            return -1; /* Safety guard */
+        }
         if (aead_protocol_send_fin(c, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
             return -1; /* Error: close connection */
         }
     }
 
-    return 1; /* Continue processing other packets */
+    return 0; /* signal: handled handshake */
 }
 
 /* Handle KCP data forwarding to TCP */
@@ -604,26 +603,33 @@ static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char
             continue; /* Drop packet and continue */
         }
 
+        /* Outer unwrap: all incoming UDP packets are obfuscated with PSK */
+        uint8_t inner[2048];
+        size_t ilen = sizeof(inner);
+        if (outer_unwrap(ctx->cfg->psk, (const uint8_t *)ubuf, (size_t)rn, inner, &ilen) != 0) {
+            /* Drop silently: could be noise/spoof */
+            continue;
+        }
+
         /* Stealth handshake response path */
-        if (!c->kcp_ready && rn >= 28) { /* Minimum size for encrypted packet */
-            int result = handle_stealth_handshake_response(ctx, c, ubuf, (size_t)rn);
+        if (!c->kcp_ready) {
+            int result = handle_stealth_handshake_response(ctx, c, (const char *)inner, ilen);
             if (result < 0) {
                 return -1; /* Error: close connection */
             } else if (result == 0) {
                 /* Successfully processed stealth handshake response */
                 continue;
             }
-            /* If result == 1, it's not a handshake response, continue to KCP
-             * processing */
+            /* If result == 1, it's not a handshake response; fall through to KCP */
         }
 
         if (!c->kcp_ready) {
-            /* Not ready and not ACCEPT: ignore */
+            /* Not ready and not a valid handshake response: ignore */
             continue;
         }
 
         if (c->kcp) {
-            (void)ikcp_input(c->kcp, ubuf, (long)rn);
+            (void)ikcp_input(c->kcp, (const char *)inner, (long)ilen);
             *fed_kcp = true;
         }
     }
@@ -1251,9 +1257,39 @@ int main(int argc, char **argv) {
                                     : NULL;
                     if (generate_stealth_handshake(pos, cctx.cfg->psk, cctx.cfg->has_psk, idata,
                                                    embed, hbuf, &hlen) == 0) {
-                        ssize_t sent =
-                            sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT, &pos->peer_addr.sa,
-                                   (socklen_t)sizeof_sockaddr(&pos->peer_addr));
+                        /* Outer obfuscation for handshake packet too */
+                        {
+                            uint8_t obuf[1600];
+                            size_t olen = sizeof(obuf);
+                            const uint8_t *key = cctx.cfg->psk; /* PSK for outer layer */
+                            if (outer_wrap(key, hbuf, hlen, obuf, &olen, 31) == 0) {
+                                ssize_t sent = sendto(pos->udp_sock, obuf, olen, MSG_DONTWAIT,
+                                                       &pos->peer_addr.sa,
+                                                       (socklen_t)sizeof_sockaddr(&pos->peer_addr));
+                                if (sent >= 0) {
+                                    g_perf.handshake_attempts++;
+                                    P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", olen);
+                                    pos->hs_scheduled = false;
+                                    pos->request.rpos += embed;
+                                } else {
+                                    P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
+                                    pos->hs_send_at_ms = now + 5;
+                                }
+                            } else {
+                                ssize_t sent =
+                                    sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT, &pos->peer_addr.sa,
+                                           (socklen_t)sizeof_sockaddr(&pos->peer_addr));
+                                if (sent >= 0) {
+                                    g_perf.handshake_attempts++;
+                                    P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hlen);
+                                    pos->hs_scheduled = false;
+                                    pos->request.rpos += embed;
+                                } else {
+                                    P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
+                                    pos->hs_send_at_ms = now + 5;
+                                }
+                            }
+                        }
                         if (sent >= 0) {
                             g_perf.handshake_attempts++;
                             P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hlen);

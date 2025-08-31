@@ -609,10 +609,10 @@ int main(int argc, char **argv) {
             if (tag == &magic_listener) {
                 /* UDP packet(s) */
                 for (;;) {
-                    char buf[UDP_RECV_BUFFER_SIZE];
+                    char obuf[UDP_RECV_BUFFER_SIZE];
                     struct sockaddr_storage rss;
                     socklen_t ralen = sizeof(rss);
-                    ssize_t rn = recvfrom(usock, buf, sizeof(buf), MSG_DONTWAIT,
+                    ssize_t rn = recvfrom(usock, obuf, sizeof(obuf), MSG_DONTWAIT,
                                           (struct sockaddr *)&rss, &ralen);
                     if (rn < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK)
@@ -633,11 +633,23 @@ int main(int argc, char **argv) {
                         P_LOG_WARN("drop UDP from unknown family=%d", (int)rss.ss_family);
                         continue;
                     }
+
+                    /* Outer unwrap first: all incoming UDP packets are obfuscated with PSK */
+                    if (!cfg.has_psk) {
+                        continue;
+                    }
+                    uint8_t inner[2048];
+                    size_t ilen = sizeof(inner);
+                    if (outer_unwrap(cfg.psk, (const uint8_t *)obuf, (size_t)rn, inner, &ilen) != 0) {
+                        /* Not our traffic; drop */
+                        continue;
+                    }
+
                     /* Try stealth handshake first: attempt to decrypt any
                      * packet from unknown source */
-                    if (rn >= 28) { /* Minimum size for encrypted packet */
+                    if (ilen >= 28) {
                         /* Only support PSK stealth handshake */
-                        if (!cfg.has_psk || !cfg.psk) {
+                        if (!cfg.has_psk) {
                             P_LOG_WARN("PSK is required for stealth handshake, "
                                        "dropping packet from %s",
                                        sockaddr_to_string(&ra));
@@ -650,7 +662,7 @@ int main(int argc, char **argv) {
                         size_t extracted_data_len = sizeof(extracted_data);
 
                         if (stealth_handshake_parse_first_packet(
-                                cfg.psk, (const uint8_t *)buf, (size_t)rn, &payload, extracted_data,
+                                cfg.psk, (const uint8_t *)inner, (size_t)ilen, &payload, extracted_data,
                                 &extracted_data_len) == 0) {
                             /* Successfully parsed stealth handshake! */
 
@@ -747,6 +759,9 @@ int main(int argc, char **argv) {
                                 }
                             }
 
+                            /* pass PSK to proxy_conn for outer obfs */
+                            nc->cfg_has_psk = cfg.has_psk;
+                            if (nc->cfg_has_psk) memcpy(nc->cfg_psk, cfg.psk, 32);
                             if (kcp_setup_conn(nc, usock, &ra, nc->conv, &kopts) != 0) {
                                 P_LOG_ERR("kcp_setup_conn failed");
                                 close(ts);
@@ -792,9 +807,20 @@ int main(int argc, char **argv) {
                             uint32_t jitter =
                                 rand_between(cfg.hs_rsp_jitter_min_ms, cfg.hs_rsp_jitter_max_ms);
                             if (jitter == 0) {
-                                (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
-                                             &nc->peer_addr.sa,
-                                             (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                /* Outer obfuscation to unify wire shape */
+                                {
+                                    uint8_t obuf[1500];
+                                    size_t olen = sizeof(obuf);
+                                    if (outer_wrap(cfg.psk, response_buf, response_len, obuf, &olen, 31) == 0) {
+                                        (void)sendto(usock, obuf, olen, MSG_DONTWAIT,
+                                                     &nc->peer_addr.sa,
+                                                     (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                    } else {
+                                        (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
+                                                     &nc->peer_addr.sa,
+                                                     (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                    }
+                                }
                                 P_LOG_INFO("sent stealth handshake response "
                                            "conv=%u for %s (%zu bytes)",
                                            nc->conv, sockaddr_to_string(&ra), response_len);
@@ -810,9 +836,19 @@ int main(int argc, char **argv) {
                                 } else {
                                     P_LOG_WARN("handshake response too large to "
                                                "buffer; sending immediately");
-                                    (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
-                                                 &nc->peer_addr.sa,
-                                                 (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                    {
+                                        uint8_t obuf[1500];
+                                        size_t olen = sizeof(obuf);
+                                        if (outer_wrap(cfg.psk, response_buf, response_len, obuf, &olen, 31) == 0) {
+                                            (void)sendto(usock, obuf, olen, MSG_DONTWAIT,
+                                                         &nc->peer_addr.sa,
+                                                         (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                        } else {
+                                            (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
+                                                         &nc->peer_addr.sa,
+                                                         (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                        }
+                                    }
                                 }
                             }
 
@@ -851,11 +887,11 @@ int main(int argc, char **argv) {
                     }
 
                     /* Otherwise expect KCP packet for existing conv */
-                    if (rn < 24) {
-                        P_LOG_WARN("drop non-handshake short UDP pkt len=%zd", rn);
+                    if (ilen < 24) {
+                        P_LOG_WARN("drop non-handshake short UDP pkt len=%zd", (ssize_t)ilen);
                         continue;
                     }
-                    uint32_t conv = ikcp_getconv(buf);
+                    uint32_t conv = ikcp_getconv((const char *)inner);
                     struct proxy_conn *c = kcp_map_safe_get(&cmap, conv);
                     if (!c) {
                         P_LOG_WARN("drop UDP for unknown conv=%u from %s", conv,
@@ -1065,8 +1101,17 @@ int main(int argc, char **argv) {
             /* Send delayed handshake responses if due */
             if (conn->hs_resp_pending) {
                 if ((int32_t)(now - conn->hs_resp_send_at_ms) >= 0) {
-                    (void)sendto(usock, conn->hs_resp_buf, conn->hs_resp_len, MSG_DONTWAIT,
-                                 &conn->peer_addr.sa, (socklen_t)sizeof_sockaddr(&conn->peer_addr));
+                    {
+                        uint8_t obuf[1500];
+                        size_t olen = sizeof(obuf);
+                        if (outer_wrap(cfg.psk, (const uint8_t *)conn->hs_resp_buf, conn->hs_resp_len, obuf, &olen, 31) == 0) {
+                            (void)sendto(usock, obuf, olen, MSG_DONTWAIT,
+                                         &conn->peer_addr.sa, (socklen_t)sizeof_sockaddr(&conn->peer_addr));
+                        } else {
+                            (void)sendto(usock, conn->hs_resp_buf, conn->hs_resp_len, MSG_DONTWAIT,
+                                         &conn->peer_addr.sa, (socklen_t)sizeof_sockaddr(&conn->peer_addr));
+                        }
+                    }
                     conn->hs_resp_pending = false;
                     P_LOG_INFO("sent delayed handshake response conv=%u (%zu bytes)", conn->conv,
                                conn->hs_resp_len);
