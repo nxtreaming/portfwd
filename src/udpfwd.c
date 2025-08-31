@@ -1452,15 +1452,8 @@ int main(int argc, char *argv[]) {
     g_cfg.proxy_conn_timeo = DEFAULT_CONN_TIMEOUT_SEC;
     g_cfg.conn_tbl_hash_size = DEFAULT_HASH_TABLE_SIZE;
 
-    int new_optind = parse_common_args(argc, argv, &g_cfg);
-    if (new_optind < 0) {
-        show_help(argv[0]);
-        return 1;
-    }
-    optind = new_optind;
-
     int opt;
-    while ((opt = getopt(argc, argv, "hdvRPp:t:S:C:B:H:")) != -1) {
+    while ((opt = getopt(argc, argv, "hdvRr6p:i:t:S:C:B:H:")) != -1) {
         switch (opt) {
         case 't': {
             char *end = NULL;
@@ -1477,12 +1470,35 @@ int main(int argc, char *argv[]) {
             }
             break;
         }
+        case 'd':
+            g_cfg.daemonize = true;
+            break;
+        case 'v':
+            /* verbose, placeholder */
+            break;
+        case 'R':
+            g_cfg.reuse_port = true;
+            break;
+        case 'r':
+            g_cfg.reuse_addr = true;
+            break;
+        case '6':
+            g_cfg.v6only = true;
+            break;
         case 'p':
             g_cfg.pidfile = optarg;
             break;
-        case 'i':
-            /* Placeholder for -i, handled in parse_common_args */
+        case 'i': {
+            char *end = NULL;
+            unsigned long v = strtoul(optarg, &end, 10);
+            if (end == optarg || *end != '\0' || v == 0) {
+                P_LOG_WARN("invalid -i value '%s', keeping default %u", optarg,
+                           g_cfg.max_conns_per_ip);
+            } else {
+                g_cfg.max_conns_per_ip = (unsigned)v;
+            }
             break;
+        }
         case 'S': {
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
