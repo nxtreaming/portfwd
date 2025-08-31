@@ -258,7 +258,12 @@ int kcptcp_parse_common_opts(int argc, char **argv, struct kcptcp_common_cli *ou
         case 'b': { long v = strtol(optarg, NULL, 10); if (v < 0) return 0; out->sockbuf_bytes = (int)v; break; }
         case 'N': out->tcp_nodelay = true; break;
         case 'K': {
-            if (!parse_psk_hex32(optarg, out->psk)) return 0; out->has_psk = true; break; }
+            if (!parse_psk_hex32(optarg, out->psk)) {
+                return 0;
+            }
+            out->has_psk = true;
+            break;
+        }
         case 'M': { long v = strtol(optarg, NULL, 10); if (v <= 0) return 0; out->kcp_mtu = (int)v; break; }
         case 'n': { long v = strtol(optarg, NULL, 10); if (v < 0) return 0; out->kcp_nd = (int)v; break; }
         case 'I': { long v = strtol(optarg, NULL, 10); if (v < 0) return 0; out->kcp_it = (int)v; break; }
@@ -271,14 +276,26 @@ int kcptcp_parse_common_opts(int argc, char **argv, struct kcptcp_common_cli *ou
             long vmin = 0, vmax = 0;
             if (sep) { *sep = '\0'; vmin = strtol(optarg, NULL, 10); vmax = strtol(sep+1, NULL, 10); *sep = '-'; }
             else { vmax = strtol(optarg, NULL, 10); vmin = 0; }
-            if (vmin < 0 || vmax < 0) return 0; out->hs_agg_min_ms = (uint32_t)vmin; out->hs_agg_max_ms = (uint32_t)vmax; break; }
+            if (vmin < 0 || vmax < 0) {
+                return 0;
+            }
+            out->hs_agg_min_ms = (uint32_t)vmin;
+            out->hs_agg_max_ms = (uint32_t)vmax;
+            break;
+        }
         case 'G': { long v = strtol(optarg, NULL, 10); if (v < 0) return 0; if (v > 4096) v = 4096; out->hs_agg_max_bytes = (uint32_t)v; break; }
         case 'j': {
             char *sep = strchr(optarg, '-'); if (!sep) sep = strchr(optarg, ':');
             long vmin = 0, vmax = 0;
             if (sep) { *sep = '\0'; vmin = strtol(optarg, NULL, 10); vmax = strtol(sep+1, NULL, 10); *sep = '-'; }
             else { vmax = strtol(optarg, NULL, 10); vmin = 0; }
-            if (vmin < 0 || vmax < 0) return 0; out->hs_rsp_jitter_min_ms = (uint32_t)vmin; out->hs_rsp_jitter_max_ms = (uint32_t)vmax; break; }
+            if (vmin < 0 || vmax < 0) {
+                return 0;
+            }
+            out->hs_rsp_jitter_min_ms = (uint32_t)vmin;
+            out->hs_rsp_jitter_max_ms = (uint32_t)vmax;
+            break;
+        }
         case 'P': out->hs_profile = optarg; break;
         case 'h': out->show_help = true; break;
         default: return 0;
