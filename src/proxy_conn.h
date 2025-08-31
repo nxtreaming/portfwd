@@ -76,6 +76,14 @@ struct proxy_conn {
     /* Handshake */
     unsigned char hs_token[16]; /* 128-bit token echoed by server in ACCEPT */
     bool kcp_ready;             /* becomes true after ACCEPT and ikcp_create */
+    /* Delayed handshake scheduling (client) */
+    bool hs_scheduled;
+    uint32_t hs_send_at_ms;
+    /* Delayed handshake response (server) */
+    bool hs_resp_pending;
+    uint32_t hs_resp_send_at_ms;
+    size_t hs_resp_len;
+    unsigned char hs_resp_buf[1536];
 
     /* Epoll tagging (client side): distinguish TCP vs UDP events */
     struct ep_tag *cli_tag; /* tag for client TCP fd */

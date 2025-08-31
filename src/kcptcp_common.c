@@ -107,6 +107,17 @@ bool get_stats_enabled(void) {
     return !(s[0] == '0');
 }
 
+uint32_t rand_between(uint32_t min, uint32_t max) {
+    if (max <= min) return min;
+    uint32_t r = 0;
+    if (secure_random_bytes((unsigned char *)&r, sizeof(r)) != 0) {
+        /* Fallback to time-based entropy if secure randomness fails */
+        r = (uint32_t)time(NULL);
+    }
+    uint32_t span = max - min + 1u;
+    return min + (r % span);
+}
+
 void set_sock_buffers_sz(int sockfd, int bytes) {
     if (bytes <= 0)
         return;
@@ -310,6 +321,12 @@ int kcptcp_parse_common_opts(int argc, char **argv,
     out->kcp_snd = -1;
     out->kcp_rcv = -1;
     out->show_help = false;
+    /* Defaults for stealth handshake tuning */
+    out->hs_agg_min_ms = 20;
+    out->hs_agg_max_ms = 80;
+    out->hs_agg_max_bytes = 1024;
+    out->hs_rsp_jitter_min_ms = 5;
+    out->hs_rsp_jitter_max_ms = 20;
 
     /* reset getopt state */
     optind = 1;
@@ -333,7 +350,7 @@ int kcptcp_parse_common_opts(int argc, char **argv,
        -W <rcvwnd>
        -h (help)
     */
-    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:h")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:g:G:j:h")) != -1) {
         switch (opt) {
         case 'd':
             out->daemonize = true;
@@ -413,6 +430,49 @@ int kcptcp_parse_common_opts(int argc, char **argv,
             if (v < 0)
                 return 0;
             out->kcp_rcv = (int)v;
+            break;
+        }
+        case 'g': { /* client: handshake aggregation window min-max in ms */
+            char *sep = strchr(optarg, '-');
+            if (!sep) sep = strchr(optarg, ':');
+            long vmin = 0, vmax = 0;
+            if (sep) {
+                *sep = '\0';
+                vmin = strtol(optarg, NULL, 10);
+                vmax = strtol(sep + 1, NULL, 10);
+                *sep = '-';
+            } else {
+                vmax = strtol(optarg, NULL, 10);
+                vmin = 0;
+            }
+            if (vmin < 0 || vmax < 0) return 0;
+            out->hs_agg_min_ms = (uint32_t)vmin;
+            out->hs_agg_max_ms = (uint32_t)vmax;
+            break;
+        }
+        case 'G': { /* client: handshake aggregation max embed bytes */
+            long v = strtol(optarg, NULL, 10);
+            if (v < 0) return 0;
+            if (v > 4096) v = 4096; /* clamp */
+            out->hs_agg_max_bytes = (uint32_t)v;
+            break;
+        }
+        case 'j': { /* server: handshake response jitter window min-max in ms */
+            char *sep = strchr(optarg, '-');
+            if (!sep) sep = strchr(optarg, ':');
+            long vmin = 0, vmax = 0;
+            if (sep) {
+                *sep = '\0';
+                vmin = strtol(optarg, NULL, 10);
+                vmax = strtol(sep + 1, NULL, 10);
+                *sep = '-';
+            } else {
+                vmax = strtol(optarg, NULL, 10);
+                vmin = 0;
+            }
+            if (vmin < 0 || vmax < 0) return 0;
+            out->hs_rsp_jitter_min_ms = (uint32_t)vmin;
+            out->hs_rsp_jitter_max_ms = (uint32_t)vmax;
             break;
         }
         case 'h':

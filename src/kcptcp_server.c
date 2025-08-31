@@ -520,6 +520,7 @@ static void print_usage(const char *prog) {
     P_LOG_INFO(
         "  -N                 enable TCP_NODELAY on outbound TCP to target");
     P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) [REQUIRED]");
+    P_LOG_INFO("  -j <min-max>       jitter response to first packet by min-max ms (stealth)");
     P_LOG_INFO("  -h                 show help");
     P_LOG_INFO(" ");
     P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
@@ -537,6 +538,8 @@ struct cfg_server {
     bool tcp_nodelay;
     bool has_psk;
     uint8_t psk[32];
+    uint32_t rsp_jitter_min_ms;
+    uint32_t rsp_jitter_max_ms;
 };
 
 int main(int argc, char **argv) {
@@ -589,6 +592,8 @@ int main(int argc, char **argv) {
     cfg.has_psk = opts.has_psk;
     if (opts.has_psk)
         memcpy(cfg.psk, opts.psk, 32);
+    cfg.rsp_jitter_min_ms = opts.hs_rsp_jitter_min_ms;
+    cfg.rsp_jitter_max_ms = opts.hs_rsp_jitter_max_ms;
 
     kcp_mtu = opts.kcp_mtu;
     kcp_nd = opts.kcp_nd;
@@ -850,12 +855,30 @@ int main(int argc, char **argv) {
                                 continue;
                             }
 
-                            (void)sendto(
-                                usock, response_buf, response_len, MSG_DONTWAIT,
-                                &nc->peer_addr.sa,
-                                (socklen_t)sizeof_sockaddr(&nc->peer_addr));
-                            P_LOG_INFO("sent stealth handshake response conv=%u for %s (%zu bytes)",
-                                       nc->conv, sockaddr_to_string(&ra), response_len);
+                            /* Apply small response jitter to look like normal traffic */
+                            uint32_t jitter = rand_between(cfg.rsp_jitter_min_ms, cfg.rsp_jitter_max_ms);
+                            if (jitter == 0) {
+                                (void)sendto(
+                                    usock, response_buf, response_len, MSG_DONTWAIT,
+                                    &nc->peer_addr.sa,
+                                    (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                P_LOG_INFO("sent stealth handshake response conv=%u for %s (%zu bytes)",
+                                           nc->conv, sockaddr_to_string(&ra), response_len);
+                            } else {
+                                if (response_len <= sizeof(nc->hs_resp_buf)) {
+                                    memcpy(nc->hs_resp_buf, response_buf, response_len);
+                                    nc->hs_resp_len = response_len;
+                                    nc->hs_resp_send_at_ms = kcp_now_ms() + jitter;
+                                    nc->hs_resp_pending = true;
+                                    P_LOG_DEBUG("queued handshake response conv=%u with %u ms jitter", nc->conv, jitter);
+                                } else {
+                                    P_LOG_WARN("handshake response too large to buffer; sending immediately");
+                                    (void)sendto(
+                                        usock, response_buf, response_len, MSG_DONTWAIT,
+                                        &nc->peer_addr.sa,
+                                        (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                }
+                            }
 
                             /* Forward any extracted initial payload to target TCP */
                             if (extracted_data_len > 0) {
@@ -1211,6 +1234,17 @@ int main(int argc, char **argv) {
 
         struct proxy_conn *conn, *tmp;
         list_for_each_entry_safe(conn, tmp, &conns, list) {
+            /* Send delayed handshake responses if due */
+            if (conn->hs_resp_pending) {
+                if ((int32_t)(now - conn->hs_resp_send_at_ms) >= 0) {
+                    (void)sendto(usock, conn->hs_resp_buf, conn->hs_resp_len, MSG_DONTWAIT,
+                                 &conn->peer_addr.sa,
+                                 (socklen_t)sizeof_sockaddr(&conn->peer_addr));
+                    conn->hs_resp_pending = false;
+                    P_LOG_INFO("sent delayed handshake response conv=%u (%zu bytes)",
+                               conn->conv, conn->hs_resp_len);
+                }
+            }
             (void)kcp_update_flush(conn, now);
             /* If server TCP got EOF, wait until all buffered client->server
              * data is flushed before closing */

@@ -99,6 +99,9 @@ struct cfg_client {
     bool tcp_nodelay;
     bool has_psk;
     uint8_t psk[32];
+    uint32_t agg_min_ms;
+    uint32_t agg_max_ms;
+    uint32_t agg_max_bytes;
 };
 
 struct client_ctx {
@@ -841,49 +844,34 @@ static void client_handle_accept(struct client_ctx *ctx) {
             free(c);
             continue;
         }
-        /* Send stealth handshake packet (looks like encrypted data) */
-        unsigned char hbuf[1024]; /* Larger buffer for stealth packet */
-        size_t hbuf_len = sizeof(hbuf);
-
-        /* Try to opportunistically embed initial TCP data to remove handshake signature */
-        unsigned char init_buf[1024];
-        size_t init_len = 0;
-        for (;;) {
-            ssize_t rn = recv(cs, (char *)init_buf + init_len, sizeof(init_buf) - init_len, MSG_DONTWAIT);
-            if (rn > 0) {
-                init_len += (size_t)rn;
-                c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX from client */
-                if (init_len >= sizeof(init_buf)) {
+        /* Pre-drain any immediately available TCP bytes into buffer */
+        {
+            char tbuf[1024];
+            for (;;) {
+                ssize_t rn = recv(cs, tbuf, sizeof(tbuf), MSG_DONTWAIT);
+                if (rn > 0) {
+                    c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
+                    size_t need = c->request.dlen + (size_t)rn;
+                    if (buffer_ensure_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
+                        P_LOG_WARN("Request buffer size limit exceeded, closing connection");
+                        close(cs);
+                        close(us);
+                        free(c);
+                        continue;
+                    }
+                    memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
+                    c->request.dlen += (size_t)rn;
+                    if (c->request.dlen >= ctx->cfg->agg_max_bytes) break;
+                } else {
                     break;
                 }
-                /* loop to drain immediately available bytes */
-                continue;
             }
-            break; /* EAGAIN/WOULDBLOCK or error/EOF -> stop */
         }
 
-        const uint8_t *init_ptr = (init_len > 0) ? init_buf : NULL;
-        size_t init_ptr_len = (init_len > 0) ? init_len : 0;
-
-        if (generate_stealth_handshake(c, ctx->cfg->psk, ctx->cfg->has_psk, init_ptr, init_ptr_len, hbuf, &hbuf_len) != 0) {
-            P_LOG_ERR("Failed to generate stealth handshake packet");
-            g_perf.handshake_failures++;
-            close(cs);
-            close(us);
-            free(c);
-            continue;
-        }
-
-        g_perf.handshake_attempts++;
-
-        ssize_t sent = sendto(c->udp_sock, hbuf, hbuf_len, MSG_DONTWAIT,
-                              &c->peer_addr.sa,
-                              (socklen_t)sizeof_sockaddr(&c->peer_addr));
-        if (sent < 0) {
-            P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
-        } else {
-            P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hbuf_len);
-        }
+        /* Schedule stealth handshake send with small randomized aggregation window */
+        uint32_t jitter = rand_between(ctx->cfg->agg_min_ms, ctx->cfg->agg_max_ms);
+        c->hs_scheduled = true;
+        c->hs_send_at_ms = kcp_now_ms() + jitter;
 
         /* Prepare epoll tags */
         struct ep_tag *ctag = (struct ep_tag *)malloc(sizeof(*ctag));
@@ -1048,6 +1036,8 @@ static void print_usage(const char *prog) {
         "  -W <rcvwnd>        KCP recv window in packets (default 1024)");
     P_LOG_INFO("  -N                 enable TCP_NODELAY on client sockets");
     P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) [REQUIRED]");
+    P_LOG_INFO("  -g <min-max>       aggregate first TCP bytes for min-max ms before sending first UDP packet");
+    P_LOG_INFO("  -G <bytes>         max bytes to embed into first UDP packet (default 1024)");
     P_LOG_INFO("  -h                 show help");
     P_LOG_INFO(" ");
     P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
@@ -1090,6 +1080,9 @@ int main(int argc, char **argv) {
     cfg.has_psk = opts.has_psk;
     if (opts.has_psk)
         memcpy(cfg.psk, opts.psk, 32);
+    cfg.agg_min_ms = opts.hs_agg_min_ms;
+    cfg.agg_max_ms = opts.hs_agg_max_ms;
+    cfg.agg_max_bytes = opts.hs_agg_max_bytes;
 
     kcp_mtu = opts.kcp_mtu;
     kcp_nd = opts.kcp_nd;
@@ -1222,6 +1215,42 @@ int main(int argc, char **argv) {
         uint32_t now = kcp_now_ms();
         struct proxy_conn *pos, *tmp;
         list_for_each_entry_safe(pos, tmp, &conns, list) {
+            /* Send scheduled stealth handshake if due */
+            if (!pos->kcp_ready && pos->hs_scheduled) {
+                if ((int32_t)(now - pos->hs_send_at_ms) >= 0) {
+                    unsigned char hbuf[1500];
+                    size_t hlen = sizeof(hbuf);
+                    size_t avail = (pos->request.dlen > pos->request.rpos)
+                                       ? (pos->request.dlen - pos->request.rpos)
+                                       : 0;
+                    size_t embed = avail;
+                    if (embed > ctx->cfg->agg_max_bytes)
+                        embed = ctx->cfg->agg_max_bytes;
+                    const uint8_t *idata = (embed > 0)
+                                               ? (const uint8_t *)(pos->request.data + pos->request.rpos)
+                                               : NULL;
+                    if (generate_stealth_handshake(pos, ctx->cfg->psk, ctx->cfg->has_psk,
+                                                   idata, embed, hbuf, &hlen) == 0) {
+                        ssize_t sent = sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT,
+                                              &pos->peer_addr.sa,
+                                              (socklen_t)sizeof_sockaddr(&pos->peer_addr));
+                        if (sent >= 0) {
+                            g_perf.handshake_attempts++;
+                            P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hlen);
+                            pos->hs_scheduled = false;
+                            pos->request.rpos += embed; /* mark embedded data consumed */
+                        } else {
+                            P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
+                            /* Try again shortly */
+                            pos->hs_send_at_ms = now + 5;
+                        }
+                    } else {
+                        P_LOG_ERR("Failed to generate stealth handshake packet");
+                        g_perf.handshake_failures++;
+                        pos->state = S_CLOSING;
+                    }
+                }
+            }
             if (pos->kcp)
                 (void)kcp_update_flush(pos, now);
             /* Periodic runtime stats logging (~5s, configurable) */

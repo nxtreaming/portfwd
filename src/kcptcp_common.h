@@ -118,6 +118,12 @@ struct kcptcp_common_cli {
     bool tcp_nodelay;
     bool has_psk;
     uint8_t psk[32];
+    /* Stealth handshake tuning */
+    uint32_t hs_agg_min_ms;      /* client: min wait to aggregate first TCP */
+    uint32_t hs_agg_max_ms;      /* client: max wait to aggregate first TCP */
+    uint32_t hs_agg_max_bytes;   /* client: max bytes to embed into first packet */
+    uint32_t hs_rsp_jitter_min_ms; /* server: min jitter before response */
+    uint32_t hs_rsp_jitter_max_ms; /* server: max jitter before response */
     /* KCP overrides (use -1 if not set; mtu>0) */
     int kcp_mtu;
     int kcp_nd, kcp_it, kcp_rs, kcp_nc, kcp_snd, kcp_rcv;
@@ -131,6 +137,9 @@ struct kcptcp_common_cli {
 int kcptcp_parse_common_opts(int argc, char **argv,
                              struct kcptcp_common_cli *out, int *pos_start,
                              bool is_server);
+
+/* Secure-random helper: return integer in [min, max]. If max<=min, returns min. */
+uint32_t rand_between(uint32_t min, uint32_t max);
 
 /* ---------------- Epoll helpers (shared) ---------------- */
 /* Generic register or modify */
