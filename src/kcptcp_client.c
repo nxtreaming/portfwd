@@ -67,10 +67,6 @@ static int generate_stealth_handshake(struct proxy_conn *conn,
                                       unsigned char *out_buf, size_t *out_len);
 
 /* Connection pool management functions */
-static int init_conn_pool(void);
-static void destroy_conn_pool(void);
-static struct proxy_conn *alloc_proxy_conn(void);
-static void release_proxy_conn_to_pool(struct proxy_conn *conn);
 
 /* Performance monitoring and logging functions */
 static void init_performance_monitoring(void);
@@ -353,7 +349,7 @@ static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn) {
     list_del(&conn->list);
 
     /* Return connection to pool instead of freeing */
-    release_proxy_conn_to_pool(conn);
+    conn_pool_release(&g_conn_pool, conn);
 }
 
 /* Handle epoll operation errors with proper cleanup */
@@ -418,112 +414,6 @@ static int generate_stealth_handshake(struct proxy_conn *conn,
     }
 
     return 0;
-}
-
-/* Connection pool management implementation */
-static int init_conn_pool(void) {
-    g_conn_pool.capacity = DEFAULT_CONN_POOL_SIZE;
-    g_conn_pool.connections =
-        malloc(sizeof(struct proxy_conn) * (size_t)g_conn_pool.capacity);
-    if (!g_conn_pool.connections) {
-        P_LOG_ERR("Failed to allocate connection pool");
-        return -1;
-    }
-
-    /* Initialize mutex and condition variable */
-    if (pthread_mutex_init(&g_conn_pool.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize connection pool mutex");
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        return -1;
-    }
-    if (pthread_cond_init(&g_conn_pool.available, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize connection pool condition variable");
-        pthread_mutex_destroy(&g_conn_pool.lock);
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        return -1;
-    }
-
-    /* Initialize freelist */
-    g_conn_pool.freelist = NULL;
-    for (int i = 0; i < g_conn_pool.capacity; i++) {
-        struct proxy_conn *conn = &g_conn_pool.connections[i];
-        conn->next = g_conn_pool.freelist;
-        g_conn_pool.freelist = conn;
-    }
-    g_conn_pool.used_count = 0;
-    g_conn_pool.high_water_mark = 0;
-
-    P_LOG_INFO("Connection pool initialized with %d connections",
-               g_conn_pool.capacity);
-    return 0;
-}
-
-static void destroy_conn_pool(void) {
-    if (g_conn_pool.connections) {
-        pthread_mutex_destroy(&g_conn_pool.lock);
-        pthread_cond_destroy(&g_conn_pool.available);
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-    }
-}
-
-static struct proxy_conn *alloc_proxy_conn(void) {
-    struct proxy_conn *conn;
-
-    pthread_mutex_lock(&g_conn_pool.lock);
-
-    if (!g_conn_pool.freelist) {
-        pthread_mutex_unlock(&g_conn_pool.lock);
-        P_LOG_WARN("Connection pool exhausted!");
-        g_perf.pool_misses++;
-        return NULL;
-    }
-
-    conn = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn->next;
-    g_conn_pool.used_count++;
-
-    if (g_conn_pool.used_count > g_conn_pool.high_water_mark) {
-        g_conn_pool.high_water_mark = g_conn_pool.used_count;
-    }
-
-    pthread_mutex_unlock(&g_conn_pool.lock);
-
-    /* Update performance counters */
-    g_perf.pool_hits++;
-    g_perf.total_connections++;
-    g_perf.active_connections++;
-
-    /* Initialize connection structure */
-    memset(conn, 0, sizeof(*conn));
-    conn->cli_sock = -1;
-    conn->udp_sock = -1;
-    INIT_LIST_HEAD(&conn->list);
-
-    return conn;
-}
-
-static void release_proxy_conn_to_pool(struct proxy_conn *conn) {
-    if (!conn) {
-        P_LOG_WARN("Attempted to release NULL connection");
-        return;
-    }
-
-    pthread_mutex_lock(&g_conn_pool.lock);
-
-    conn->next = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn;
-    g_conn_pool.used_count--;
-
-    pthread_cond_signal(&g_conn_pool.available);
-    pthread_mutex_unlock(&g_conn_pool.lock);
-
-    /* Update performance counters */
-    if (g_perf.active_connections > 0) {
-        g_perf.active_connections--;
-    }
 }
 
 /* Validate UDP source address matches expected peer */
@@ -818,7 +708,7 @@ static void dump_performance_stats(void) {
     if (g_conn_pool.capacity > 0) {
         double pool_utilization =
             (double)g_conn_pool.used_count / g_conn_pool.capacity * 100.0;
-        LOG_STATS_INFO("Pool: used=%d/%d (%.1f%%) high_water=%d",
+        LOG_STATS_INFO("Pool: used=%zu/%zu (%.1f%%) high_water=%zu",
                        g_conn_pool.used_count, g_conn_pool.capacity,
                        pool_utilization, g_conn_pool.high_water_mark);
     }
@@ -941,7 +831,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
         }
 
         /* Allocate connection from pool */
-        struct proxy_conn *c = alloc_proxy_conn();
+        struct proxy_conn *c = (struct proxy_conn *)conn_pool_alloc(&g_conn_pool);
         if (!c) {
             P_LOG_ERR("Connection pool exhausted");
             close(cs);
@@ -961,7 +851,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
             P_LOG_ERR("Failed to generate secure random token");
             close(cs);
             close(us);
-            release_proxy_conn_to_pool(c);
+            conn_pool_release(&g_conn_pool, c);
             continue;
         }
         /* Determine effective aggregation profile for this listen port */
@@ -998,7 +888,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
                                    "closing connection");
                         close(cs);
                         close(us);
-                        release_proxy_conn_to_pool(c);
+                        conn_pool_release(&g_conn_pool, c);
                         drop_conn = true;
                         break;
                     }
@@ -1032,7 +922,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
                 free(utag);
             close(cs);
             close(us);
-            release_proxy_conn_to_pool(c);
+            conn_pool_release(&g_conn_pool, c);
             continue;
         }
         ctag->conn = c;
@@ -1049,7 +939,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
             close(us);
             free(ctag);
             free(utag);
-            release_proxy_conn_to_pool(c);
+            conn_pool_release(&g_conn_pool, c);
             continue;
         }
         if (kcptcp_ep_register_rw(ctx->epfd, us, utag, false) < 0) {
@@ -1059,7 +949,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
             close(us);
             free(ctag);
             free(utag);
-            release_proxy_conn_to_pool(c);
+            conn_pool_release(&g_conn_pool, c);
             continue;
         }
 
@@ -1311,7 +1201,7 @@ int main(int argc, char **argv) {
     }
 
     /* Initialize connection pool for performance */
-    if (init_conn_pool() != 0) {
+    if (conn_pool_init(&g_conn_pool, MAX_CONNECTIONS, sizeof(struct proxy_conn)) != 0) {
         P_LOG_ERR("Failed to initialize connection pool");
         return 1;
     }
@@ -1499,7 +1389,7 @@ cleanup:
         close(lsock);
     if (epfd >= 0)
         epoll_close_comp(epfd);
-    destroy_conn_pool();
+    conn_pool_destroy(&g_conn_pool);
     cleanup_pidfile();
     return rc;
 }
