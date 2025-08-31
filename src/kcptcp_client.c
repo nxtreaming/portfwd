@@ -1201,7 +1201,7 @@ int main(int argc, char **argv) {
     }
 
     /* Initialize connection pool for performance */
-    if (conn_pool_init(&g_conn_pool, MAX_CONNECTIONS, sizeof(struct proxy_conn)) != 0) {
+        if (conn_pool_init(&g_conn_pool, DEFAULT_CONN_POOL_SIZE, sizeof(struct proxy_conn)) != 0) {
         P_LOG_ERR("Failed to initialize connection pool");
         return 1;
     }
