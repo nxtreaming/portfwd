@@ -56,16 +56,6 @@ struct rate_limiter {
     size_t window_size_sec;
 };
 
-/* Connection pool for performance optimization */
-struct conn_pool {
-    struct proxy_conn *connections; /* Pre-allocated connection array */
-    struct proxy_conn *freelist;    /* Linked list of available connections */
-    int capacity;                   /* Total pool capacity */
-    int used_count;                 /* Currently allocated connections */
-    int high_water_mark;            /* Peak usage for monitoring */
-    pthread_mutex_t lock;           /* Thread safety mutex */
-    pthread_cond_t available; /* Condition variable for blocking allocation */
-};
 
 /* Forward declarations for basic helper functions */
 static void secure_zero(void *ptr, size_t len);
