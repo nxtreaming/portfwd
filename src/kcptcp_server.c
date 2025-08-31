@@ -46,7 +46,19 @@
 #define HASH_TABLE_SIZE 1024
 #define MAX_CONV_GENERATION_ATTEMPTS 100
 
-/* Security structures defined in fwd_util.h */
+/* Security structures */
+struct rate_limiter_entry {
+    union sockaddr_inx addr;
+    time_t last_time;
+    size_t count;
+};
+
+struct rate_limiter {
+    struct rate_limiter_entry entries[HASH_TABLE_SIZE];
+    size_t num_entries;
+    pthread_mutex_t lock;
+};
+
 
 struct cfg_server {
     union sockaddr_inx laddr; /* UDP listen address */
@@ -313,7 +325,7 @@ static bool conn_limit_check(const union sockaddr_inx *addr) {
 
     /* Check per-IP connection limit */
     size_t hash = addr_hash(addr) % HASH_TABLE_SIZE;
-    struct conn_limiter_entry *entry = &g_conn_limiter.entries[hash];
+    struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
 
     if (!is_sockaddr_inx_equal(&entry->addr, addr)) {
         /* New address */
@@ -341,7 +353,7 @@ static void conn_limit_release(const union sockaddr_inx *addr) {
     pthread_mutex_lock(&g_conn_limiter.lock);
 
     size_t hash = addr_hash(addr) % HASH_TABLE_SIZE;
-    struct conn_limiter_entry *entry = &g_conn_limiter.entries[hash];
+    struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
 
     if (is_sockaddr_inx_equal(&entry->addr, addr) && entry->count > 0) {
         entry->count--;
