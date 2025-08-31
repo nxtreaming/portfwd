@@ -845,6 +845,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
             continue;
         }
         /* Pre-drain any immediately available TCP bytes into buffer */
+        bool drop_conn = false;
         {
             char tbuf[1024];
             for (;;) {
@@ -857,7 +858,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
                         close(cs);
                         close(us);
                         free(c);
-                        continue;
+                        drop_conn = true;
+                        break;
                     }
                     memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
                     c->request.dlen += (size_t)rn;
@@ -866,6 +868,9 @@ static void client_handle_accept(struct client_ctx *ctx) {
                     break;
                 }
             }
+        }
+        if (drop_conn) {
+            continue;
         }
 
         /* Schedule stealth handshake send with small randomized aggregation window */
@@ -1224,12 +1229,12 @@ int main(int argc, char **argv) {
                                        ? (pos->request.dlen - pos->request.rpos)
                                        : 0;
                     size_t embed = avail;
-                    if (embed > ctx->cfg->agg_max_bytes)
-                        embed = ctx->cfg->agg_max_bytes;
+                    if (embed > cctx.cfg->agg_max_bytes)
+                        embed = cctx.cfg->agg_max_bytes;
                     const uint8_t *idata = (embed > 0)
                                                ? (const uint8_t *)(pos->request.data + pos->request.rpos)
                                                : NULL;
-                    if (generate_stealth_handshake(pos, ctx->cfg->psk, ctx->cfg->has_psk,
+                    if (generate_stealth_handshake(pos, cctx.cfg->psk, cctx.cfg->has_psk,
                                                    idata, embed, hbuf, &hlen) == 0) {
                         ssize_t sent = sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT,
                                               &pos->peer_addr.sa,
