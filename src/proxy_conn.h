@@ -46,8 +46,8 @@ struct proxy_conn {
     struct buffer_info request;  /* client -> server */
     struct buffer_info response; /* server -> client */
 
-    uint32_t magic_client;
-    uint32_t magic_server;
+    uintptr_t magic_client;
+    uintptr_t magic_server;
 
     bool use_splice;
     /* Per-direction splice pipes and pending lengths */

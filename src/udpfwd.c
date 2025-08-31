@@ -348,26 +348,6 @@ static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
 }
 #endif
 
-/* Initialize rate limiter */
-static int init_rate_limiter(unsigned max_pps, unsigned max_bps,
-                             unsigned max_per_ip) {
-    memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
-
-    if (pthread_mutex_init(&g_rate_limiter.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize rate limiter mutex");
-        return -1;
-    }
-
-    g_rate_limiter.max_pps = max_pps;
-    g_rate_limiter.max_bps = max_bps;
-    g_rate_limiter.max_per_ip = max_per_ip;
-
-    P_LOG_INFO(
-        "Rate limiter initialized: max_pps=%u, max_bps=%u, max_per_ip=%u",
-        max_pps, max_bps, max_per_ip);
-    return 0;
-}
-
 /* Destroy rate limiter */
 static void destroy_rate_limiter(void) {
     pthread_mutex_destroy(&g_rate_limiter.lock);
