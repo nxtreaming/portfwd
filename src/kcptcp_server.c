@@ -30,6 +30,7 @@
 #include "buffer_limits.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
+#include "fwd_util.h"
 #include <pthread.h>
 
 /* Configuration constants */
@@ -79,6 +80,15 @@ static struct conn_limiter g_conn_limiter = {0};
 /* Forward declarations */
 static void conn_cleanup_server(struct proxy_conn *conn, int epfd,
                                 struct kcp_map_safe *cmap);
+
+/* Thread-safe KCP map operations */
+static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets);
+static void kcp_map_safe_free(struct kcp_map_safe *cmap);
+static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap,
+                                           uint32_t conv);
+static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv,
+                            struct proxy_conn *c);
+static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
 static void remove_pid_file(const char *pidfile) {
     if (pidfile) {
         if (unlink(pidfile) != 0) {
@@ -303,7 +313,7 @@ static bool conn_limit_check(const union sockaddr_inx *addr) {
 
     /* Check per-IP connection limit */
     size_t hash = addr_hash(addr) % HASH_TABLE_SIZE;
-        struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
+    struct conn_limiter_entry *entry = &g_conn_limiter.entries[hash];
 
     if (!is_sockaddr_inx_equal(&entry->addr, addr)) {
         /* New address */
@@ -331,7 +341,7 @@ static void conn_limit_release(const union sockaddr_inx *addr) {
     pthread_mutex_lock(&g_conn_limiter.lock);
 
     size_t hash = addr_hash(addr) % HASH_TABLE_SIZE;
-        struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
+    struct conn_limiter_entry *entry = &g_conn_limiter.entries[hash];
 
     if (is_sockaddr_inx_equal(&entry->addr, addr) && entry->count > 0) {
         entry->count--;
