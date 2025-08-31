@@ -48,12 +48,27 @@ User-space TCP/UDP port forwarding services
       -6                 for IPv6 listener, set IPV6_V6ONLY
       -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)
       -M <mtu>           KCP MTU (default 1350; tune to avoid IP fragmentation)
-      -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305); enables encryption
+      -A <0|1>           KCP nodelay (default 1)
+      -I <ms>            KCP interval in ms (default 10)
+      -X <n>             KCP fast resend (default 2)
+      -C <0|1>           KCP no congestion control (default 1)
+      -w <sndwnd>        KCP send window in packets (default 1024)
+      -W <rcvwnd>        KCP recv window in packets (default 1024)
+      -N                 enable TCP_NODELAY on client sockets
+      -K <hex>           32-byte PSK in hex (REQUIRED; enables AEAD + stealth handshake)
+      -g <min-max>       aggregate first TCP bytes for min-max ms before first UDP (default 20-80)
+      -G <bytes>         max bytes to embed in first UDP packet (default 1024)
+      -P off|auto|csv:<ports> per-port aggregation profile
+                           off: disable per-port heuristics
+                           auto: built-in profiles (SSH/web/RDP/VNC)
+                           csv: comma-separated ports with no aggregation
       -h                 show help
 
   Notes:
   - Listens on a local TCP address and forwards streams over UDP using KCP.
-  - AEAD encryption is enabled only when `-K` is provided on both client and server.
+  - PSK `-K` is required. AEAD (ChaCha20-Poly1305) and stealth handshake are always enabled with the PSK.
+  - Stealth handshake: the first UDP packet looks like encrypted data and can embed the first TCP bytes.
+  - Aggregation (`-g/-G/-P`) adds a small randomized delay to gather initial TCP bytes to mimic normal traffic.
 
 ### kcptcp-server (KCP/UDP to TCP server)
 
@@ -67,12 +82,20 @@ User-space TCP/UDP port forwarding services
       -6                 for IPv6 listener, set IPV6_V6ONLY
       -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)
       -M <mtu>           KCP MTU (default 1350; tune to avoid IP fragmentation)
-      -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305); enables encryption
+      -A <0|1>           KCP nodelay (default 1)
+      -I <ms>            KCP interval in ms (default 10)
+      -X <n>             KCP fast resend (default 2)
+      -C <0|1>           KCP no congestion control (default 1)
+      -w <sndwnd>        KCP send window in packets (default 1024)
+      -W <rcvwnd>        KCP recv window in packets (default 1024)
+      -N                 enable TCP_NODELAY on outbound TCP to target
+      -K <hex>           32-byte PSK in hex (REQUIRED; enables AEAD + stealth handshake)
+      -j <min-max>       jitter response to first packet by min-max ms (stealth)
       -h                 show help
 
   Notes:
   - Listens on a UDP address, accepts KCP sessions, and bridges to a target TCP service.
-  - AEAD requires the same `-K` PSK as the client for handshakes to succeed.
+  - PSK must match the client; stealth handshake response can be jittered with `-j` to mimic normal traffic timing.
 
 ## Examples
 
@@ -109,9 +132,14 @@ ssh -p 2022 localhost
 
 Notes:
 
-- The `-K` PSK must be the same 32-byte value (64 hex chars) on both sides.
+- The `-K` PSK must be the same 32-byte value (64 hex chars) on both sides; it is now required.
 - If you observe IP fragmentation, try `-M 1200` on both client and server.
-- Without `-K`, traffic is not encrypted; use `-K` to enable ChaCha20-Poly1305.
+- Client-side stealth tunables:
+  - `-g 30-100 -G 1200` for web-like ports (80/443) to gather HTTP/TLS client hello.
+  - `-P off` to disable per-port heuristics and always use `-g/-G` as provided.
+  - `-P csv:22,2222` to disable aggregation on specific ports (e.g., SSH).
+- Server-side stealth jitter:
+  - `-j 5-25` to add small jitter before sending handshake response.
 
 ## Signals, PID files, and graceful shutdown
 
