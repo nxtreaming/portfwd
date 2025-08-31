@@ -589,7 +589,6 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const u
     /* Use secure randomness for padding length to avoid deterministic patterns */
     uint8_t pad_rnd = 0;
     if (secure_random_bytes(&pad_rnd, 1) != 0) {
-        free(plaintext);
         return -1;
     }
     size_t padding_size = 8 + (size_t)(pad_rnd % 24); /* 8-31 bytes random padding */
