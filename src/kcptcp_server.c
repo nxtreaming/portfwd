@@ -58,6 +58,33 @@ struct rate_limiter {
     pthread_mutex_t lock;
 };
 
+struct conn_limiter_entry {
+    union sockaddr_inx addr;
+    size_t count;
+};
+
+struct conn_limiter {
+    struct conn_limiter_entry ip_counts[HASH_TABLE_SIZE];
+    size_t total_connections;
+    pthread_mutex_t lock;
+};
+
+struct cfg_server {
+    union sockaddr_inx laddr; /* UDP listen address */
+    union sockaddr_inx taddr; /* TCP target address */
+    bool reuse_addr;
+    bool reuse_port;
+    bool v6only;
+    int sockbuf_bytes;
+    bool tcp_nodelay;
+    bool has_psk;
+    uint8_t psk[32];
+    uint32_t hs_rsp_jitter_min_ms;
+    uint32_t hs_rsp_jitter_max_ms;
+    bool daemonize;
+    const char *pidfile;
+};
+
 
 /* Thread-safe KCP map wrapper */
 struct kcp_map_safe {
@@ -86,6 +113,8 @@ static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,
                                  struct proxy_conn *conn);
 static uint32_t derive_conv_from_psk_token(const uint8_t psk[32],
                                            const uint8_t token[16]);
+static void print_usage(const char *prog_name);
+static bool kcptcp_deterministic_conv_enabled(void);
 
 /* Thread-safe KCP map operations */
 static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets);
@@ -441,6 +470,34 @@ static int handle_system_error(const char *operation, int error_code) {
         P_LOG_ERR("System error in %s: %s", operation, strerror(error_code));
         return -1;
     }
+}
+
+static void print_usage(const char *prog_name) {
+    fprintf(stderr, "Usage: %s [options] <listen-udp-addr> <target-tcp-addr>\n", prog_name);
+    fprintf(stderr, "\nOptions:\n");
+    fprintf(stderr, "  -h, --help                 Show this help message and exit\n");
+    fprintf(stderr, "  -K, --psk <psk>            Pre-shared key for AEAD encryption (required)\n");
+    fprintf(stderr, "  --hs-jitter-min <ms>       Min handshake response jitter in ms (default: 0)\n");
+    fprintf(stderr, "  --hs-jitter-max <ms>       Max handshake response jitter in ms (default: 100)\n");
+    fprintf(stderr, "  -d, --daemonize            Run in the background\n");
+    fprintf(stderr, "  -p, --pidfile <file>       Write PID to a file\n");
+    fprintf(stderr, "  --reuse-addr               Enable SO_REUSEADDR\n");
+    fprintf(stderr, "  --reuse-port               Enable SO_REUSEPORT\n");
+    fprintf(stderr, "  --v6only                   Enable IPV6_V6ONLY\n");
+    fprintf(stderr, "  --sockbuf <bytes>          Set socket buffer size (SO_SNDBUF, SO_RCVBUF)\n");
+    fprintf(stderr, "  --tcp-nodelay              Enable TCP_NODELAY on target sockets\n");
+    fprintf(stderr, "\nKCP Options:\n");
+    fprintf(stderr, "  --kcp-mtu <mtu>            Set KCP MTU (default: 1400)\n");
+    fprintf(stderr, "  --kcp-nodelay <0|1>        Enable/disable KCP nodelay mode\n");
+    fprintf(stderr, "  --kcp-interval <ms>        Set KCP update interval\n");
+    fprintf(stderr, "  --kcp-resend <0|1|2>       Set KCP fast resend mode\n");
+    fprintf(stderr, "  --kcp-nc <0|1>             Enable/disable congestion control\n");
+    fprintf(stderr, "  --kcp-sndwnd <wnd>         Set KCP send window size\n");
+    fprintf(stderr, "  --kcp-rcvwnd <wnd>         Set KCP receive window size\n");
+}
+
+static bool kcptcp_deterministic_conv_enabled(void) {
+    return true; /* Or based on some config */
 }
 
 int main(int argc, char **argv) {
@@ -1165,7 +1222,27 @@ cleanup:
     if (epfd >= 0)
         epoll_close_comp(epfd);
     kcp_map_safe_free(&cmap);
-    destroy_conn_pool_server();
-    cleanup_pidfile();
+    if (cfg.pidfile)
+        remove_pid_file(cfg.pidfile);
+
+    conn_pool_destroy(&g_conn_pool);
+
+    P_LOG_INFO("kcptcp-server shut down");
+
     return rc;
+}
+
+void print_usage(const char *progname) {
+    printf("Usage: %s [options]\n", progname);
+    printf("Options:\n");
+    printf("  -h, --help             Show this help message and exit\n");
+    printf("  -v, --version          Show version number and exit\n");
+    printf("  -c, --config <file>    Specify configuration file\n");
+    printf("  -p, --pidfile <file>   Specify pid file\n");
+    printf("  -l, --log-level <level> Specify log level (0-5)\n");
+    printf("  -f, --foreground       Run in foreground\n");
+}
+
+bool kcptcp_deterministic_conv_enabled(void) {
+    return false; /* TODO: implement me */
 }
