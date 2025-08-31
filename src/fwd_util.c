@@ -173,14 +173,18 @@ int create_pid_file(const char *filepath) {
     return 0;
 }
 
+void init_fwd_config(struct fwd_config *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->max_total_connections = -1; // Default: no limit
+    cfg->max_per_ip = 0; // Default: no limit
+}
+
 int parse_common_args(int argc, char **argv, struct fwd_config *cfg) {
     int opt;
 
     // Reset getopt's internal state.
     optind = 1;
 
-    // Set default values
-    memset(cfg, 0, sizeof(*cfg));
 
     // A colon after an option character indicates it takes an argument.
     while ((opt = getopt(argc, argv, "drR6P:i:")) != -1) {

@@ -37,6 +37,7 @@ extern struct app_state g_state;
 
 
 void set_nonblock(int fd);
+void set_cloexec(int fd);
 void *addr_of_sockaddr(const union sockaddr_inx *addr);
 const unsigned short *port_of_sockaddr(const union sockaddr_inx *addr);
 size_t sizeof_sockaddr(const union sockaddr_inx *addr);

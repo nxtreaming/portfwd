@@ -21,7 +21,9 @@ struct fwd_config {
     bool reuse_addr;
     bool reuse_port;
     bool v6only;
+    bool base_addr_mode;
     unsigned int max_per_ip; /* Max connections per source IP */
+    int max_total_connections; /* Max total connections */
 };
 
 // Global signal-safe flag for graceful shutdown
@@ -43,6 +45,7 @@ int do_daemonize(void);
  * @param cfg  The fwd_config struct to populate.
  * @return The updated optind value on success, -1 on error.
  */
+void init_fwd_config(struct fwd_config *cfg);
 int parse_common_args(int argc, char **argv, struct fwd_config *cfg);
 
 #endif // FWD_UTIL_H
