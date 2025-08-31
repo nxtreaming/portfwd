@@ -1290,16 +1290,6 @@ int main(int argc, char **argv) {
                                 }
                             }
                         }
-                        if (sent >= 0) {
-                            g_perf.handshake_attempts++;
-                            P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hlen);
-                            pos->hs_scheduled = false;
-                            pos->request.rpos += embed; /* mark embedded data consumed */
-                        } else {
-                            P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
-                            /* Try again shortly */
-                            pos->hs_send_at_ms = now + 5;
-                        }
                     } else {
                         P_LOG_ERR("Failed to generate stealth handshake packet");
                         g_perf.handshake_failures++;
