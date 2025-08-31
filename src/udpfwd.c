@@ -321,19 +321,19 @@ static int safe_close(int fd) {
 static uint32_t hash_addr(const union sockaddr_inx *a);
 
 /* Connection management */
-static void proxy_conn_walk_continue(const struct config *cfg,
+static void proxy_conn_walk_continue(const struct fwd_config *cfg,
                                      unsigned walk_max, int epfd);
 static bool proxy_conn_evict_one(int epfd);
 
 /* Data handling */
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
 #ifdef __linux__
-static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd,
+static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int epfd,
                                struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
                                struct iovec *s_iovs,
                                char (*c_bufs)[UDP_PROXY_DGRAM_CAP]);
 #else
-static void handle_client_data(const struct config *cfg, int lsn_sock,
+static void handle_client_data(const struct fwd_config *cfg, int lsn_sock,
                                int epfd);
 #endif
 
@@ -345,13 +345,6 @@ static void init_batching_resources(struct mmsghdr **c_msgs,
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP],
                                     struct mmsghdr **s_msgs,
                                     struct iovec **s_iovs);
-
-static void destroy_batching_resources(struct mmsghdr *c_msgs,
-                                       struct iovec *c_iov,
-                                       struct sockaddr_storage *c_addrs,
-                                       char (*c_bufs)[UDP_PROXY_DGRAM_CAP],
-                                       struct mmsghdr *s_msgs,
-                                       struct iovec *s_iovs);
 #endif
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -851,7 +844,7 @@ static void segmented_update_lru(void) {
 }
 
 static struct proxy_conn *
-proxy_conn_get_or_create(const struct config *cfg,
+proxy_conn_get_or_create(const struct fwd_config *cfg,
                          const union sockaddr_inx *cli_addr, int epfd) {
     struct list_head *chain = &conn_tbl_hbase[bucket_index_fun(cli_addr)];
     struct proxy_conn *conn = NULL;
@@ -1042,7 +1035,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     conn_pool_release(&g_conn_pool, conn);
 }
 
-static void proxy_conn_walk_continue(const struct config *cfg,
+static void proxy_conn_walk_continue(const struct fwd_config *cfg,
                                      unsigned walk_max, int epfd) {
     unsigned walked = 0;
     time_t now = atomic_load(&g_now_ts);
@@ -1118,14 +1111,13 @@ static bool proxy_conn_evict_one(int epfd) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #ifdef __linux__
-static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd,
+static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int epfd,
                                struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
                                struct iovec *s_iovs,
-                               char (*c_bufs)[UDP_PROXY_DGRAM_CAP])
+                               char (*c_bufs)[UDP_PROXY_DGRAM_CAP]) {
 #else
-static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
+static void handle_client_data(const struct fwd_config *cfg, int lsn_sock, int epfd) {
 #endif
-{
     struct proxy_conn *conn;
 
 #ifdef __linux__
@@ -1550,35 +1542,31 @@ static void show_help(const char *prog) {
 }
 
 int main(int argc, char *argv[]) {
-    /* Local variables */
-    int opt, b_true = 1, lsn_sock = -1, epfd = -1, i, rc = 0;
-    struct config cfg;
-    struct fwd_config fwd_cfg;
-    int new_optind;
-    struct epoll_event ev, events[MAX_EVENTS];
-    char s_addr1[50] = "", s_addr2[50] = "";
-    time_t last_check;
+    int rc = 1;
+    struct fwd_config fwd_config;
+    int listen_sock = -1, epfd = -1, i;
+    time_t last_check = 0;
+    uint32_t magic_listener = EV_MAGIC_LISTENER;
 
-    new_optind = parse_common_args(argc, argv, &fwd_cfg);
+#ifdef __linux__
+    struct mmsghdr *c_msgs = NULL, *s_msgs = NULL;
+    struct iovec *c_iov = NULL, *s_iovs = NULL;
+    struct sockaddr_storage *c_addrs = NULL;
+    char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = {0};
+#endif
+
+    init_fwd_config(&fwd_config);
+    fwd_config.proxy_conn_timeo = DEFAULT_CONN_TIMEOUT_SEC;
+    fwd_config.conn_tbl_hash_size = DEFAULT_HASH_TABLE_SIZE;
+
+    int new_optind = parse_common_args(argc, argv, &fwd_config);
     if (new_optind < 0) {
-        print_usage(argv[0]);
+        show_help(argv[0]);
         return 1;
     }
     optind = new_optind;
 
-    memset(&cfg, 0, sizeof(cfg));
-
-    cfg.daemonize = fwd_cfg.daemonize;
-    cfg.reuse_addr = fwd_cfg.reuse_addr;
-    cfg.reuse_port = fwd_cfg.reuse_port;
-    cfg.v6only = fwd_cfg.v6only;
-    cfg.pidfile = fwd_cfg.pidfile;
-    // Note: max_per_ip is handled inside the udpfwd-specific loop for now.
-
-    /* Set default values */
-    cfg.proxy_conn_timeo = DEFAULT_CONN_TIMEOUT_SEC;
-    cfg.conn_tbl_hash_size = DEFAULT_HASH_TABLE_SIZE;
-
+    int opt;
     while ((opt = getopt(argc, argv, "t:S:C:B:H:")) != -1) {
         switch (opt) {
         case 't': {
@@ -1586,13 +1574,11 @@ int main(int argc, char *argv[]) {
             unsigned long v = strtoul(optarg, &end, 10);
             if (end == optarg || *end != '\0') {
                 P_LOG_WARN("invalid -t value '%s', keeping default %u", optarg,
-                           cfg.proxy_conn_timeo);
+                           fwd_config.proxy_conn_timeo);
             } else {
-                if (v == 0)
-                    v = 1;
-                if (v > 86400UL)
-                    v = 86400UL;
-                cfg.proxy_conn_timeo = (unsigned)v;
+                if (v == 0) v = 1;
+                if (v > 86400UL) v = 86400UL;
+                fwd_config.proxy_conn_timeo = (unsigned)v;
             }
             break;
         }
@@ -1603,10 +1589,8 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -S value '%s', keeping default %d", optarg,
                            g_sockbuf_cap_runtime);
             } else {
-                if (v < 4096)
-                    v = 4096;
-                if (v > (8 << 20))
-                    v = (8 << 20);
+                if (v < 4096) v = 4096;
+                if (v > (8 << 20)) v = (8 << 20);
                 g_sockbuf_cap_runtime = (int)v;
             }
             break;
@@ -1618,10 +1602,8 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -C value '%s', keeping default %d", optarg,
                            g_conn_pool_capacity);
             } else {
-                if (v < 64)
-                    v = 64;
-                if (v > (1 << 20))
-                    v = (1 << 20);
+                if (v < 64) v = 64;
+                if (v > (1 << 20)) v = (1 << 20);
                 g_conn_pool_capacity = (int)v;
             }
             break;
@@ -1634,10 +1616,8 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -B value '%s', keeping default %d", optarg,
                            g_batch_sz_runtime);
             } else {
-                if (v < 1)
-                    v = 1;
-                if (v > UDP_PROXY_BATCH_SZ)
-                    v = UDP_PROXY_BATCH_SZ;
+                if (v < 1) v = 1;
+                if (v > UDP_PROXY_BATCH_SZ) v = UDP_PROXY_BATCH_SZ;
                 g_batch_sz_runtime = (int)v;
             }
 #else
@@ -1650,213 +1630,129 @@ int main(int argc, char *argv[]) {
             unsigned long v = strtoul(optarg, &end, 10);
             if (end == optarg || *end != '\0') {
                 P_LOG_WARN("invalid -H value '%s', keeping default %u", optarg,
-                           cfg.conn_tbl_hash_size);
+                           fwd_config.conn_tbl_hash_size);
             } else {
-                if (v == 0)
-                    v = 4093UL;
-                if (v < 64UL)
-                    v = 64UL;
-                if (v > (1UL << 20))
-                    v = (1UL << 20);
-                cfg.conn_tbl_hash_size = (unsigned)v;
+                if (v == 0) v = 4093UL;
+                if (v < 64UL) v = 64UL;
+                if (v > (1UL << 20)) v = (1UL << 20);
+                fwd_config.conn_tbl_hash_size = (unsigned)v;
             }
             break;
         }
-        default:
-            show_help(argv[0]);
-            rc = 1;
-            goto cleanup;
+        default: show_help(argv[0]); return 1;
         }
     }
 
     if (optind > argc - 2) {
         show_help(argv[0]);
-        rc = 1;
+        return 1;
+    }
+
+    if (get_sockaddr_inx(argv[optind], &fwd_config.src_addr, true) != 0) return 1;
+    if (get_sockaddr_inx(argv[optind + 1], &fwd_config.dst_addr, false) != 0) return 1;
+
+    openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
+
+    if (fwd_config.daemonize) {
+        if (do_daemonize() != 0) return 1;
+    }
+
+    if (fwd_config.pidfile) {
+        if (create_pid_file(fwd_config.pidfile) != 0) return 1;
+    }
+
+    if (conn_pool_init(&g_conn_pool, g_conn_pool_capacity,
+                       sizeof(struct proxy_conn)) < 0) {
+        P_LOG_ERR("conn_pool_init: failed");
         goto cleanup;
     }
 
-    /* Resolve source address */
-    if (get_sockaddr_inx_pair(argv[optind], &cfg.src_addr, true) < 0) {
-        P_LOG_ERR("Invalid source address '%s'.", argv[optind]);
-        rc = 1;
-        goto cleanup;
-    }
-    optind++;
-
-    /* Resolve destination addresse */
-    if (get_sockaddr_inx_pair(argv[optind], &cfg.dst_addr, true) < 0) {
-        P_LOG_ERR("Invalid destination address '%s'.", argv[optind]);
-        rc = 1;
-        goto cleanup;
-    }
-    optind++;
-
-    /* Initialize logging */
-    openlog("udpfwd", LOG_PID | LOG_NDELAY, LOG_DAEMON);
-
-    /* Initialize connection pool */
-    int capacity = (g_conn_pool_capacity > 0) ? g_conn_pool_capacity : UDP_PROXY_MAX_CONNS;
-    if (conn_pool_init(&g_conn_pool, capacity, sizeof(struct proxy_conn)) != 0) {
-        rc = 1;
+    if (init_conn_limiter(fwd_config.max_total_connections, fwd_config.max_per_ip) != 0) {
         goto cleanup;
     }
 
-    /* Initialize rate limiter */
-    if (init_rate_limiter(cfg.max_packets_per_second, cfg.max_bytes_per_second,
-                          cfg.max_connections_per_ip) != 0) {
-        destroy_conn_pool();
-        rc = 1;
+    if (setup_shutdown_signals() != 0) {
+        P_LOG_ERR("setup_shutdown_signals: failed");
         goto cleanup;
     }
 
-    /* Initialize backpressure queue */
-#if ENABLE_BACKPRESSURE_QUEUE
-    if (init_backpressure_queue() != 0) {
-        destroy_rate_limiter();
-        destroy_conn_pool();
-        rc = 1;
-        goto cleanup;
-    }
-#endif
-
-    /* Create listening socket */
-    lsn_sock = socket(cfg.src_addr.sa.sa_family, SOCK_DGRAM, 0);
-    if (lsn_sock < 0) {
-        P_LOG_ERR("socket(): %s.", strerror(errno));
-        rc = 1;
+    listen_sock = socket(fwd_config.src_addr.sa.sa_family, SOCK_DGRAM, 0);
+    if (listen_sock < 0) {
+        P_LOG_ERR("socket(): %s", strerror(errno));
         goto cleanup;
     }
 
-    /* Configure socket options */
-    if (cfg.reuse_addr) {
-        if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEADDR, &b_true,
-                       sizeof(b_true)) < 0)
-            P_LOG_WARN(
-                "setsockopt(SO_REUSEADDR): %s (continuing without reuseaddr)",
-                strerror(errno));
+    if (fwd_config.reuse_addr) {
+        int on = 1;
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) <
+            0) {
+            P_LOG_WARN("setsockopt(SO_REUSEADDR): %s", strerror(errno));
+        }
     }
+
 #ifdef SO_REUSEPORT
-    if (cfg.reuse_port) {
-        if (setsockopt(lsn_sock, SOL_SOCKET, SO_REUSEPORT, &b_true,
-                       sizeof(b_true)) < 0) {
-            P_LOG_WARN(
-                "setsockopt(SO_REUSEPORT): %s (continuing without reuseport)",
-                strerror(errno));
+    if (fwd_config.reuse_port) {
+        int on = 1;
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) <
+            0) {
+            P_LOG_WARN("setsockopt(SO_REUSEPORT): %s", strerror(errno));
         }
     }
 #endif
-    if (cfg.src_addr.sa.sa_family == AF_INET6 && cfg.v6only)
-        (void)setsockopt(lsn_sock, IPPROTO_IPV6, IPV6_V6ONLY, &b_true,
-                         sizeof(b_true));
-    if (bind(lsn_sock, (struct sockaddr *)&cfg.src_addr,
-             sizeof_sockaddr(&cfg.src_addr)) < 0) {
-        P_LOG_ERR("bind(): %s.", strerror(errno));
-        rc = 1;
+
+    if (fwd_config.src_addr.sa.sa_family == AF_INET6 && fwd_config.v6only) {
+        int on = 1;
+        (void)setsockopt(listen_sock, IPPROTO_IPV6, IPV6_V6ONLY, &on, sizeof(on));
+    }
+
+    if (bind(listen_sock, &fwd_config.src_addr.sa, sizeof_sockaddr(&fwd_config.src_addr)) < 0) {
+        P_LOG_ERR("bind(): %s", strerror(errno));
         goto cleanup;
     }
-    set_nonblock(lsn_sock);
-    set_sock_buffers(lsn_sock);
 
-    inet_ntop(cfg.src_addr.sa.sa_family, addr_of_sockaddr(&cfg.src_addr),
-              s_addr1, sizeof(s_addr1));
-    inet_ntop(cfg.dst_addr.sa.sa_family, addr_of_sockaddr(&cfg.dst_addr),
-              s_addr2, sizeof(s_addr2));
-    P_LOG_INFO("Listening on [%s]:%d, proxying to [%s]:%d", s_addr1,
-               ntohs(*port_of_sockaddr(&cfg.src_addr)), s_addr2,
-               ntohs(*port_of_sockaddr(&cfg.dst_addr)));
+    set_nonblock(listen_sock);
+    set_sock_buffers(listen_sock);
 
-    /* Create epoll table. */
-    /* Prefer epoll_create1 with CLOEXEC when available */
-#ifdef __linux__
 #ifdef EPOLL_CLOEXEC
     epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL))
-        epfd = epoll_create(2048);
+    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL)) epfd = epoll_create(1);
 #else
-    epfd = epoll_create(2048);
-#endif
-#else
-    epfd = epoll_create(2048);
+    epfd = epoll_create(1);
 #endif
     if (epfd < 0) {
         P_LOG_ERR("epoll_create(): %s", strerror(errno));
-        rc = 1;
         goto cleanup;
     }
 
-    if (fwd_cfg.daemonize) {
-        if (do_daemonize() != 0) {
-            return 1; // do_daemonize logs errors
-        }
-    }
+    g_conn_tbl_hash_size = fwd_config.conn_tbl_hash_size;
+    if (g_conn_tbl_hash_size < 64) g_conn_tbl_hash_size = 64;
+    if (g_conn_tbl_hash_size > (1u << 20)) g_conn_tbl_hash_size = (1u << 20);
 
-    if (fwd_cfg.pidfile) {
-        if (create_pid_file(fwd_cfg.pidfile) != 0) {
-            return 1;
-        }
-    }
-
-    /* Set up signal handlers */
-    if (setup_shutdown_signals() != 0) {
-        P_LOG_ERR("Failed to setup signal handlers");
-        rc = 1;
-        goto cleanup;
-    }
-
-    /* Initialize the connection table */
-    g_conn_tbl_hash_size = cfg.conn_tbl_hash_size;
-    /*
-     * Respect the configured hash size (e.g., a prime like 4093 to reduce
-     * collisions). Only clamp to sane bounds; do NOT round to power-of-two
-     * here.
-     */
-    if (g_conn_tbl_hash_size < 64)
-        g_conn_tbl_hash_size = 64;
-    if (g_conn_tbl_hash_size > (1u << 20))
-        g_conn_tbl_hash_size = (1u << 20);
-
-    /* Select bucket indexing strategy once to avoid per-call checks */
     bucket_index_fun =
         is_power_of_two(g_conn_tbl_hash_size)
-            ? proxy_conn_hash_bitwise /* fast path for 2^k sizes */
-            : proxy_conn_hash_mod;    /* general path for arbitrary sizes (e.g.,
-                                         primes) */
+            ? proxy_conn_hash_bitwise
+            : proxy_conn_hash_mod;
     assert(bucket_index_fun != NULL);
 
     conn_tbl_hbase = malloc(sizeof(struct list_head) * g_conn_tbl_hash_size);
     if (!conn_tbl_hbase) {
-        P_LOG_ERR("Failed to allocate connection hash table");
-        rc = 1;
+        P_LOG_ERR("malloc(conn_tbl_hbase): failed");
         goto cleanup;
     }
-
     for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
         INIT_LIST_HEAD(&conn_tbl_hbase[i]);
     }
 
 #if ENABLE_FINE_GRAINED_LOCKS
-    /* Allocate fine-grained locks for hash table buckets */
     conn_tbl_locks = malloc(sizeof(pthread_spinlock_t) * g_conn_tbl_hash_size);
     if (!conn_tbl_locks) {
-        P_LOG_ERR("Failed to allocate connection hash table locks");
-        free(conn_tbl_hbase);
-        conn_tbl_hbase = NULL;
-        rc = 1;
+        P_LOG_ERR("malloc(conn_tbl_locks): failed");
         goto cleanup;
     }
-
     for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
         if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) !=
             0) {
-            P_LOG_ERR("Failed to initialize hash table lock %d", i);
-            /* Clean up already initialized locks */
-            for (int j = 0; j < i; j++) {
-                pthread_spin_destroy(&conn_tbl_locks[j]);
-            }
-            free((void *)conn_tbl_locks);
-            free(conn_tbl_hbase);
-            conn_tbl_hbase = NULL;
-            conn_tbl_locks = NULL;
+            P_LOG_ERR("pthread_spin_init(lock %d): failed", i);
             rc = 1;
             goto cleanup;
         }
@@ -1878,7 +1774,7 @@ int main(int argc, char *argv[]) {
 #ifdef EPOLLEXCLUSIVE
     ev.events |= EPOLLEXCLUSIVE;
 #endif
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, lsn_sock, &ev) < 0) {
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_sock, &ev) < 0) {
         P_LOG_ERR("epoll_ctl(ADD, listener): %s", strerror(errno));
         rc = 1;
         goto cleanup;
@@ -1891,7 +1787,7 @@ int main(int argc, char *argv[]) {
 
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= 2) {
-            proxy_conn_walk_continue(&cfg, 200, epfd);
+            proxy_conn_walk_continue(&fwd_config, 200, epfd);
             /* Segmented LRU update to reduce per-packet overhead */
             segmented_update_lru();
             /* Process any queued backpressure packets */
@@ -1932,14 +1828,14 @@ int main(int argc, char *argv[]) {
                     goto cleanup;
                 }
 #ifdef __linux__
-                handle_client_data(&cfg, lsn_sock, epfd, c_msgs, s_msgs, s_iovs,
+                handle_client_data(&fwd_config, listen_sock, epfd, c_msgs, s_msgs, s_iovs,
                                    c_bufs);
 #else
-                handle_client_data(&cfg, lsn_sock, epfd);
+                handle_client_data(&fwd_config, listen_sock, epfd);
 #endif
             } else {
                 /* Data from server */
-                conn = (struct proxy_conn *)evp->data.ptr;
+                conn = evp->data.ptr;
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
                     /* fatal on this flow: release session */
                     release_proxy_conn(conn, epfd);
