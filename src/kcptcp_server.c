@@ -58,16 +58,6 @@ struct rate_limiter {
     pthread_mutex_t lock;
 };
 
-struct conn_limiter_entry {
-    union sockaddr_inx addr;
-    size_t count;
-};
-
-struct conn_limiter {
-    struct conn_limiter_entry ip_counts[HASH_TABLE_SIZE];
-    size_t total_connections;
-    pthread_mutex_t lock;
-};
 
 /* Thread-safe KCP map wrapper */
 struct kcp_map_safe {
@@ -75,18 +65,9 @@ struct kcp_map_safe {
     pthread_rwlock_t lock;
 };
 
-/* Connection pool for performance optimization */
-struct conn_pool {
-    struct proxy_conn *connections; /* Pre-allocated connection array */
-    struct proxy_conn *freelist;    /* Linked list of available connections */
-    int capacity;                   /* Total pool capacity */
-    int used_count;                 /* Currently allocated connections */
-    int high_water_mark;            /* Peak usage for monitoring */
-    pthread_mutex_t lock;           /* Thread safety mutex */
-};
 
-static struct conn_pool g_conn_pool = {0};
-static const int DEFAULT_CONN_POOL_SIZE = 2048;
+extern struct conn_pool g_conn_pool;
+static const size_t DEFAULT_CONN_POOL_SIZE = 2048;
 
 /* Global security objects */
 static struct rate_limiter g_rate_limiter = {0};
@@ -158,11 +139,6 @@ static uint32_t derive_conv_from_psk_token(const uint8_t psk[32],
     return v;
 }
 
-/* Connection pool management */
-static int init_conn_pool_server(void);
-static void destroy_conn_pool_server(void);
-static struct proxy_conn *alloc_proxy_conn_server(void);
-static void release_proxy_conn_server(struct proxy_conn *conn);
 
 /* Safe memory management functions */
 static void secure_zero(void *ptr, size_t len) {
@@ -228,11 +204,8 @@ static void conn_cleanup_server(struct proxy_conn *conn, int epfd,
     /* Release connection limit for this address */
     conn_limit_release(&conn->peer_addr);
 
-    /* Remove from connection list */
-    list_del(&conn->list);
-
-    /* Return connection to pool instead of freeing */
-    release_proxy_conn_server(conn);
+    /* Return connection to pool */
+    conn_pool_release(&g_conn_pool, conn);
 }
 
 /* Address hashing function for rate limiting and connection limiting */
@@ -369,6 +342,17 @@ static uint32_t generate_secure_conv(void) {
 }
 
 /* Thread-safe KCP map operations */
+static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets);
+static void kcp_map_safe_free(struct kcp_map_safe *cmap);
+static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap,
+                                           uint32_t conv);
+static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv,
+                            struct proxy_conn *c);
+static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
+
+/* Enhanced error handling functions */
+static int handle_system_error(const char *operation, int error_code);
+
 static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets) {
     if (!cmap)
         return -1;
@@ -428,7 +412,6 @@ static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv) {
     pthread_rwlock_unlock(&cmap->lock);
 }
 
-/* Enhanced error handling functions */
 static int handle_system_error(const char *operation, int error_code) {
     if (!operation)
         return -1;
@@ -459,142 +442,6 @@ static int handle_system_error(const char *operation, int error_code) {
         return -1;
     }
 }
-
-/* Connection pool management implementation */
-static int init_conn_pool_server(void) {
-    g_conn_pool.capacity = DEFAULT_CONN_POOL_SIZE;
-    g_conn_pool.connections =
-        malloc(sizeof(struct proxy_conn) * (size_t)g_conn_pool.capacity);
-    if (!g_conn_pool.connections) {
-        P_LOG_ERR("Failed to allocate connection pool");
-        return -1;
-    }
-
-    /* Initialize mutex */
-    if (pthread_mutex_init(&g_conn_pool.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize connection pool mutex");
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-        return -1;
-    }
-
-    /* Initialize freelist */
-    g_conn_pool.freelist = NULL;
-    for (int i = 0; i < g_conn_pool.capacity; i++) {
-        struct proxy_conn *conn = &g_conn_pool.connections[i];
-        conn->next = g_conn_pool.freelist;
-        g_conn_pool.freelist = conn;
-    }
-    g_conn_pool.used_count = 0;
-    g_conn_pool.high_water_mark = 0;
-
-    P_LOG_INFO("Connection pool initialized with %d connections",
-               g_conn_pool.capacity);
-    return 0;
-}
-
-static void destroy_conn_pool_server(void) {
-    if (g_conn_pool.connections) {
-        pthread_mutex_destroy(&g_conn_pool.lock);
-        free(g_conn_pool.connections);
-        g_conn_pool.connections = NULL;
-    }
-}
-
-static struct proxy_conn *alloc_proxy_conn_server(void) {
-    struct proxy_conn *conn;
-
-    pthread_mutex_lock(&g_conn_pool.lock);
-
-    if (!g_conn_pool.freelist) {
-        pthread_mutex_unlock(&g_conn_pool.lock);
-        P_LOG_WARN("Connection pool exhausted!");
-        return NULL;
-    }
-
-    conn = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn->next;
-    g_conn_pool.used_count++;
-
-    if (g_conn_pool.used_count > g_conn_pool.high_water_mark) {
-        g_conn_pool.high_water_mark = g_conn_pool.used_count;
-    }
-
-    pthread_mutex_unlock(&g_conn_pool.lock);
-
-    /* Initialize connection structure */
-    memset(conn, 0, sizeof(*conn));
-    conn->svr_sock = -1;
-    conn->udp_sock = -1;
-    INIT_LIST_HEAD(&conn->list);
-
-    return conn;
-}
-
-static void release_proxy_conn_server(struct proxy_conn *conn) {
-    if (!conn) {
-        P_LOG_WARN("Attempted to release NULL connection");
-        return;
-    }
-
-    pthread_mutex_lock(&g_conn_pool.lock);
-
-    conn->next = g_conn_pool.freelist;
-    g_conn_pool.freelist = conn;
-    g_conn_pool.used_count--;
-
-    pthread_mutex_unlock(&g_conn_pool.lock);
-}
-
-static void print_usage(const char *prog) {
-    P_LOG_INFO(
-        "Usage: %s [options] <local_udp_addr:port> <target_tcp_addr:port>",
-        prog);
-    P_LOG_INFO("Options:");
-    P_LOG_INFO("  -d                 run in background (daemonize)");
-    P_LOG_INFO("  -p <pidfile>       write PID to file");
-    P_LOG_INFO("  -r                 set SO_REUSEADDR on listener socket");
-    P_LOG_INFO("  -R                 set SO_REUSEPORT on listener socket");
-    P_LOG_INFO("  -6                 for IPv6 listener, set IPV6_V6ONLY");
-    P_LOG_INFO(
-        "  -S <bytes>         SO_RCVBUF/SO_SNDBUF size (default build-time)");
-    P_LOG_INFO("  -M <mtu>           KCP MTU (default 1350; lower if frequent "
-               "fragmentation)");
-    P_LOG_INFO("  -A <0|1>           KCP nodelay (default 1)");
-    P_LOG_INFO("  -I <ms>            KCP interval in ms (default 10)");
-    P_LOG_INFO("  -X <n>             KCP fast resend (default 2)");
-    P_LOG_INFO("  -C <0|1>           KCP no congestion control (default 1)");
-    P_LOG_INFO(
-        "  -w <sndwnd>        KCP send window in packets (default 1024)");
-    P_LOG_INFO(
-        "  -W <rcvwnd>        KCP recv window in packets (default 1024)");
-    P_LOG_INFO(
-        "  -N                 enable TCP_NODELAY on outbound TCP to target");
-    P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) "
-               "[REQUIRED]");
-    P_LOG_INFO("  -j <min-max>       jitter response to first packet by "
-               "min-max ms (stealth)");
-    P_LOG_INFO("  -h                 show help");
-    P_LOG_INFO(" ");
-    P_LOG_INFO(
-        "Note: PSK (-K) is required for secure handshake authentication.");
-}
-
-struct cfg_server {
-    union sockaddr_inx laddr; /* UDP listen */
-    union sockaddr_inx taddr; /* TCP target */
-    const char *pidfile;
-    bool daemonize;
-    bool reuse_addr;
-    bool reuse_port;
-    bool v6only;
-    int sockbuf_bytes;
-    bool tcp_nodelay;
-    bool has_psk;
-    uint8_t psk[32];
-    uint32_t rsp_jitter_min_ms;
-    uint32_t rsp_jitter_max_ms;
-};
 
 int main(int argc, char **argv) {
     int rc = 1;
@@ -716,7 +563,8 @@ int main(int argc, char **argv) {
     }
 
     /* Initialize connection pool */
-    if (init_conn_pool_server() != 0) {
+    if (conn_pool_init(&g_conn_pool, DEFAULT_CONN_POOL_SIZE,
+                       sizeof(struct proxy_conn)) != 0) {
         P_LOG_ERR("Failed to initialize connection pool");
         goto cleanup;
     }
@@ -826,7 +674,7 @@ int main(int argc, char **argv) {
                                 continue;
                             }
 
-                            struct proxy_conn *nc = alloc_proxy_conn_server();
+                            struct proxy_conn *nc = conn_pool_alloc(&g_conn_pool);
                             if (!nc) {
                                 P_LOG_ERR("Connection pool exhausted");
                                 close(ts);
@@ -864,7 +712,7 @@ int main(int argc, char **argv) {
                                                   "conv after 100 attempts");
                                         close(ts);
                                         conn_limit_release(&ra);
-                                        release_proxy_conn_server(nc);
+                                        conn_pool_release(&g_conn_pool, nc);
                                         continue;
                                     }
                                 } while (conv_try == 0 ||
@@ -895,7 +743,7 @@ int main(int argc, char **argv) {
                                 } else {
                                     P_LOG_ERR("session key derivation failed");
                                     close(ts);
-                                    release_proxy_conn_server(nc);
+                                    conn_pool_release(&g_conn_pool, nc);
                                     continue;
                                 }
                             }
@@ -905,7 +753,7 @@ int main(int argc, char **argv) {
                                 P_LOG_ERR("kcp_setup_conn failed");
                                 close(ts);
                                 kcp_map_safe_del(&cmap, nc->conv);
-                                release_proxy_conn_server(nc);
+                                conn_pool_release(&g_conn_pool, nc);
                                 continue;
                             }
 
@@ -943,7 +791,7 @@ int main(int argc, char **argv) {
                                           "response");
                                 close(nc->svr_sock);
                                 conn_limit_release(&ra);
-                                release_proxy_conn_server(nc);
+                                conn_pool_release(&g_conn_pool, nc);
                                 continue;
                             }
 
