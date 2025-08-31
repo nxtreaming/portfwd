@@ -10,6 +10,9 @@
 #include <string.h>
 #include <sys/file.h>
 #include <unistd.h>
+#include <netdb.h>
+#include <pwd.h>
+#include <grp.h>
 
 // For logging before daemonization or when syslog is not used
 #define P_LOG_ERR(fmt, ...) fprintf(stderr, "ERROR: " fmt "\n", ##__VA_ARGS__)
@@ -54,7 +57,7 @@ int do_daemonize(void) {
 }
 
 /* Setup signal handlers for graceful shutdown */
-int setup_shutdown_signals(void) {
+void init_signals(void) {
     struct sigaction sa;
 
     /* Block signals during handler execution */
@@ -217,5 +220,54 @@ int parse_common_args(int argc, char **argv, struct fwd_config *cfg) {
     }
 
     return optind;
+}
+
+void set_cloexec(int fd) {
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags != -1) {
+        fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+}
+
+void drop_privileges(const char *username) {
+    struct passwd *pw = getpwnam(username);
+    if (pw == NULL) {
+        P_LOG_ERR("getpwnam(\"%s\"): %s. User not found?", username, strerror(errno));
+        exit(1);
+    }
+    if (initgroups(username, pw->pw_gid) != 0) {
+        P_LOG_ERR("initgroups() failed: %s", strerror(errno));
+        exit(1);
+    }
+    if (setgid(pw->pw_gid) != 0) {
+        P_LOG_ERR("setgid() failed: %s", strerror(errno));
+        exit(1);
+    }
+    if (setuid(pw->pw_uid) != 0) {
+        P_LOG_ERR("setuid() failed: %s", strerror(errno));
+        exit(1);
+    }
+    P_LOG_INFO("Dropped privileges to user '%s'", username);
+}
+
+int resolve_address(union sockaddr_inx *addr, const char *host, const char *port_str) {
+    struct addrinfo hints, *res;
+    int status;
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;     // Allow IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM; // TCP socket
+
+    if ((status = getaddrinfo(host, port_str, &hints, &res)) != 0) {
+        P_LOG_ERR("getaddrinfo for %s:%s: %s", host, port_str, gai_strerror(status));
+        return -1;
+    }
+
+    // Copy the first result's address info
+    memcpy(addr, res->ai_addr, res->ai_addrlen);
+
+    freeaddrinfo(res); // Free the linked list
+
+    return 0;
 }
 

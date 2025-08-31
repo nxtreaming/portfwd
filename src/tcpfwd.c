@@ -815,17 +815,15 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         } else {
             P_LOG_ERR("connect() to %s: %s", sockaddr_to_string(dst_addr), strerror(errno));
             __sync_fetch_and_add(&g_stats.connect_errors, 1);
-            release_proxy_conn(conn, NULL, NULL, epfd);
-            continue;
         }
         __sync_fetch_and_add(&g_stats.total_accepted, 1);
         int64_t current = __sync_fetch_and_add(&g_stats.current_active, 1) + 1;
-        if (current > g_stats.peak_concurrent) g_stats.peak_concurrent = current;
-    }
+        if ((uint64_t)current > 0 && (uint64_t)current > g_stats.peak_concurrent) g_stats.peak_concurrent = (uint64_t)current;
 
     return 0;
 }
 
+{{ ... }}
 static void print_stats_summary(void) {
     // Implementation can be added here
 }

@@ -22,8 +22,10 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)/3rd/kcp
 	mkdir -p $(BUILD_DIR)/3rd/chacha20poly1305
 
-tcpfwd: $(BUILD_DIR)/tcpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o tcpfwd $(BUILD_DIR)/tcpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)
+FWD_OBJS = $(BUILD_DIR)/tcpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
+
+tcpfwd: $(FWD_OBJS)
+	$(CC) $(CFLAGS) -o tcpfwd $(FWD_OBJS) $(LDFLAGS)
 
 udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(NO_EPOLL_O) $(LDFLAGS)

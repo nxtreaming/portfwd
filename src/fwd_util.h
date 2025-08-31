@@ -75,13 +75,12 @@ struct conn_limiter {
 extern volatile sig_atomic_t g_shutdown_requested;
 
 // Setup signal handlers for graceful shutdown
-int setup_shutdown_signals(void);
+void init_signals(void);
 
 // PID file management
 int create_pid_file(const char *path);
 void cleanup_pidfile(void);
 int do_daemonize(void);
-void init_signals(void);
 void drop_privileges(const char *username);
 
 /**
