@@ -14,16 +14,59 @@
  * @brief Holds configuration options common to all forwarders.
  */
 struct fwd_config {
-    union sockaddr_inx src_addr;
+    union sockaddr_inx listen_addr;
     union sockaddr_inx dst_addr;
     const char *pidfile;
+    const char *username;
     bool daemonize;
-    bool reuse_addr;
-    bool reuse_port;
-    bool v6only;
-    bool base_addr_mode;
-    unsigned int max_per_ip; /* Max connections per source IP */
-    int max_total_connections; /* Max total connections */
+    bool transparent_proxy;
+    bool use_splice; /* zero-copy */
+
+    /* Connection limits */
+    int max_total_connections;
+    int max_per_ip_connections;
+
+    /* Keepalive settings */
+    int ka_idle;
+    int ka_intvl;
+    int ka_cnt;
+
+    /* Buffer sizes */
+    int sockbuf_size;
+    int backpressure_wm;
+
+    /* Timeouts */
+    int idle_timeout;
+};
+
+struct proxy_stats {
+    pthread_mutex_t lock;
+    time_t start_time;
+    time_t last_stats_report;
+    uint64_t total_connected;
+    uint64_t total_failed;
+    uint64_t total_accepted;
+    uint64_t current_active;
+    uint64_t peak_concurrent;
+    uint64_t bytes_sent;
+    uint64_t bytes_received;
+    uint64_t limit_rejections;
+    uint64_t connect_errors;
+};
+
+#define CONN_LIMIT_HASH_SIZE 256
+
+struct conn_limit_entry {
+    union sockaddr_inx addr;
+    uint32_t count;
+};
+
+struct conn_limiter {
+    pthread_mutex_t lock;
+    struct conn_limit_entry entries[CONN_LIMIT_HASH_SIZE];
+    uint32_t total_connections;
+    uint32_t max_total;
+    uint32_t max_per_ip;
 };
 
 // Global signal-safe flag for graceful shutdown
@@ -36,6 +79,8 @@ int setup_shutdown_signals(void);
 int create_pid_file(const char *path);
 void cleanup_pidfile(void);
 int do_daemonize(void);
+void init_signals(void);
+void drop_privileges(const char *username);
 
 /**
  * @brief Parses common command-line arguments and populates the config.

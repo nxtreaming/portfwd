@@ -36,6 +36,7 @@
 #include "common.h"
 #include "list.h"
 #include "proxy_conn.h"
+#include "conn_pool.h"
 #include "fwd_util.h"
 
 #ifdef __linux__
@@ -372,11 +373,8 @@ static void update_traffic_stats(uint64_t bytes_in, uint64_t bytes_out) {
 /* Connection Limiting */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-    return 0;
-}
-
 /* Initialize connection limiter */
-static int init_conn_limiter(int max_total, int max_per_ip) {
+static int init_conn_limiter(uint32_t max_total, uint32_t max_per_ip) {
     memset(&g_conn_limiter, 0, sizeof(g_conn_limiter));
 
     if (pthread_mutex_init(&g_conn_limiter.lock, NULL) != 0) {
@@ -505,10 +503,10 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
         safe_close(conn->cli_sock);
         conn->cli_sock = -1;
     }
-    if (conn->srv_sock >= 0) {
-        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->srv_sock, NULL);
-        safe_close(conn->srv_sock);
-        conn->srv_sock = -1;
+    if (conn->svr_sock >= 0) {
+        epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL);
+        safe_close(conn->svr_sock);
+        conn->svr_sock = -1;
     }
 
     free(conn->request.data);
@@ -562,7 +560,7 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     uint32_t cli_events = 0;
     uint32_t srv_events = 0;
 
-    if (conn->state != CONN_STATE_CONNECTED) return;
+    if (conn->state != S_FORWARDING) return;
 
     // Read from client if server buffer has space
     if (conn->response.dlen < g_backpressure_wm) cli_events |= EPOLLIN;
@@ -580,10 +578,10 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
 
     ev.events = srv_events | EPOLLET | EPOLLRDHUP;
     ev.data.ptr = (void *)conn->magic_server;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, conn->srv_sock, &ev);
+    epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &ev);
 }
 
-static int do_forward(struct proxy_conn *conn, int src_fd, int dst_fd, struct buffer *buf) {
+static int do_forward(struct proxy_conn *conn, int src_fd, int dst_fd, struct buffer_info *buf) {
     ssize_t n;
     if (buf->dlen > 0) {
         n = write(dst_fd, buf->data + buf->rpos, buf->dlen);
@@ -626,17 +624,17 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd, struct 
 
     if (magic == conn->magic_client) { // Event on client socket
         if (ev->events & EPOLLIN) {
-            if (do_forward(conn, conn->cli_sock, conn->srv_sock, &conn->request) < 0) return -1;
+            if (do_forward(conn, conn->cli_sock, conn->svr_sock, &conn->request) < 0) return -1;
         }
         if (ev->events & EPOLLOUT) {
-            if (do_forward(conn, conn->srv_sock, conn->cli_sock, &conn->response) < 0) return -1;
+            if (do_forward(conn, conn->svr_sock, conn->cli_sock, &conn->response) < 0) return -1;
         }
     } else if (magic == conn->magic_server) { // Event on server socket
         if (ev->events & EPOLLIN) {
-            if (do_forward(conn, conn->srv_sock, conn->cli_sock, &conn->response) < 0) return -1;
+            if (do_forward(conn, conn->svr_sock, conn->cli_sock, &conn->response) < 0) return -1;
         }
         if (ev->events & EPOLLOUT) {
-            if (do_forward(conn, conn->cli_sock, conn->srv_sock, &conn->request) < 0) return -1;
+            if (do_forward(conn, conn->cli_sock, conn->svr_sock, &conn->request) < 0) return -1;
         }
     }
 
@@ -649,7 +647,7 @@ static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
     int err = 0;
     socklen_t len = sizeof(err);
 
-    if ((ev->events & (EPOLLERR | EPOLLHUP)) || (getsockopt(conn->srv_sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0)) {
+    if ((ev->events & (EPOLLERR | EPOLLHUP)) || (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0)) {
         P_LOG_WARN("Server connection failed: %s", strerror(err == 0 ? ETIMEDOUT : err));
         __sync_fetch_and_add(&g_stats.connect_errors, 1);
         release_proxy_conn(conn, NULL, NULL, epfd);
@@ -657,7 +655,7 @@ static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
     }
 
     P_LOG_INFO("Server connection established for client %s", sockaddr_to_string(&conn->cli_addr));
-    conn->state = CONN_STATE_CONNECTED;
+    conn->state = S_FORWARDING;
     update_connection_stats(true, false);
 
     struct epoll_event cli_ev, srv_ev;
@@ -667,7 +665,7 @@ static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
 
     srv_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
     srv_ev.data.ptr = (void *)conn->magic_server;
-    epoll_ctl(epfd, EPOLL_CTL_MOD, conn->srv_sock, &srv_ev);
+    epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &srv_ev);
 }
 
 static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg) {
@@ -696,9 +694,9 @@ static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg) 
                 }
             } else if (ptr >= MIN_VALID_POINTER) {
                 struct proxy_conn *conn = (struct proxy_conn *)(ptr & ~0xFU);
-                if (conn->state == CONN_STATE_CONNECTING) {
+                if (conn->state == S_SERVER_CONNECTING) {
                     handle_server_connecting(conn, i, epfd, ev);
-                } else if (conn->state == CONN_STATE_CONNECTED) {
+                } else if (conn->state == S_FORWARDING) {
                     if (handle_forwarding(conn, i, epfd, ev) < 0) {
                         release_proxy_conn(conn, events, &num_events, epfd);
                     }
@@ -755,7 +753,7 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
 
         memset(conn, 0, sizeof(*conn));
         conn->cli_sock = cli_sock;
-        conn->srv_sock = -1;
+        conn->svr_sock = -1;
         conn->magic_client = (uintptr_t)conn | EV_MAGIC_CLIENT;
         conn->magic_server = (uintptr_t)conn | EV_MAGIC_SERVER;
         conn->last_active = time(NULL);
@@ -777,17 +775,17 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         }
 #endif
 
-        conn->srv_sock = socket(dst_addr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-        if (conn->srv_sock < 0) {
-            P_LOG_ERR("socket(srv_sock): %s", strerror(errno));
+        conn->svr_sock = socket(dst_addr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        if (conn->svr_sock < 0) {
+            P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
             release_proxy_conn(conn, NULL, NULL, epfd);
             continue;
         }
 
-        set_sock_buffers(conn->srv_sock);
+        set_sock_buffers(conn->svr_sock);
 
-        if (connect(conn->srv_sock, &dst_addr->sa, sizeof_sockaddr(dst_addr)) == 0) {
-            conn->state = CONN_STATE_CONNECTED;
+        if (connect(conn->svr_sock, &dst_addr->sa, sizeof_sockaddr(dst_addr)) == 0) {
+            conn->state = S_FORWARDING;
             update_connection_stats(true, false);
             struct epoll_event cli_ev, srv_ev;
             cli_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
@@ -795,12 +793,12 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
             epoll_ctl(epfd, EPOLL_CTL_ADD, conn->cli_sock, &cli_ev);
             srv_ev.events = EPOLLIN | EPOLLET | EPOLLRDHUP;
             srv_ev.data.ptr = (void *)conn->magic_server;
-            epoll_ctl(epfd, EPOLL_CTL_ADD, conn->srv_sock, &srv_ev);
+            epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &srv_ev);
         } else if (errno == EINPROGRESS) {
-            conn->state = CONN_STATE_CONNECTING;
+            conn->state = S_SERVER_CONNECTING;
             struct epoll_event ev = { .events = EPOLLOUT | EPOLLIN | EPOLLET, .data.ptr = (void*)conn };
-            if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->srv_sock, &ev) < 0) {
-                P_LOG_ERR("epoll_ctl(ADD, srv_sock): %s", strerror(errno));
+            if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
+                P_LOG_ERR("epoll_ctl(ADD, svr_sock): %s", strerror(errno));
                 release_proxy_conn(conn, NULL, NULL, epfd);
                 continue;
             }
@@ -946,13 +944,13 @@ int main(int argc, char **argv) {
     g_backpressure_wm = g_cfg.backpressure_wm;
 
     if (g_cfg.daemonize) {
-        daemonize();
+        do_daemonize();
     }
 
     init_signals();
 
     if (g_cfg.pidfile) {
-        create_pidfile(g_cfg.pidfile);
+        cleanup_pidfile();
     }
 
     if (init_stats() != 0) {
