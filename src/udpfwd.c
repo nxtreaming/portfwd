@@ -1493,9 +1493,9 @@ int main(int argc, char *argv[]) {
             unsigned long v = strtoul(optarg, &end, 10);
             if (end == optarg || *end != '\0' || v == 0) {
                 P_LOG_WARN("invalid -i value '%s', keeping default %u", optarg,
-                           g_cfg.max_conns_per_ip);
+                           g_cfg.max_per_ip_connections);
             } else {
-                g_cfg.max_conns_per_ip = (unsigned)v;
+                g_cfg.max_per_ip_connections = (unsigned)v;
             }
             break;
         }
