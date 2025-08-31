@@ -45,7 +45,7 @@
 #define HASH_TABLE_SIZE 1024
 #define MAX_CONV_GENERATION_ATTEMPTS 100
 
-/* Security structures */
+/* Security structures defined in fwd_util.h */
 
 struct cfg_server {
     union sockaddr_inx laddr; /* UDP listen address */
@@ -63,13 +63,53 @@ struct cfg_server {
     const char *pidfile;
 };
 
+/* Thread-safe KCP map wrapper */
+struct kcp_map_safe {
+    struct kcp_map map;
+    pthread_rwlock_t lock;
+};
+
+struct conn_pool g_conn_pool;
+static const size_t DEFAULT_CONN_POOL_SIZE = 2048;
+
 /* Global security objects */
+static struct rate_limiter g_rate_limiter = {0};
 static struct conn_limiter g_conn_limiter = {0};
 
 /* Forward declarations */
 static void conn_cleanup_server(struct proxy_conn *conn, int epfd,
                                 struct kcp_map_safe *cmap);
-static void remove_pid_file(const char *pidfile);
+static void remove_pid_file(const char *pidfile) {
+    if (pidfile) {
+        if (unlink(pidfile) != 0) {
+            P_LOG_WARN("Failed to remove pidfile '%s': %s", pidfile, strerror(errno));
+        }
+    }
+}
+
+static void print_usage(const char *prog) {
+    printf("Usage: %s [options] <listen-addr> <target-addr>\n", prog);
+    printf("Options:\n");
+    printf("  -h, --help                 Show this help message\n");
+    printf("  -K, --psk <key>            Pre-shared key for AEAD encryption (required)\n");
+    printf("  --pidfile <path>           Path to PID file\n");
+    printf("  --daemonize                Run as a daemon\n");
+    printf("  --reuse-addr               Enable SO_REUSEADDR\n");
+    printf("  --reuse-port               Enable SO_REUSEPORT\n");
+    printf("  --v6only                   Enable IPV6_V6ONLY\n");
+    printf("  --sockbuf <bytes>          Set socket buffer size (SO_SNDBUF/SO_RCVBUF)\n");
+    printf("  --tcp-nodelay              Enable TCP_NODELAY on target connection\n");
+    printf("  --hs-jitter-min <ms>       Min handshake response jitter (default: 0)\n");
+    printf("  --hs-jitter-max <ms>       Max handshake response jitter (default: 0)\n");
+    printf("KCP Options:\n");
+    printf("  --kcp-mtu <mtu>            Set KCP MTU (default: 1400)\n");
+    printf("  --kcp-nodelay <0|1>        Set KCP nodelay mode\n");
+    printf("  --kcp-interval <ms>        Set KCP interval\n");
+    printf("  --kcp-resend <0|1|2>       Set KCP resend mode\n");
+    printf("  --kcp-nc <0|1>             Set KCP congestion control\n");
+    printf("  --kcp-sndwnd <wnd>         Set KCP send window size\n");
+    printf("  --kcp-rcvwnd <wnd>         Set KCP receive window size\n");
+}
 static uint32_t generate_secure_conv(void);
 static bool rate_limit_check_addr(const union sockaddr_inx *addr);
 static bool conn_limit_check(const union sockaddr_inx *addr);
@@ -80,19 +120,13 @@ static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,
 static uint32_t derive_conv_from_psk_token(const uint8_t psk[32],
                                            const uint8_t token[16]);
 
-/* Thread-safe KCP map operations */
-static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets);
-static void kcp_map_safe_free(struct kcp_map_safe *cmap);
-static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap,
-                                           uint32_t conv);
-static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv,
-                            struct proxy_conn *c);
-static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
 
 /* Enhanced error handling */
 #define LOG_CONN_ERR(conn, fmt, ...)                                           \
     P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,           \
               ##__VA_ARGS__)
+
+/* Enhanced error handling functions */
 
 #define LOG_CONN_WARN(conn, fmt, ...)                                          \
     P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,          \
@@ -102,7 +136,6 @@ static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
     P_LOG_INFO("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,          \
                ##__VA_ARGS__)
 
-static int handle_system_error(const char *operation, int error_code);
 
 /* Safe epoll add/modify wrapper for server */
 static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,
@@ -270,7 +303,7 @@ static bool conn_limit_check(const union sockaddr_inx *addr) {
 
     /* Check per-IP connection limit */
     size_t hash = addr_hash(addr) % HASH_TABLE_SIZE;
-    struct conn_limiter_entry *entry = &g_conn_limiter.ip_counts[hash];
+        struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
 
     if (!is_sockaddr_inx_equal(&entry->addr, addr)) {
         /* New address */
@@ -298,7 +331,7 @@ static void conn_limit_release(const union sockaddr_inx *addr) {
     pthread_mutex_lock(&g_conn_limiter.lock);
 
     size_t hash = addr_hash(addr) % HASH_TABLE_SIZE;
-    struct conn_limiter_entry *entry = &g_conn_limiter.ip_counts[hash];
+        struct conn_limit_entry *entry = &g_conn_limiter.entries[hash];
 
     if (is_sockaddr_inx_equal(&entry->addr, addr) && entry->count > 0) {
         entry->count--;
@@ -333,17 +366,6 @@ static uint32_t generate_secure_conv(void) {
     return conv;
 }
 
-/* Thread-safe KCP map operations */
-static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets);
-static void kcp_map_safe_free(struct kcp_map_safe *cmap);
-static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap,
-                                           uint32_t conv);
-static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv,
-                            struct proxy_conn *c);
-static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
-
-/* Enhanced error handling functions */
-static int handle_system_error(const char *operation, int error_code);
 
 static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets) {
     if (!cmap)
