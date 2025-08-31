@@ -434,7 +434,7 @@ static bool check_connection_limit(const union sockaddr_inx *addr) {
         if (entry->count > 0) {
             if (is_sockaddr_inx_equal(&entry->addr, addr)) {
                 /* Same IP */
-                if (entry->count >= g_conn_limiter.max_per_ip) {
+                if (entry->count >= (uint32_t)g_conn_limiter.max_per_ip) {
                     pthread_mutex_unlock(&g_conn_limiter.lock);
                     P_LOG_WARN("Per-IP connection limit reached for %s (%d "
                                "connections)",
@@ -573,12 +573,12 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     if (conn->state != S_FORWARDING) return;
 
     // Read from client if server buffer has space
-    if (conn->response.dlen < g_backpressure_wm) cli_events |= EPOLLIN;
+    if (conn->response.dlen < (size_t)g_backpressure_wm) cli_events |= EPOLLIN;
     // Write to client if we have data for it
     if (conn->response.dlen > 0) srv_events |= EPOLLOUT;
 
     // Read from server if client buffer has space
-    if (conn->request.dlen < g_backpressure_wm) srv_events |= EPOLLIN;
+    if (conn->request.dlen < (size_t)g_backpressure_wm) srv_events |= EPOLLIN;
     // Write to server if we have data for it
     if (conn->request.dlen > 0) cli_events |= EPOLLOUT;
 
@@ -819,9 +819,12 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
             continue;
         }
         __sync_fetch_and_add(&g_stats.total_accepted, 1);
-        uint64_t current = __sync_fetch_and_add(&g_stats.current_active, 1) + 1;
+        int64_t current = __sync_fetch_and_add(&g_stats.current_active, 1) + 1;
         if (current > g_stats.peak_concurrent) g_stats.peak_concurrent = current;
     }
+
+    return 0;
+}
 
 static void print_stats_summary(void) {
     // Implementation can be added here
