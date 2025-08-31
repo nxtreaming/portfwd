@@ -18,6 +18,9 @@
 // Global signal-safe flag for graceful shutdown
 volatile sig_atomic_t g_shutdown_requested = 0;
 
+// Forward declaration
+static int resolve_address(union sockaddr_inx *addr, const char *host, const char *port_str);
+
 /* Signal-safe shutdown handler */
 static void handle_shutdown_signal(int sig) {
     (void)sig; /* Unused parameter */
@@ -244,6 +247,61 @@ void drop_privileges(const char *username) {
         exit(1);
     }
     P_LOG_INFO("Dropped privileges to user '%s'", username);
+}
+
+int get_sockaddr_inx(const char *str, union sockaddr_inx *addr, bool is_source) {
+    char *host, *port_str;
+    char *dup = strdup(str);
+    if (!dup) {
+        P_LOG_ERR("strdup failed");
+        return -1;
+    }
+
+    if (*dup == '[') {
+        host = dup + 1;
+        char *end = strchr(host, ']');
+        if (!end) {
+            P_LOG_ERR("Invalid IPv6 address format: missing ']'");
+            free(dup);
+            return -1;
+        }
+        *end = '\0';
+        port_str = end + 1;
+        if (*port_str != ':') {
+            P_LOG_ERR("Invalid IPv6 address format: missing ':' after ']' ");
+            free(dup);
+            return -1;
+        }
+        port_str++;
+    } else {
+        host = dup;
+        port_str = strrchr(dup, ':');
+        if (!port_str) {
+            if (is_source) {
+                 P_LOG_ERR("Source address requires a port.");
+                 free(dup);
+                 return -1;
+            }
+            port_str = "0"; // Destination port can be 0
+        } else {
+            *port_str = '\0';
+            port_str++;
+        }
+    }
+
+    if (strlen(host) == 0) {
+        if (is_source) {
+            host = "0.0.0.0";
+        } else {
+            P_LOG_ERR("Destination address requires a host.");
+            free(dup);
+            return -1;
+        }
+    }
+
+    int rc = resolve_address(addr, host, port_str);
+    free(dup);
+    return rc;
 }
 
 int resolve_address(union sockaddr_inx *addr, const char *host, const char *port_str) {
