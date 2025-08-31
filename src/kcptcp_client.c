@@ -31,23 +31,21 @@
 #include <pthread.h>
 
 /* Configuration constants */
-#define DEFAULT_KEEPALIVE_INTERVAL_MS  30000
-#define DEFAULT_IDLE_TIMEOUT_SEC        180
-#define DEFAULT_EPOLL_MAX_EVENTS        256
-#define DEFAULT_REKEY_TIMEOUT_MS        10000
-#define MIN_BUFFER_SIZE                 4096
-#define UDP_RECV_BUFFER_SIZE            (64 * 1024)
+#define DEFAULT_KEEPALIVE_INTERVAL_MS 30000
+#define DEFAULT_IDLE_TIMEOUT_SEC 180
+#define DEFAULT_EPOLL_MAX_EVENTS 256
+#define DEFAULT_REKEY_TIMEOUT_MS 10000
+#define MIN_BUFFER_SIZE 4096
+#define UDP_RECV_BUFFER_SIZE (64 * 1024)
 
 /* Error handling macros */
-#define LOG_CONN_ERR(conn, fmt, ...) \
-    P_LOG_ERR("conv=%u state=%d: " fmt, \
-              (conn)->conv, (conn)->state, ##__VA_ARGS__)
+#define LOG_CONN_ERR(conn, fmt, ...)                                           \
+    P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,           \
+              ##__VA_ARGS__)
 
-#define LOG_CONN_WARN(conn, fmt, ...) \
-    P_LOG_WARN("conv=%u state=%d: " fmt, \
-               (conn)->conv, (conn)->state, ##__VA_ARGS__)
-
-
+#define LOG_CONN_WARN(conn, fmt, ...)                                          \
+    P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,          \
+               ##__VA_ARGS__)
 
 /* Rate limiting structure */
 struct rate_limiter {
@@ -59,20 +57,22 @@ struct rate_limiter {
 
 /* Connection pool for performance optimization */
 struct conn_pool {
-    struct proxy_conn *connections;  /* Pre-allocated connection array */
-    struct proxy_conn *freelist;     /* Linked list of available connections */
-    int capacity;                    /* Total pool capacity */
-    int used_count;                  /* Currently allocated connections */
-    int high_water_mark;             /* Peak usage for monitoring */
-    pthread_mutex_t lock;            /* Thread safety mutex */
-    pthread_cond_t available;        /* Condition variable for blocking allocation */
+    struct proxy_conn *connections; /* Pre-allocated connection array */
+    struct proxy_conn *freelist;    /* Linked list of available connections */
+    int capacity;                   /* Total pool capacity */
+    int used_count;                 /* Currently allocated connections */
+    int high_water_mark;            /* Peak usage for monitoring */
+    pthread_mutex_t lock;           /* Thread safety mutex */
+    pthread_cond_t available; /* Condition variable for blocking allocation */
 };
 
 /* Forward declarations for basic helper functions */
 static void secure_zero(void *ptr, size_t len);
 static bool rate_limit_check(struct rate_limiter *rl);
-static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
-                                      const uint8_t *initial_data, size_t initial_data_len,
+static int generate_stealth_handshake(struct proxy_conn *conn,
+                                      const uint8_t *psk, bool has_psk,
+                                      const uint8_t *initial_data,
+                                      size_t initial_data_len,
                                       unsigned char *out_buf, size_t *out_len);
 
 /* Connection pool management functions */
@@ -113,16 +113,22 @@ struct client_ctx {
     struct cfg_client *cfg;
     struct kcp_opts *kopts;
     struct list_head *conns;
-    struct rate_limiter handshake_limiter;  /* Rate limit handshake attempts */
+    struct rate_limiter handshake_limiter; /* Rate limit handshake attempts */
 };
 
 /* Functions that need struct client_ctx */
 static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn);
-static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn, const char *operation);
-static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf, size_t ubuf_size, bool *fed_kcp);
-static int handle_stealth_handshake_response(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len);
-static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen);
-static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss);
+static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn,
+                              const char *operation);
+static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c,
+                              char *ubuf, size_t ubuf_size, bool *fed_kcp);
+static int handle_stealth_handshake_response(struct client_ctx *ctx,
+                                             struct proxy_conn *c,
+                                             const char *buf, size_t len);
+static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c,
+                             char *payload, int plen);
+static int validate_udp_source(struct proxy_conn *c,
+                               const struct sockaddr_storage *rss);
 
 /* Global connection pool */
 static struct conn_pool g_conn_pool = {0};
@@ -154,15 +160,13 @@ struct perf_counters {
 static struct perf_counters g_perf = {0};
 
 /* Enhanced logging macros with context */
-#define LOG_PERF_INFO(fmt, ...) \
-    P_LOG_INFO("[PERF] " fmt, ##__VA_ARGS__)
+#define LOG_PERF_INFO(fmt, ...) P_LOG_INFO("[PERF] " fmt, ##__VA_ARGS__)
 
-#define LOG_CONN_DEBUG(conn, fmt, ...) \
-    P_LOG_DEBUG("conv=%u state=%d: " fmt, \
-                (conn)->conv, (conn)->state, ##__VA_ARGS__)
+#define LOG_CONN_DEBUG(conn, fmt, ...)                                         \
+    P_LOG_DEBUG("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,         \
+                ##__VA_ARGS__)
 
-#define LOG_STATS_INFO(fmt, ...) \
-    P_LOG_INFO("[STATS] " fmt, ##__VA_ARGS__)
+#define LOG_STATS_INFO(fmt, ...) P_LOG_INFO("[STATS] " fmt, ##__VA_ARGS__)
 
 static void client_handle_accept(struct client_ctx *ctx);
 static void client_handle_udp_events(struct client_ctx *ctx,
@@ -170,25 +174,29 @@ static void client_handle_udp_events(struct client_ctx *ctx,
 static void client_handle_tcp_events(struct client_ctx *ctx,
                                      struct proxy_conn *c, uint32_t evmask);
 
-/* Compute per-port aggregation profile. Returns effective min/max ms and max bytes.
- * Heuristics:
+/* Compute per-port aggregation profile. Returns effective min/max ms and max
+ * bytes. Heuristics:
  *  - SSH-like (22, 2222): no aggregation, low embed cap (e.g., 256-512)
- *  - Web-like (80, 8080, 443, 8443): modest aggregation window (30-100ms), larger embed
+ *  - Web-like (80, 8080, 443, 8443): modest aggregation window (30-100ms),
+ * larger embed
  *  - RDP/VNC (3389, 5900): very small aggregation (0-20ms), moderate embed
  *  - Default: use cfg values
  */
-static void compute_agg_profile(const struct cfg_client *cfg, uint16_t listen_port,
-                                uint32_t *out_min_ms, uint32_t *out_max_ms,
-                                uint32_t *out_max_bytes) {
+static void compute_agg_profile(const struct cfg_client *cfg,
+                                uint16_t listen_port, uint32_t *out_min_ms,
+                                uint32_t *out_max_ms, uint32_t *out_max_bytes) {
     uint32_t min_ms = cfg->agg_min_ms;
     uint32_t max_ms = cfg->agg_max_ms;
     uint32_t max_bytes = cfg->agg_max_bytes;
 
     /* If profile OFF: use baseline and return */
     if (cfg->agg_profile_mode == 0) {
-        if (out_min_ms) *out_min_ms = min_ms;
-        if (out_max_ms) *out_max_ms = max_ms;
-        if (out_max_bytes) *out_max_bytes = max_bytes;
+        if (out_min_ms)
+            *out_min_ms = min_ms;
+        if (out_max_ms)
+            *out_max_ms = max_ms;
+        if (out_max_bytes)
+            *out_max_bytes = max_bytes;
         return;
     }
 
@@ -198,10 +206,14 @@ static void compute_agg_profile(const struct cfg_client *cfg, uint16_t listen_po
             if (cfg->noagg_ports[i] == listen_port) {
                 min_ms = 0;
                 max_ms = 0;
-                if (max_bytes > 512) max_bytes = 512;
-                if (out_min_ms) *out_min_ms = min_ms;
-                if (out_max_ms) *out_max_ms = max_ms;
-                if (out_max_bytes) *out_max_bytes = max_bytes;
+                if (max_bytes > 512)
+                    max_bytes = 512;
+                if (out_min_ms)
+                    *out_min_ms = min_ms;
+                if (out_max_ms)
+                    *out_max_ms = max_ms;
+                if (out_max_bytes)
+                    *out_max_bytes = max_bytes;
                 return;
             }
         }
@@ -213,14 +225,17 @@ static void compute_agg_profile(const struct cfg_client *cfg, uint16_t listen_po
     case 2222:
         min_ms = 0;
         max_ms = 0;
-        if (max_bytes > 512) max_bytes = 512;
+        if (max_bytes > 512)
+            max_bytes = 512;
         break;
     case 80:
     case 8080:
     case 443:
     case 8443:
-        if (min_ms < 30) min_ms = 30;
-        if (max_ms < 100) max_ms = 100;
+        if (min_ms < 30)
+            min_ms = 30;
+        if (max_ms < 100)
+            max_ms = 100;
         if (max_bytes < 1200) {
             /* keep user's smaller cap */
         } else {
@@ -229,29 +244,39 @@ static void compute_agg_profile(const struct cfg_client *cfg, uint16_t listen_po
         break;
     case 3389: /* RDP */
     case 5900: /* VNC */
-        if (max_ms > 20) max_ms = 20;
-        if (min_ms > max_ms) min_ms = max_ms;
-        if (max_bytes > 768) max_bytes = 768;
+        if (max_ms > 20)
+            max_ms = 20;
+        if (min_ms > max_ms)
+            min_ms = max_ms;
+        if (max_bytes > 768)
+            max_bytes = 768;
         break;
     default:
         break;
     }
-    if (out_min_ms) *out_min_ms = min_ms;
-    if (out_max_ms) *out_max_ms = max_ms;
-    if (out_max_bytes) *out_max_bytes = max_bytes;
+    if (out_min_ms)
+        *out_min_ms = min_ms;
+    if (out_max_ms)
+        *out_max_ms = max_ms;
+    if (out_max_bytes)
+        *out_max_bytes = max_bytes;
 }
 
 /* Parse CSV of port numbers into array */
 static int parse_ports_csv(const char *csv, uint16_t *arr, int max, int *outn) {
-    if (!csv || !arr || max <= 0 || !outn) return -1;
+    if (!csv || !arr || max <= 0 || !outn)
+        return -1;
     int n = 0;
     const char *p = csv;
     while (*p) {
-        while (*p == ',' || *p == ' ' || *p == '\t') p++;
-        if (!*p) break;
+        while (*p == ',' || *p == ' ' || *p == '\t')
+            p++;
+        if (!*p)
+            break;
         char *end = NULL;
         long v = strtol(p, &end, 10);
-        if (end == p) break;
+        if (end == p)
+            break;
         if (v >= 0 && v <= 65535) {
             if (n < max) {
                 arr[n++] = (uint16_t)v;
@@ -265,15 +290,17 @@ static int parse_ports_csv(const char *csv, uint16_t *arr, int max, int *outn) {
 
 /* Safe memory management functions */
 static void secure_zero(void *ptr, size_t len) {
-    if (!ptr || len == 0) return;
+    if (!ptr || len == 0)
+        return;
     volatile unsigned char *p = ptr;
-    while (len--) *p++ = 0;
+    while (len--)
+        *p++ = 0;
 }
-
 
 /* Unified connection cleanup function */
 static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn) {
-    if (!conn) return;
+    if (!conn)
+        return;
 
     P_LOG_DEBUG("Cleaning up connection conv=%u", conn->conv);
 
@@ -309,7 +336,8 @@ static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn) {
     if (conn->udp_backlog.data) {
         free(conn->udp_backlog.data);
         conn->udp_backlog.data = NULL;
-        conn->udp_backlog.capacity = conn->udp_backlog.dlen = conn->udp_backlog.rpos = 0;
+        conn->udp_backlog.capacity = conn->udp_backlog.dlen =
+            conn->udp_backlog.rpos = 0;
     }
 
     /* Clean up epoll tags */
@@ -338,9 +366,11 @@ static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn) {
 }
 
 /* Handle epoll operation errors with proper cleanup */
-static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn, const char *operation) {
+static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn,
+                              const char *operation) {
     (void)ctx; /* Unused parameter */
-    if (!conn || !operation) return -1;
+    if (!conn || !operation)
+        return -1;
 
     LOG_CONN_ERR(conn, "epoll %s failed: %s", operation, strerror(errno));
     conn->state = S_CLOSING;
@@ -348,7 +378,8 @@ static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn, c
 }
 
 /* Safe epoll add/modify with error handling */
-static int safe_epoll_mod(struct client_ctx *ctx, int fd, struct epoll_event *ev, struct proxy_conn *conn) {
+static int safe_epoll_mod(struct client_ctx *ctx, int fd,
+                          struct epoll_event *ev, struct proxy_conn *conn) {
     if (ep_add_or_mod(ctx->epfd, fd, ev) < 0) {
         return handle_epoll_error(ctx, conn, "modify");
     }
@@ -357,7 +388,8 @@ static int safe_epoll_mod(struct client_ctx *ctx, int fd, struct epoll_event *ev
 
 /* Rate limiting implementation */
 static bool rate_limit_check(struct rate_limiter *rl) {
-    if (!rl) return true;
+    if (!rl)
+        return true;
 
     time_t now = time(NULL);
     if (now - rl->window_start >= (time_t)rl->window_size_sec) {
@@ -371,13 +403,14 @@ static bool rate_limit_check(struct rate_limiter *rl) {
     return true;
 }
 
-
-
 /* Generate stealth handshake first packet */
-static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
-                                      const uint8_t *initial_data, size_t initial_data_len,
+static int generate_stealth_handshake(struct proxy_conn *conn,
+                                      const uint8_t *psk, bool has_psk,
+                                      const uint8_t *initial_data,
+                                      size_t initial_data_len,
                                       unsigned char *out_buf, size_t *out_len) {
-    if (!conn || !out_buf || !out_len) return -1;
+    if (!conn || !out_buf || !out_len)
+        return -1;
 
     /* Only support PSK version now */
     if (!has_psk || !psk) {
@@ -386,8 +419,9 @@ static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *ps
     }
 
     /* Create stealth handshake packet with embedded payload */
-    if (stealth_handshake_create_first_packet(psk, conn->hs_token, initial_data, initial_data_len,
-                                              out_buf, out_len) != 0) {
+    if (stealth_handshake_create_first_packet(psk, conn->hs_token, initial_data,
+                                              initial_data_len, out_buf,
+                                              out_len) != 0) {
         P_LOG_ERR("Failed to create stealth handshake packet");
         return -1;
     }
@@ -398,7 +432,8 @@ static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *ps
 /* Connection pool management implementation */
 static int init_conn_pool(void) {
     g_conn_pool.capacity = DEFAULT_CONN_POOL_SIZE;
-    g_conn_pool.connections = malloc(sizeof(struct proxy_conn) * (size_t)g_conn_pool.capacity);
+    g_conn_pool.connections =
+        malloc(sizeof(struct proxy_conn) * (size_t)g_conn_pool.capacity);
     if (!g_conn_pool.connections) {
         P_LOG_ERR("Failed to allocate connection pool");
         return -1;
@@ -429,7 +464,8 @@ static int init_conn_pool(void) {
     g_conn_pool.used_count = 0;
     g_conn_pool.high_water_mark = 0;
 
-    P_LOG_INFO("Connection pool initialized with %d connections", g_conn_pool.capacity);
+    P_LOG_INFO("Connection pool initialized with %d connections",
+               g_conn_pool.capacity);
     return 0;
 }
 
@@ -500,7 +536,8 @@ static void release_proxy_conn_to_pool(struct proxy_conn *conn) {
 }
 
 /* Validate UDP source address matches expected peer */
-static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss) {
+static int validate_udp_source(struct proxy_conn *c,
+                               const struct sockaddr_storage *rss) {
     union sockaddr_inx ra;
     memset(&ra, 0, sizeof(ra));
 
@@ -528,7 +565,9 @@ static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_stora
 }
 
 /* Handle stealth handshake response */
-static int handle_stealth_handshake_response(struct client_ctx *ctx, struct proxy_conn *c, const char *buf, size_t len) {
+static int handle_stealth_handshake_response(struct client_ctx *ctx,
+                                             struct proxy_conn *c,
+                                             const char *buf, size_t len) {
     uint32_t conv;
     bool valid_response = false;
 
@@ -540,7 +579,8 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
 
     /* Try to parse as stealth handshake response */
     struct stealth_handshake_response response;
-    if (stealth_handshake_parse_response(ctx->cfg->psk, (const uint8_t *)buf, len, &response) != 0) {
+    if (stealth_handshake_parse_response(ctx->cfg->psk, (const uint8_t *)buf,
+                                         len, &response) != 0) {
         LOG_CONN_WARN(c, "Failed to parse stealth handshake response; ignore");
         return 1; /* Continue processing other packets */
     }
@@ -582,7 +622,8 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
         }
     }
 
-    if (kcp_setup_conn(c, c->udp_sock, &c->peer_addr, c->conv, ctx->kopts) != 0) {
+    if (kcp_setup_conn(c, c->udp_sock, &c->peer_addr, c->conv, ctx->kopts) !=
+        0) {
         P_LOG_ERR("kcp_setup_conn failed after ACCEPT");
         return -1; /* Error: close connection */
     }
@@ -598,8 +639,9 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
     /* Flush any buffered request data */
     if (c->request.dlen > c->request.rpos) {
         size_t remain = c->request.dlen - c->request.rpos;
-        if (aead_protocol_send_data(c, c->request.data + c->request.rpos, (int)remain,
-                                    ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+        if (aead_protocol_send_data(c, c->request.data + c->request.rpos,
+                                    (int)remain, ctx->cfg->psk,
+                                    ctx->cfg->has_psk) < 0) {
             return -1; /* Error: close connection */
         }
         c->request.rpos = c->request.dlen; /* consumed */
@@ -616,7 +658,8 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
 }
 
 /* Handle KCP data forwarding to TCP */
-static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen) {
+static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c,
+                             char *payload, int plen) {
     if (!payload || plen <= 0) {
         return 0; /* Continue processing */
     }
@@ -628,8 +671,10 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Backpressure: buffer and enable EPOLLOUT */
             size_t need = c->response.dlen + (size_t)plen;
-            if (ensure_buffer_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
-                P_LOG_WARN("Response buffer size limit exceeded, closing connection");
+            if (ensure_buffer_capacity(&c->response, need,
+                                       MAX_TCP_BUFFER_SIZE) < 0) {
+                P_LOG_WARN(
+                    "Response buffer size limit exceeded, closing connection");
                 return -1; /* Error: close connection */
             }
             memcpy(c->response.data + c->response.dlen, payload, (size_t)plen);
@@ -649,8 +694,10 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
         /* Short write: buffer remaining and enable EPOLLOUT */
         size_t rem = (size_t)plen - (size_t)wn;
         size_t need = c->response.dlen + rem;
-        if (ensure_buffer_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
-            P_LOG_WARN("Response buffer size limit exceeded, closing connection");
+        if (ensure_buffer_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) <
+            0) {
+            P_LOG_WARN(
+                "Response buffer size limit exceeded, closing connection");
             return -1; /* Error: close connection */
         }
         memcpy(c->response.data + c->response.dlen, payload + wn, rem);
@@ -675,7 +722,8 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
 }
 
 /* Handle UDP packet reception and processing */
-static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf, size_t ubuf_size, bool *fed_kcp) {
+static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c,
+                              char *ubuf, size_t ubuf_size, bool *fed_kcp) {
     for (;;) {
         struct sockaddr_storage rss;
         socklen_t rlen = sizeof(rss);
@@ -704,14 +752,16 @@ static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char
 
         /* Stealth handshake response path */
         if (!c->kcp_ready && rn >= 28) { /* Minimum size for encrypted packet */
-            int result = handle_stealth_handshake_response(ctx, c, ubuf, (size_t)rn);
+            int result =
+                handle_stealth_handshake_response(ctx, c, ubuf, (size_t)rn);
             if (result < 0) {
                 return -1; /* Error: close connection */
             } else if (result == 0) {
                 /* Successfully processed stealth handshake response */
                 continue;
             }
-            /* If result == 1, it's not a handshake response, continue to KCP processing */
+            /* If result == 1, it's not a handshake response, continue to KCP
+             * processing */
         }
 
         if (!c->kcp_ready) {
@@ -745,7 +795,8 @@ static void dump_performance_stats(void) {
         return;
     }
 
-    LOG_STATS_INFO("=== Performance Statistics (uptime: %ld seconds) ===", uptime);
+    LOG_STATS_INFO("=== Performance Statistics (uptime: %ld seconds) ===",
+                   uptime);
     LOG_STATS_INFO("Connections: total=%llu active=%llu failed=%llu",
                    (unsigned long long)g_perf.total_connections,
                    (unsigned long long)g_perf.active_connections,
@@ -766,14 +817,16 @@ static void dump_performance_stats(void) {
                    (unsigned long long)g_perf.tcp_connections_accepted);
     LOG_STATS_INFO("KCP: packets_processed=%llu",
                    (unsigned long long)g_perf.kcp_packets_processed);
-    LOG_STATS_INFO("System: buffer_expansions=%llu epoll_errors=%llu rate_limit_drops=%llu",
+    LOG_STATS_INFO("System: buffer_expansions=%llu epoll_errors=%llu "
+                   "rate_limit_drops=%llu",
                    (unsigned long long)g_perf.buffer_expansions,
                    (unsigned long long)g_perf.epoll_errors,
                    (unsigned long long)g_perf.rate_limit_drops);
 
     /* Connection pool statistics */
     if (g_conn_pool.capacity > 0) {
-        double pool_utilization = (double)g_conn_pool.used_count / g_conn_pool.capacity * 100.0;
+        double pool_utilization =
+            (double)g_conn_pool.used_count / g_conn_pool.capacity * 100.0;
         LOG_STATS_INFO("Pool: used=%d/%d (%.1f%%) high_water=%d",
                        g_conn_pool.used_count, g_conn_pool.capacity,
                        pool_utilization, g_conn_pool.high_water_mark);
@@ -831,7 +884,8 @@ static void client_handle_udp_events(struct client_ctx *ctx,
             char *payload = NULL;
             int plen = 0;
             int res = aead_protocol_handle_incoming_packet(
-                c, ubuf, got, ctx->cfg->psk, ctx->cfg->has_psk, &payload, &plen);
+                c, ubuf, got, ctx->cfg->psk, ctx->cfg->has_psk, &payload,
+                &plen);
 
             if (res < 0) { // Error
                 P_LOG_ERR("AEAD packet handling failed (res=%d)", res);
@@ -876,8 +930,9 @@ static void client_handle_accept(struct client_ctx *ctx) {
 
         /* Apply rate limiting to prevent handshake flooding */
         if (!rate_limit_check(&ctx->handshake_limiter)) {
-            P_LOG_WARN("Handshake rate limit exceeded, dropping connection from %s",
-                       sockaddr_to_string(&ca));
+            P_LOG_WARN(
+                "Handshake rate limit exceeded, dropping connection from %s",
+                sockaddr_to_string(&ca));
             g_perf.rate_limit_drops++;
             close(cs);
             continue;
@@ -928,10 +983,13 @@ static void client_handle_accept(struct client_ctx *ctx) {
         uint32_t eff_min_ms = ctx->cfg->agg_min_ms;
         uint32_t eff_max_ms = ctx->cfg->agg_max_ms;
         uint32_t eff_max_bytes = ctx->cfg->agg_max_bytes;
-        compute_agg_profile(ctx->cfg, lport, &eff_min_ms, &eff_max_ms, &eff_max_bytes);
+        compute_agg_profile(ctx->cfg, lport, &eff_min_ms, &eff_max_ms,
+                            &eff_max_bytes);
         /* Cap by MTU-derived embed capacity to avoid fragmentation */
-        uint32_t mtu_cap = kcptcp_stealth_embed_cap_from_mtu(ctx->kopts ? ctx->kopts->mtu : 1350);
-        if (eff_max_bytes > mtu_cap) eff_max_bytes = mtu_cap;
+        uint32_t mtu_cap = kcptcp_stealth_embed_cap_from_mtu(
+            ctx->kopts ? ctx->kopts->mtu : 1350);
+        if (eff_max_bytes > mtu_cap)
+            eff_max_bytes = mtu_cap;
         c->hs_agg_max_bytes_eff = eff_max_bytes;
 
         /* Pre-drain any immediately available TCP bytes into buffer */
@@ -943,8 +1001,10 @@ static void client_handle_accept(struct client_ctx *ctx) {
                 if (rn > 0) {
                     c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
                     size_t need = c->request.dlen + (size_t)rn;
-                    if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
-                        P_LOG_WARN("Request buffer size limit exceeded, closing connection");
+                    if (ensure_buffer_capacity(&c->request, need,
+                                               MAX_TCP_BUFFER_SIZE) < 0) {
+                        P_LOG_WARN("Request buffer size limit exceeded, "
+                                   "closing connection");
                         close(cs);
                         close(us);
                         release_proxy_conn_to_pool(c);
@@ -953,7 +1013,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
                     }
                     memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
                     c->request.dlen += (size_t)rn;
-                    if (c->request.dlen >= eff_max_bytes) break;
+                    if (c->request.dlen >= eff_max_bytes)
+                        break;
                 } else {
                     break;
                 }
@@ -963,7 +1024,8 @@ static void client_handle_accept(struct client_ctx *ctx) {
             continue;
         }
 
-        /* Schedule stealth handshake send with small randomized aggregation window */
+        /* Schedule stealth handshake send with small randomized aggregation
+         * window */
         uint32_t jitter = rand_between(eff_min_ms, eff_max_ms);
         c->hs_scheduled = true;
         c->hs_send_at_ms = kcp_now_ms() + jitter;
@@ -1072,8 +1134,10 @@ static void client_handle_tcp_events(struct client_ctx *ctx,
             if (!c->kcp_ready) {
                 /* buffer until KCP ready */
                 size_t need = c->request.dlen + (size_t)rn;
-                if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
-                    P_LOG_WARN("Request buffer size limit exceeded, closing connection");
+                if (ensure_buffer_capacity(&c->request, need,
+                                           MAX_TCP_BUFFER_SIZE) < 0) {
+                    P_LOG_WARN("Request buffer size limit exceeded, closing "
+                               "connection");
                     c->state = S_CLOSING;
                     break;
                 }
@@ -1130,16 +1194,22 @@ static void print_usage(const char *prog) {
     P_LOG_INFO(
         "  -W <rcvwnd>        KCP recv window in packets (default 1024)");
     P_LOG_INFO("  -N                 enable TCP_NODELAY on client sockets");
-    P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) [REQUIRED]");
-    P_LOG_INFO("  -g <min-max>       aggregate first TCP bytes for min-max ms before sending first UDP packet");
-    P_LOG_INFO("  -G <bytes>         max bytes to embed into first UDP packet (default 1024)");
-    P_LOG_INFO("  -P off|auto|csv:<ports> per-port aggregation profile (client)\n"
-               "                         off: disable per-port heuristics\n"
-               "                         auto: enable built-in profiles\n"
-               "                         csv: comma-separated ports with no aggregation");
+    P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) "
+               "[REQUIRED]");
+    P_LOG_INFO("  -g <min-max>       aggregate first TCP bytes for min-max ms "
+               "before sending first UDP packet");
+    P_LOG_INFO("  -G <bytes>         max bytes to embed into first UDP packet "
+               "(default 1024)");
+    P_LOG_INFO(
+        "  -P off|auto|csv:<ports> per-port aggregation profile (client)\n"
+        "                         off: disable per-port heuristics\n"
+        "                         auto: enable built-in profiles\n"
+        "                         csv: comma-separated ports with no "
+        "aggregation");
     P_LOG_INFO("  -h                 show help");
     P_LOG_INFO(" ");
-    P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
+    P_LOG_INFO(
+        "Note: PSK (-K) is required for secure handshake authentication.");
 }
 
 int main(int argc, char **argv) {
@@ -1192,15 +1262,17 @@ int main(int argc, char **argv) {
             cfg.agg_profile_mode = 1;
         } else if (strncmp(opts.hs_profile, "csv:", 4) == 0) {
             cfg.agg_profile_mode = 2;
-            (void)parse_ports_csv(opts.hs_profile + 4, cfg.noagg_ports,
-                                  (int)(sizeof(cfg.noagg_ports) / sizeof(cfg.noagg_ports[0])),
-                                  &cfg.noagg_count);
+            (void)parse_ports_csv(
+                opts.hs_profile + 4, cfg.noagg_ports,
+                (int)(sizeof(cfg.noagg_ports) / sizeof(cfg.noagg_ports[0])),
+                &cfg.noagg_count);
         } else {
             /* Treat as CSV directly */
             cfg.agg_profile_mode = 2;
-            (void)parse_ports_csv(opts.hs_profile, cfg.noagg_ports,
-                                  (int)(sizeof(cfg.noagg_ports) / sizeof(cfg.noagg_ports[0])),
-                                  &cfg.noagg_count);
+            (void)parse_ports_csv(
+                opts.hs_profile, cfg.noagg_ports,
+                (int)(sizeof(cfg.noagg_ports) / sizeof(cfg.noagg_ports[0])),
+                &cfg.noagg_count);
         }
     }
 
@@ -1301,7 +1373,8 @@ int main(int argc, char **argv) {
         int timeout_ms = kcptcp_compute_kcp_timeout_ms(&conns, 1000);
 
         struct epoll_event events[DEFAULT_EPOLL_MAX_EVENTS];
-        int nfds = epoll_wait(epfd, events, DEFAULT_EPOLL_MAX_EVENTS, timeout_ms);
+        int nfds =
+            epoll_wait(epfd, events, DEFAULT_EPOLL_MAX_EVENTS, timeout_ms);
         if (nfds < 0) {
             if (errno == EINTR) { /* fallthrough to timer update */
             } else {
@@ -1346,26 +1419,34 @@ int main(int argc, char **argv) {
                     size_t embed = avail;
                     if (embed > pos->hs_agg_max_bytes_eff)
                         embed = pos->hs_agg_max_bytes_eff;
-                    const uint8_t *idata = (embed > 0)
-                                               ? (const uint8_t *)(pos->request.data + pos->request.rpos)
-                                               : NULL;
-                    if (generate_stealth_handshake(pos, cctx.cfg->psk, cctx.cfg->has_psk,
-                                                   idata, embed, hbuf, &hlen) == 0) {
-                        ssize_t sent = sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT,
-                                              &pos->peer_addr.sa,
-                                              (socklen_t)sizeof_sockaddr(&pos->peer_addr));
+                    const uint8_t *idata =
+                        (embed > 0) ? (const uint8_t *)(pos->request.data +
+                                                        pos->request.rpos)
+                                    : NULL;
+                    if (generate_stealth_handshake(pos, cctx.cfg->psk,
+                                                   cctx.cfg->has_psk, idata,
+                                                   embed, hbuf, &hlen) == 0) {
+                        ssize_t sent =
+                            sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT,
+                                   &pos->peer_addr.sa,
+                                   (socklen_t)sizeof_sockaddr(&pos->peer_addr));
                         if (sent >= 0) {
                             g_perf.handshake_attempts++;
-                            P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hlen);
+                            P_LOG_DEBUG(
+                                "Sent stealth handshake packet (%zu bytes)",
+                                hlen);
                             pos->hs_scheduled = false;
-                            pos->request.rpos += embed; /* mark embedded data consumed */
+                            pos->request.rpos +=
+                                embed; /* mark embedded data consumed */
                         } else {
-                            P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
+                            P_LOG_WARN("Failed to send stealth handshake: %s",
+                                       strerror(errno));
                             /* Try again shortly */
                             pos->hs_send_at_ms = now + 5;
                         }
                     } else {
-                        P_LOG_ERR("Failed to generate stealth handshake packet");
+                        P_LOG_ERR(
+                            "Failed to generate stealth handshake packet");
                         g_perf.handshake_failures++;
                         pos->state = S_CLOSING;
                     }

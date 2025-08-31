@@ -51,10 +51,12 @@
 
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 60
-#define DEFAULT_HASH_TABLE_SIZE 65537  /* Larger prime number for better distribution */
-#define MIN_BATCH_SIZE 64              /* Increased from 4 for better performance */
+#define DEFAULT_HASH_TABLE_SIZE                                                \
+    65537                 /* Larger prime number for better distribution */
+#define MIN_BATCH_SIZE 64 /* Increased from 4 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
-#define BATCH_ADJUST_INTERVAL_SEC 30   /* Reduced frequency from 5 to 30 seconds */
+#define BATCH_ADJUST_INTERVAL_SEC                                              \
+    30 /* Reduced frequency from 5 to 30 seconds */
 #define RATE_LIMIT_WINDOW_SEC 1
 
 /* Hash function constants */
@@ -63,10 +65,10 @@
 #define GOLDEN_RATIO_32 0x9e3779b9
 
 /* Adaptive batch sizing thresholds - less aggressive */
-#define BATCH_HIGH_UTILIZATION_RATIO 0.9  /* Increased from 0.8 */
-#define BATCH_LOW_UTILIZATION_RATIO 0.1   /* Decreased from 0.3 */
-#define BATCH_INCREASE_FACTOR 1.2         /* Reduced from 1.5 */
-#define BATCH_DECREASE_FACTOR 0.8         /* Reduced from 0.67 */
+#define BATCH_HIGH_UTILIZATION_RATIO 0.9 /* Increased from 0.8 */
+#define BATCH_LOW_UTILIZATION_RATIO 0.1  /* Decreased from 0.3 */
+#define BATCH_INCREASE_FACTOR 1.2        /* Reduced from 1.5 */
+#define BATCH_DECREASE_FACTOR 0.8        /* Reduced from 0.67 */
 
 #define BATCH_HASH_SIZE 4096
 
@@ -102,26 +104,31 @@
 #endif
 
 #ifndef DISABLE_BACKPRESSURE_QUEUE
-#define ENABLE_BACKPRESSURE_QUEUE 0  /* Disabled by default for better performance */
+ /* Disabled by default for better performance */
+#define ENABLE_BACKPRESSURE_QUEUE 0
 #else
 #define ENABLE_BACKPRESSURE_QUEUE 0
 #endif
 
-/* Batch processing limits - decouple max batches from per-batch message limit */
-#define MAX_CONCURRENT_BATCHES 1024  /* Maximum number of concurrent server sockets in one batch cycle */
+/* Batch processing limits - decouple max batches from per-batch message limit
+ */
+/* Maximum number of concurrent server sockets in one batch cycle */
+#define MAX_CONCURRENT_BATCHES 1024
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
 
 /* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
-#define UDP_PROXY_SOCKBUF_CAP (2 * 1024 * 1024)  /* Increased from 256KB to 2MB for better throughput */
+/* Increased from 256KB to 2MB for better throughput */
+#define UDP_PROXY_SOCKBUF_CAP (2 * 1024 * 1024)
 #endif
 
 /* Linux-specific batching parameters */
 #ifdef __linux__
 #ifndef UDP_PROXY_BATCH_SZ
-#define UDP_PROXY_BATCH_SZ 512  /* Increased from 16 for much better performance */
+/* Increased from 16 for much better performance */
+#define UDP_PROXY_BATCH_SZ 512
 #endif
 #ifndef UDP_PROXY_DGRAM_CAP
 /* Max safe UDP payload size: 65535 - 8 (UDP header) - 20 (IPv4 header) */
@@ -183,13 +190,13 @@ struct rate_limiter {
  * with mutex protection for thread safety.
  */
 struct conn_pool {
-    struct proxy_conn *connections;  /**< Pre-allocated connection array */
-    struct proxy_conn *freelist;     /**< Linked list of available connections */
-    int capacity;                    /**< Total pool capacity */
-    atomic_int used_count;           /**< Currently allocated connections (atomic) */
-    int high_water_mark;             /**< Peak usage for monitoring */
-    pthread_mutex_t lock;            /**< Thread safety mutex */
-    pthread_cond_t available;        /**< Condition variable for blocking allocation */
+    struct proxy_conn *connections; /**< Pre-allocated connection array */
+    struct proxy_conn *freelist;    /**< Linked list of available connections */
+    int capacity;                   /**< Total pool capacity */
+    atomic_int used_count;    /**< Currently allocated connections (atomic) */
+    int high_water_mark;      /**< Peak usage for monitoring */
+    pthread_mutex_t lock;     /**< Thread safety mutex */
+    pthread_cond_t available; /**< Condition variable for blocking allocation */
 };
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -199,7 +206,7 @@ struct conn_pool {
 /* Connection hash table - protected by fine-grained locks */
 static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
-static atomic_uint conn_tbl_len;                /**< Atomic connection count */
+static atomic_uint conn_tbl_len; /**< Atomic connection count */
 
 #if ENABLE_FINE_GRAINED_LOCKS
 /* Hash table bucket locks for fine-grained locking */
@@ -228,14 +235,13 @@ struct adaptive_batch {
 };
 
 static struct adaptive_batch g_adaptive_batch = {
-    .current_size = UDP_PROXY_BATCH_SZ,  /* Start with full batch size */
+    .current_size = UDP_PROXY_BATCH_SZ, /* Start with full batch size */
     .min_size = MIN_BATCH_SIZE,
     .max_size = MAX_BATCH_SIZE,
     .total_packets = 0,
     .total_batches = 0,
     .last_adjust = 0,
-    .lock = PTHREAD_MUTEX_INITIALIZER
-};
+    .lock = PTHREAD_MUTEX_INITIALIZER};
 #endif /* ENABLE_ADAPTIVE_BATCHING */
 #endif
 
@@ -246,14 +252,14 @@ static pthread_mutex_t g_lru_lock = PTHREAD_MUTEX_INITIALIZER;
 #if ENABLE_LRU_LOCKS
 /* Segmented LRU update state to avoid O(N) scans */
 static struct {
-    unsigned next_bucket;           /* Next bucket to scan in segmented update */
-    time_t last_segment_update;     /* Last time we did a segment update */
-    unsigned buckets_per_segment;   /* How many buckets to process per segment */
+    unsigned next_bucket;         /* Next bucket to scan in segmented update */
+    time_t last_segment_update;   /* Last time we did a segment update */
+    unsigned buckets_per_segment; /* How many buckets to process per segment */
 } g_lru_segment_state = {0, 0, 64};
 #endif
 
 /* Cached current timestamp (monotonic seconds on Linux) for hot paths */
-static atomic_long g_now_ts;                    /**< Atomic timestamp cache */
+static atomic_long g_now_ts; /**< Atomic timestamp cache */
 
 /* Function pointer to compute bucket index from a 32-bit hash */
 static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
@@ -376,14 +382,16 @@ static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
         return ntohl(addr->sin.sin_addr.s_addr) % RATE_LIMIT_HASH_SIZE;
     } else if (addr->sa.sa_family == AF_INET6) {
         const uint32_t *p = (const uint32_t *)&addr->sin6.sin6_addr;
-        return (ntohl(p[0]) ^ ntohl(p[1]) ^ ntohl(p[2]) ^ ntohl(p[3])) % RATE_LIMIT_HASH_SIZE;
+        return (ntohl(p[0]) ^ ntohl(p[1]) ^ ntohl(p[2]) ^ ntohl(p[3])) %
+               RATE_LIMIT_HASH_SIZE;
     }
     return 0;
 }
 #endif
 
 /* Initialize rate limiter */
-static int init_rate_limiter(unsigned max_pps, unsigned max_bps, unsigned max_per_ip) {
+static int init_rate_limiter(unsigned max_pps, unsigned max_bps,
+                             unsigned max_per_ip) {
     memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
 
     if (pthread_mutex_init(&g_rate_limiter.lock, NULL) != 0) {
@@ -395,8 +403,9 @@ static int init_rate_limiter(unsigned max_pps, unsigned max_bps, unsigned max_pe
     g_rate_limiter.max_bps = max_bps;
     g_rate_limiter.max_per_ip = max_per_ip;
 
-    P_LOG_INFO("Rate limiter initialized: max_pps=%u, max_bps=%u, max_per_ip=%u",
-               max_pps, max_bps, max_per_ip);
+    P_LOG_INFO(
+        "Rate limiter initialized: max_pps=%u, max_bps=%u, max_per_ip=%u",
+        max_pps, max_bps, max_per_ip);
     return 0;
 }
 
@@ -407,7 +416,8 @@ static void destroy_rate_limiter(void) {
 }
 
 /* Check if packet is allowed by rate limiter */
-static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size) {
+static bool check_rate_limit(const union sockaddr_inx *addr,
+                             size_t packet_size) {
 #if !ENABLE_RATE_LIMITING
     (void)addr;
     (void)packet_size;
@@ -445,7 +455,8 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
     }
 
     /* Check packet rate limit */
-    if (g_rate_limiter.max_pps > 0 && entry->packet_count >= g_rate_limiter.max_pps) {
+    if (g_rate_limiter.max_pps > 0 &&
+        entry->packet_count >= g_rate_limiter.max_pps) {
         pthread_mutex_unlock(&g_rate_limiter.lock);
         P_LOG_WARN("Packet rate limit exceeded for %s (%lu pps)",
                    sockaddr_to_string(addr), entry->packet_count);
@@ -453,7 +464,8 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
     }
 
     /* Check byte rate limit */
-    if (g_rate_limiter.max_bps > 0 && entry->byte_count + packet_size > g_rate_limiter.max_bps) {
+    if (g_rate_limiter.max_bps > 0 &&
+        entry->byte_count + packet_size > g_rate_limiter.max_bps) {
         pthread_mutex_unlock(&g_rate_limiter.lock);
         P_LOG_WARN("Byte rate limit exceeded for %s (%lu bps)",
                    sockaddr_to_string(addr), entry->byte_count);
@@ -461,7 +473,8 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
     }
 
     /* Check per-IP connection limit */
-    if (g_rate_limiter.max_per_ip > 0 && entry->connection_count >= g_rate_limiter.max_per_ip) {
+    if (g_rate_limiter.max_per_ip > 0 &&
+        entry->connection_count >= g_rate_limiter.max_per_ip) {
         pthread_mutex_unlock(&g_rate_limiter.lock);
         P_LOG_WARN("Per-IP connection limit exceeded for %s (%u connections)",
                    sockaddr_to_string(addr), entry->connection_count);
@@ -478,7 +491,8 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
 }
 
 /* Validate packet size and content */
-static bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
+static bool validate_packet(const char *data, size_t len,
+                            const union sockaddr_inx *src) {
 #if !ENABLE_PACKET_VALIDATION
     (void)data;
     (void)len;
@@ -487,8 +501,8 @@ static bool validate_packet(const char *data, size_t len, const union sockaddr_i
 #else
     /* Check packet size limits */
     if (len < 1 || len > UDP_PROXY_DGRAM_CAP) {
-        P_LOG_WARN("Invalid packet size %zu from %s (min=1, max=%d)",
-                   len, sockaddr_to_string(src), UDP_PROXY_DGRAM_CAP);
+        P_LOG_WARN("Invalid packet size %zu from %s (min=1, max=%d)", len,
+                   sockaddr_to_string(src), UDP_PROXY_DGRAM_CAP);
         return false;
     }
 
@@ -526,7 +540,8 @@ static void destroy_backpressure_queue(void) {
 
 /* Add entry to backpressure queue */
 static bool enqueue_backpressure(int sock, const char *data, size_t len,
-                                 const union sockaddr_inx *dest_addr, socklen_t dest_len) {
+                                 const union sockaddr_inx *dest_addr,
+                                 socklen_t dest_len) {
     pthread_mutex_lock(&g_backpressure_queue.lock);
 
     if (g_backpressure_queue.count >= BACKPRESSURE_QUEUE_SIZE) {
@@ -534,7 +549,8 @@ static bool enqueue_backpressure(int sock, const char *data, size_t len,
         return false; /* Queue full */
     }
 
-    struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.tail];
+    struct backpressure_entry *entry =
+        &g_backpressure_queue.entries[g_backpressure_queue.tail];
     entry->sock = sock;
     memcpy(entry->data, data, len);
     entry->len = len;
@@ -545,7 +561,8 @@ static bool enqueue_backpressure(int sock, const char *data, size_t len,
         entry->dest_len = 0;
     }
 
-    g_backpressure_queue.tail = (g_backpressure_queue.tail + 1) % BACKPRESSURE_QUEUE_SIZE;
+    g_backpressure_queue.tail =
+        (g_backpressure_queue.tail + 1) % BACKPRESSURE_QUEUE_SIZE;
     g_backpressure_queue.count++;
 
     pthread_mutex_unlock(&g_backpressure_queue.lock);
@@ -557,13 +574,15 @@ static void process_backpressure_queue(void) {
     pthread_mutex_lock(&g_backpressure_queue.lock);
 
     while (g_backpressure_queue.count > 0) {
-        struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.head];
+        struct backpressure_entry *entry =
+            &g_backpressure_queue.entries[g_backpressure_queue.head];
 
         ssize_t sent;
         if (entry->dest_len > 0) {
             /* UDP sendto */
-            sent = sendto(entry->sock, entry->data, entry->len, 0,
-                         (struct sockaddr *)&entry->dest_addr, entry->dest_len);
+            sent =
+                sendto(entry->sock, entry->data, entry->len, 0,
+                       (struct sockaddr *)&entry->dest_addr, entry->dest_len);
         } else {
             /* Connected UDP send */
             sent = send(entry->sock, entry->data, entry->len, 0);
@@ -578,7 +597,8 @@ static void process_backpressure_queue(void) {
         }
 
         /* Move to next entry */
-        g_backpressure_queue.head = (g_backpressure_queue.head + 1) % BACKPRESSURE_QUEUE_SIZE;
+        g_backpressure_queue.head =
+            (g_backpressure_queue.head + 1) % BACKPRESSURE_QUEUE_SIZE;
         g_backpressure_queue.count--;
     }
 
@@ -609,22 +629,26 @@ static void adjust_batch_size(void) {
     if (batches > 0) {
         double avg_batch_size = (double)packets / batches;
 
-        if (avg_batch_size > g_adaptive_batch.current_size * BATCH_HIGH_UTILIZATION_RATIO) {
+        if (avg_batch_size >
+            g_adaptive_batch.current_size * BATCH_HIGH_UTILIZATION_RATIO) {
             /* High utilization - increase batch size */
             if (g_adaptive_batch.current_size < g_adaptive_batch.max_size) {
                 g_adaptive_batch.current_size =
-                    (int)(g_adaptive_batch.current_size * BATCH_INCREASE_FACTOR);
+                    (int)(g_adaptive_batch.current_size *
+                          BATCH_INCREASE_FACTOR);
                 if (g_adaptive_batch.current_size > g_adaptive_batch.max_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.max_size;
                 }
                 P_LOG_INFO("Increased batch size to %d (avg=%.1f)",
                            g_adaptive_batch.current_size, avg_batch_size);
             }
-        } else if (avg_batch_size < g_adaptive_batch.current_size * BATCH_LOW_UTILIZATION_RATIO) {
+        } else if (avg_batch_size < g_adaptive_batch.current_size *
+                                        BATCH_LOW_UTILIZATION_RATIO) {
             /* Low utilization - decrease batch size */
             if (g_adaptive_batch.current_size > g_adaptive_batch.min_size) {
                 g_adaptive_batch.current_size =
-                    (int)(g_adaptive_batch.current_size * BATCH_DECREASE_FACTOR);
+                    (int)(g_adaptive_batch.current_size *
+                          BATCH_DECREASE_FACTOR);
                 if (g_adaptive_batch.current_size < g_adaptive_batch.min_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.min_size;
                 }
@@ -648,7 +672,8 @@ static int get_optimal_batch_size(void) {
 #if ENABLE_ADAPTIVE_BATCHING
     return g_adaptive_batch.current_size;
 #else
-    return UDP_PROXY_BATCH_SZ; /* Use fixed batch size for maximum performance */
+    return UDP_PROXY_BATCH_SZ; /* Use fixed batch size for maximum performance
+                                */
 #endif
 }
 
@@ -871,7 +896,8 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 #endif
 }
 
-/* Segmented LRU update to avoid O(N) scans - process only a subset of buckets each time */
+/* Segmented LRU update to avoid O(N) scans - process only a subset of buckets
+ * each time */
 static void segmented_update_lru(void) {
 #if ENABLE_LRU_LOCKS
     time_t now = time(NULL);
@@ -884,7 +910,8 @@ static void segmented_update_lru(void) {
 
     /* Adjust buckets per segment based on total hash table size */
     if (g_lru_segment_state.buckets_per_segment == 0) {
-        g_lru_segment_state.buckets_per_segment = (g_conn_tbl_hash_size / 32) + 1;
+        g_lru_segment_state.buckets_per_segment =
+            (g_conn_tbl_hash_size / 32) + 1;
         if (g_lru_segment_state.buckets_per_segment > 256) {
             g_lru_segment_state.buckets_per_segment = 256;
         }
@@ -894,7 +921,8 @@ static void segmented_update_lru(void) {
 
     /* Process only a segment of buckets to spread the work over time */
     unsigned start_bucket = g_lru_segment_state.next_bucket;
-    unsigned end_bucket = start_bucket + g_lru_segment_state.buckets_per_segment;
+    unsigned end_bucket =
+        start_bucket + g_lru_segment_state.buckets_per_segment;
     if (end_bucket > g_conn_tbl_hash_size) {
         end_bucket = g_conn_tbl_hash_size;
     }
@@ -965,8 +993,9 @@ proxy_conn_get_or_create(const struct config *cfg,
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
             inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
                       s_addr, sizeof(s_addr));
-            P_LOG_WARN("Conn table full (%u), dropping %s:%d", current_conn_count,
-                       s_addr, ntohs(*port_of_sockaddr(cli_addr)));
+            P_LOG_WARN("Conn table full (%u), dropping %s:%d",
+                       current_conn_count, s_addr,
+                       ntohs(*port_of_sockaddr(cli_addr)));
             goto err;
         }
     }
@@ -1038,15 +1067,16 @@ proxy_conn_get_or_create(const struct config *cfg,
     /* Update connection count atomically */
     unsigned new_count = atomic_fetch_add(&conn_tbl_len, 1) + 1;
 
-    /* Log new connections at DEBUG level to reduce overhead in high-connection scenarios */
+    /* Log new connections at DEBUG level to reduce overhead in high-connection
+     * scenarios */
     /* Only log every 100th connection to avoid spam */
     static _Atomic unsigned log_counter = 0;
     unsigned current_count = atomic_fetch_add(&log_counter, 1);
     if ((current_count % 100) == 0) {
         inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr,
                   sizeof(s_addr));
-        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every 100th)", s_addr,
-                   ntohs(*port_of_sockaddr(cli_addr)), new_count);
+        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every 100th)",
+                   s_addr, ntohs(*port_of_sockaddr(cli_addr)), new_count);
     }
 
     conn->last_active = monotonic_seconds();
@@ -1106,7 +1136,8 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
                        strerror(errno));
         }
         if (safe_close(conn->svr_sock) < 0) {
-            P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock, strerror(errno));
+            P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock,
+                       strerror(errno));
         }
         conn->svr_sock = -1;
     }
@@ -1129,7 +1160,8 @@ static void proxy_conn_walk_continue(const struct config *cfg,
     }
 
     while (walked < walk_max && !list_empty(&g_lru_list)) {
-        struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
+        struct proxy_conn *oldest =
+            list_first_entry(&g_lru_list, struct proxy_conn, lru);
 
         long diff = (long)(now - oldest->last_active);
         if (diff < 0)
@@ -1167,7 +1199,8 @@ static bool proxy_conn_evict_one(int epfd) {
         return false;
     }
 
-    struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
+    struct proxy_conn *oldest =
+        list_first_entry(&g_lru_list, struct proxy_conn, lru);
     union sockaddr_inx addr = oldest->cli_addr;
     char s_addr[50] = "";
 
@@ -1247,13 +1280,15 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     continue;
                 touch_proxy_conn(conn);
 
-                /* O(1) batch lookup using hash table with linear probing for collision resolution */
+                /* O(1) batch lookup using hash table with linear probing for
+                 * collision resolution */
                 int hash_key = conn->svr_sock % BATCH_HASH_SIZE;
                 int batch_idx = batch_hash[hash_key];
                 int probe_count = 0;
 
                 /* Linear probing to handle hash collisions */
-                while (batch_idx != -1 && batches[batch_idx].sock != conn->svr_sock &&
+                while (batch_idx != -1 &&
+                       batches[batch_idx].sock != conn->svr_sock &&
                        probe_count < BATCH_HASH_SIZE) {
                     hash_key = (hash_key + 1) % BATCH_HASH_SIZE;
                     batch_idx = batch_hash[hash_key];
@@ -1270,9 +1305,12 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     /* Check if we can create a new batch */
                     if (num_batches >= MAX_CONCURRENT_BATCHES) {
                         atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
-                        ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
-                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                            P_LOG_WARN("send(server, overflow): %s", strerror(errno));
+                        ssize_t wr = send(conn->svr_sock, c_bufs[i],
+                                          c_msgs[i].msg_len, 0);
+                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                            errno != EINTR) {
+                            P_LOG_WARN("send(server, overflow): %s",
+                                       strerror(errno));
                         }
                         continue;
                     }
@@ -1284,12 +1322,16 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                 }
                 if (batches[batch_idx].count >= get_optimal_batch_size()) {
                     atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
-                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
-                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                        P_LOG_WARN("send(server, batch_full): %s", strerror(errno));
+                    ssize_t wr =
+                        send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                        errno != EINTR) {
+                        P_LOG_WARN("send(server, batch_full): %s",
+                                   strerror(errno));
                     }
                 } else {
-                    batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+                    batches[batch_idx].msg_indices[batches[batch_idx].count++] =
+                        i;
                 }
             }
 
@@ -1312,24 +1354,31 @@ static void handle_client_data(const struct config *cfg, int lsn_sock, int epfd)
                     if (sent < 0) {
                         if (errno == EAGAIN || errno == EWOULDBLOCK ||
                             errno == EINTR) {
-                            /* Socket buffer full - rely on kernel buffering, don't queue in userspace */
-                            /* This is more efficient than copying data to userspace queues */
-                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, remaining);
+                            /* Socket buffer full - rely on kernel buffering,
+                             * don't queue in userspace */
+                            /* This is more efficient than copying data to
+                             * userspace queues */
+                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow,
+                                             remaining);
                             break;
                         }
-                        P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, remaining=%d",
+                        P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, "
+                                   "remaining=%d",
                                    strerror(errno), remaining, remaining);
                         break;
                     }
                     if (sent == 0) {
                         /* Avoid tight loop if nothing progressed */
-                        P_LOG_WARN("sendmmsg(server) sent 0 packets, remaining=%d", remaining);
+                        P_LOG_WARN(
+                            "sendmmsg(server) sent 0 packets, remaining=%d",
+                            remaining);
                         break;
                     }
                     if (sent < remaining) {
                         /* Partial send - log for debugging */
-                        P_LOG_INFO("sendmmsg(server) partial: sent=%d, remaining=%d",
-                                   sent, remaining);
+                        P_LOG_INFO(
+                            "sendmmsg(server) partial: sent=%d, remaining=%d",
+                            sent, remaining);
                     }
                     remaining -= sent;
                     msgp += sent;
@@ -1453,13 +1502,15 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
                     /* leave remaining for later */
                     break;
                 }
-                P_LOG_WARN("sendmmsg(client) failed: %s, attempted=%d, remaining=%d",
-                           strerror(errno), remaining, remaining);
+                P_LOG_WARN(
+                    "sendmmsg(client) failed: %s, attempted=%d, remaining=%d",
+                    strerror(errno), remaining, remaining);
                 break;
             }
             if (sent == 0) {
                 /* Avoid tight loop if nothing progressed */
-                P_LOG_WARN("sendmmsg(client) sent 0 packets, remaining=%d", remaining);
+                P_LOG_WARN("sendmmsg(client) sent 0 packets, remaining=%d",
+                           remaining);
                 break;
             }
             if (sent < remaining) {
@@ -1598,7 +1649,8 @@ static void show_help(const char *prog) {
     P_LOG_INFO("  -B <batch>       Linux recvmmsg/sendmmsg batch size (1..%d, "
                "default: %d)",
                UDP_PROXY_BATCH_SZ, UDP_PROXY_BATCH_SZ);
-    P_LOG_INFO("  -H <size>        hash table size (default: %d, recommend >= max_conns)",
+    P_LOG_INFO("  -H <size>        hash table size (default: %d, recommend >= "
+               "max_conns)",
                DEFAULT_HASH_TABLE_SIZE);
     P_LOG_INFO("  -p <pidfile>     write PID to file");
 }
@@ -1912,7 +1964,8 @@ int main(int argc, char *argv[]) {
     }
 
     for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
-        if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) != 0) {
+        if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) !=
+            0) {
             P_LOG_ERR("Failed to initialize hash table lock %d", i);
             /* Clean up already initialized locks */
             for (int j = 0; j < i; j++) {
@@ -2061,10 +2114,12 @@ cleanup:
                lru_immediate, lru_deferred);
 
     if (socket_overflows > 0) {
-        P_LOG_WARN("Consider increasing -B (batch size) or -C (max connections) if overflows are high");
+        P_LOG_WARN("Consider increasing -B (batch size) or -C (max "
+                   "connections) if overflows are high");
     }
     if (hash_collisions > socket_overflows * 10) {
-        P_LOG_WARN("High hash collision rate detected, consider adjusting hash table size");
+        P_LOG_WARN("High hash collision rate detected, consider adjusting hash "
+                   "table size");
     }
     closelog();
 

@@ -60,7 +60,7 @@ struct proxy_conn {
     int svr_fd;
     time_t last_active;
     time_t last_addr_warn; /* Last time we warned about unexpected UDP source */
-    struct list_head lru; /* LRU linkage: oldest at head, newest at tail */
+    struct list_head lru;  /* LRU linkage: oldest at head, newest at tail */
     bool needs_lru_update; /* Flag to batch LRU updates for performance */
 
     /* KCP tunneling fields (used by kcptcp-* binaries) */

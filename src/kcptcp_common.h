@@ -39,36 +39,41 @@ struct stealth_handshake_response {
 } __attribute__((packed));
 
 /* Magic numbers for stealth handshake */
-#define STEALTH_HANDSHAKE_MAGIC     0x12345678
-#define STEALTH_RESPONSE_MAGIC      0x87654321
+#define STEALTH_HANDSHAKE_MAGIC 0x12345678
+#define STEALTH_RESPONSE_MAGIC 0x87654321
 
 /* Buffer sizes */
-#define STEALTH_HANDSHAKE_PAYLOAD_SIZE    sizeof(struct stealth_handshake_payload)
-#define STEALTH_HANDSHAKE_RESPONSE_SIZE   sizeof(struct stealth_handshake_response)
+#define STEALTH_HANDSHAKE_PAYLOAD_SIZE sizeof(struct stealth_handshake_payload)
+#define STEALTH_HANDSHAKE_RESPONSE_SIZE                                        \
+    sizeof(struct stealth_handshake_response)
 
 /* Minimum size for stealth handshake packet (payload + some padding) */
-#define STEALTH_HANDSHAKE_MIN_SIZE        (STEALTH_HANDSHAKE_PAYLOAD_SIZE + 16)
+#define STEALTH_HANDSHAKE_MIN_SIZE (STEALTH_HANDSHAKE_PAYLOAD_SIZE + 16)
 
 /* Stealth handshake helper functions */
-int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *token,
-                                          const uint8_t *initial_data, size_t initial_data_len,
-                                          uint8_t *out_packet, size_t *out_packet_len);
+int stealth_handshake_create_first_packet(
+    const uint8_t *psk, const uint8_t *token, const uint8_t *initial_data,
+    size_t initial_data_len, uint8_t *out_packet, size_t *out_packet_len);
 
-int stealth_handshake_parse_first_packet(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
-                                        struct stealth_handshake_payload *payload,
-                                        uint8_t *out_data, size_t *out_data_len);
+int stealth_handshake_parse_first_packet(
+    const uint8_t *psk, const uint8_t *packet, size_t packet_len,
+    struct stealth_handshake_payload *payload, uint8_t *out_data,
+    size_t *out_data_len);
 
-int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const uint8_t *token,
-                                     uint8_t *out_packet, size_t *out_packet_len);
+int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv,
+                                      const uint8_t *token, uint8_t *out_packet,
+                                      size_t *out_packet_len);
 
-int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
-                                    struct stealth_handshake_response *response);
+int stealth_handshake_parse_response(
+    const uint8_t *psk, const uint8_t *packet, size_t packet_len,
+    struct stealth_handshake_response *response);
 
 /* Env-controlled stats helpers */
 uint32_t get_stats_interval_ms(void);
 bool get_stats_dump_enabled(void);
 bool get_stats_enabled(void);
-/* Per-connection periodic stats logging using last_* snapshots inside proxy_conn. */
+/* Per-connection periodic stats logging using last_* snapshots inside
+ * proxy_conn. */
 void kcptcp_maybe_log_stats(struct proxy_conn *c, uint64_t now_ms);
 /* One-shot dump of totals for a connection when closing */
 void kcptcp_log_total_stats(struct proxy_conn *c);
@@ -132,9 +137,10 @@ struct kcptcp_common_cli {
     bool has_psk;
     uint8_t psk[32];
     /* Stealth handshake tuning */
-    uint32_t hs_agg_min_ms;      /* client: min wait to aggregate first TCP */
-    uint32_t hs_agg_max_ms;      /* client: max wait to aggregate first TCP */
-    uint32_t hs_agg_max_bytes;   /* client: max bytes to embed into first packet */
+    uint32_t hs_agg_min_ms; /* client: min wait to aggregate first TCP */
+    uint32_t hs_agg_max_ms; /* client: max wait to aggregate first TCP */
+    uint32_t
+        hs_agg_max_bytes; /* client: max bytes to embed into first packet */
     uint32_t hs_rsp_jitter_min_ms; /* server: min jitter before response */
     uint32_t hs_rsp_jitter_max_ms; /* server: max jitter before response */
     /* Profile selector (client): "off", "auto", or "csv:22,2222" */
@@ -153,7 +159,8 @@ int kcptcp_parse_common_opts(int argc, char **argv,
                              struct kcptcp_common_cli *out, int *pos_start,
                              bool is_server);
 
-/* Secure-random helper: return integer in [min, max]. If max<=min, returns min. */
+/* Secure-random helper: return integer in [min, max]. If max<=min, returns min.
+ */
 uint32_t rand_between(uint32_t min, uint32_t max);
 
 /* ---------------- Epoll helpers (shared) ---------------- */
