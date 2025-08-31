@@ -17,8 +17,7 @@ int secure_random_bytes(uint8_t *buf, size_t len) {
 
 #ifdef _WIN32
     HCRYPTPROV hProv = 0;
-    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL,
-                             CRYPT_VERIFYCONTEXT)) {
+    if (!CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
         return -1;
     }
 

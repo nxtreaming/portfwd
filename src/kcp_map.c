@@ -31,8 +31,7 @@ void kcp_map_free(struct kcp_map *m) {
     for (size_t i = 0; i < m->nbuckets; ++i) {
         struct list_head *head = &m->buckets[i].head;
         while (!list_empty(head)) {
-            struct kcp_map_entry *e =
-                list_first_entry(head, struct kcp_map_entry, node);
+            struct kcp_map_entry *e = list_first_entry(head, struct kcp_map_entry, node);
             list_del(&e->node);
             free(e);
         }

@@ -39,8 +39,7 @@ static inline void kcp_opts_set_defaults(struct kcp_opts *o) {
 uint32_t kcp_now_ms(void);
 
 /* Setup KCP on a proxy_conn (stub until ikcp is linked) */
-int kcp_setup_conn(struct proxy_conn *c, int udp_fd,
-                   const union sockaddr_inx *peer, uint32_t conv,
+int kcp_setup_conn(struct proxy_conn *c, int udp_fd, const union sockaddr_inx *peer, uint32_t conv,
                    const struct kcp_opts *opts);
 
 /* Drive timer update/flush (stub until ikcp is linked) */

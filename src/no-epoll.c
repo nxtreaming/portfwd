@@ -74,16 +74,14 @@ int epoll_create(int size) {
     /* Find a free slot */
     for (i = 0; i < pseudo_epolls_cap; i++) {
         if (pseudo_epolls[i] == NULL) {
-            struct pseudo_epoll_handle *eh =
-                (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
+            struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
             if (!eh) {
                 errno = ENOMEM;
                 return -1;
             }
             eh->cap = 16;
             eh->pfds = (struct pollfd *)calloc(eh->cap, sizeof(struct pollfd));
-            eh->evs = (struct epoll_event *)calloc(eh->cap,
-                                                   sizeof(struct epoll_event));
+            eh->evs = (struct epoll_event *)calloc(eh->cap, sizeof(struct epoll_event));
             eh->fd_map = (struct ht *)calloc(1, sizeof(struct ht));
             if (!eh->pfds || !eh->evs || !eh->fd_map) {
                 free(eh->pfds);
@@ -94,8 +92,8 @@ int epoll_create(int size) {
                 return -1;
             }
             eh->fd_map->capacity = HT_INITIAL_CAPACITY;
-            eh->fd_map->buckets = (struct ht_entry **)calloc(
-                eh->fd_map->capacity, sizeof(struct ht_entry *));
+            eh->fd_map->buckets =
+                (struct ht_entry **)calloc(eh->fd_map->capacity, sizeof(struct ht_entry *));
             if (!eh->fd_map->buckets) {
                 free(eh->pfds);
                 free(eh->evs);
@@ -121,8 +119,7 @@ int epoll_create(int size) {
         pseudo_epolls[i] = NULL;
     pseudo_epolls_cap = new_cap;
     /* Allocate first new slot */
-    struct pseudo_epoll_handle *eh =
-        (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
+    struct pseudo_epoll_handle *eh = (struct pseudo_epoll_handle *)calloc(1, sizeof(*eh));
     if (!eh) {
         errno = ENOMEM;
         return -1;
@@ -140,8 +137,8 @@ int epoll_create(int size) {
         return -1;
     }
     eh->fd_map->capacity = HT_INITIAL_CAPACITY;
-    eh->fd_map->buckets = (struct ht_entry **)calloc(eh->fd_map->capacity,
-                                                     sizeof(struct ht_entry *));
+    eh->fd_map->buckets =
+        (struct ht_entry **)calloc(eh->fd_map->capacity, sizeof(struct ht_entry *));
     if (!eh->fd_map->buckets) {
         free(eh->pfds);
         free(eh->evs);
@@ -203,10 +200,9 @@ int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event) {
         if (!entry) { /* ADD */
             if (eh->len == eh->cap) {
                 size_t ncap = eh->cap * 2;
-                struct pollfd *npfds =
-                    (struct pollfd *)realloc(eh->pfds, ncap * sizeof(*npfds));
-                struct epoll_event *nevs = (struct epoll_event *)realloc(
-                    eh->evs, ncap * sizeof(*nevs));
+                struct pollfd *npfds = (struct pollfd *)realloc(eh->pfds, ncap * sizeof(*npfds));
+                struct epoll_event *nevs =
+                    (struct epoll_event *)realloc(eh->evs, ncap * sizeof(*nevs));
                 if (!npfds || !nevs) {
                     if (npfds != eh->pfds)
                         free(npfds);
@@ -267,8 +263,7 @@ static int ht_resize(struct ht *ht) {
     struct ht_entry **old_buckets = ht->buckets;
 
     ht->capacity *= 2;
-    ht->buckets =
-        (struct ht_entry **)calloc(ht->capacity, sizeof(struct ht_entry *));
+    ht->buckets = (struct ht_entry **)calloc(ht->capacity, sizeof(struct ht_entry *));
     if (!ht->buckets) {
         ht->capacity = old_capacity;
         ht->buckets = old_buckets;
@@ -298,8 +293,7 @@ static int ht_insert(struct ht *ht, int fd, size_t index) {
 
     unsigned long hash = (unsigned long)fd;
     size_t bucket_index = hash % ht->capacity;
-    struct ht_entry *new_entry =
-        (struct ht_entry *)malloc(sizeof(struct ht_entry));
+    struct ht_entry *new_entry = (struct ht_entry *)malloc(sizeof(struct ht_entry));
     if (!new_entry) {
         errno = ENOMEM;
         return -1;
@@ -349,8 +343,7 @@ static int ht_remove(struct ht *ht, int fd) {
     return -1; /* Not found */
 }
 
-int epoll_wait(int epfd, struct epoll_event *events, int maxevents,
-               int timeout) {
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout) {
     if (epfd < 0 || (size_t)epfd >= pseudo_epolls_cap || !pseudo_epolls[epfd]) {
         errno = EINVAL;
         return -1;

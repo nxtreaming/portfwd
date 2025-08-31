@@ -54,12 +54,10 @@
 
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 60
-#define DEFAULT_HASH_TABLE_SIZE                                                \
-    65537                 /* Larger prime number for better distribution */
-#define MIN_BATCH_SIZE 64 /* Increased from 4 for better performance */
+#define DEFAULT_HASH_TABLE_SIZE 65537 /* Larger prime number for better distribution */
+#define MIN_BATCH_SIZE 64             /* Increased from 4 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
-#define BATCH_ADJUST_INTERVAL_SEC                                              \
-    30 /* Reduced frequency from 5 to 30 seconds */
+#define BATCH_ADJUST_INTERVAL_SEC 30 /* Reduced frequency from 5 to 30 seconds */
 #define RATE_LIMIT_WINDOW_SEC 1
 
 /* Hash function constants */
@@ -107,7 +105,7 @@
 #endif
 
 #ifndef DISABLE_BACKPRESSURE_QUEUE
- /* Disabled by default for better performance */
+/* Disabled by default for better performance */
 #define ENABLE_BACKPRESSURE_QUEUE 0
 #else
 #define ENABLE_BACKPRESSURE_QUEUE 0
@@ -167,7 +165,6 @@ struct rate_limiter {
     unsigned max_bps;
     unsigned max_per_ip;
 };
-
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Global Variables */
@@ -312,9 +309,8 @@ static bool proxy_conn_evict_one(int epfd);
 /* Data handling */
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
 #ifdef __linux__
-static void handle_client_data(int listen_sock, int epfd,
-                               struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
-                               struct iovec *s_iovs,
+static void handle_client_data(int listen_sock, int epfd, struct mmsghdr *c_msgs,
+                               struct mmsghdr *s_msgs, struct iovec *s_iovs,
                                char (*c_bufs)[UDP_PROXY_DGRAM_CAP]);
 #else
 static void handle_client_data(int listen_sock, int epfd);
@@ -322,11 +318,9 @@ static void handle_client_data(int listen_sock, int epfd);
 
 /* Linux batching support */
 #ifdef __linux__
-static void init_batching_resources(struct mmsghdr **c_msgs,
-                                    struct iovec **c_iov,
+static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
                                     struct sockaddr_storage **c_addrs,
-                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP],
-                                    struct mmsghdr **s_msgs,
+                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr **s_msgs,
                                     struct iovec **s_iovs);
 #endif
 
@@ -341,8 +335,7 @@ static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
         return ntohl(addr->sin.sin_addr.s_addr) % RATE_LIMIT_HASH_SIZE;
     } else if (addr->sa.sa_family == AF_INET6) {
         const uint32_t *p = (const uint32_t *)&addr->sin6.sin6_addr;
-        return (ntohl(p[0]) ^ ntohl(p[1]) ^ ntohl(p[2]) ^ ntohl(p[3])) %
-               RATE_LIMIT_HASH_SIZE;
+        return (ntohl(p[0]) ^ ntohl(p[1]) ^ ntohl(p[2]) ^ ntohl(p[3])) % RATE_LIMIT_HASH_SIZE;
     }
     return 0;
 }
@@ -355,8 +348,7 @@ static void destroy_rate_limiter(void) {
 }
 
 /* Check if packet is allowed by rate limiter */
-static bool check_rate_limit(const union sockaddr_inx *addr,
-                             size_t packet_size) {
+static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size) {
 #if !ENABLE_RATE_LIMITING
     (void)addr;
     (void)packet_size;
@@ -394,26 +386,23 @@ static bool check_rate_limit(const union sockaddr_inx *addr,
     }
 
     /* Check packet rate limit */
-    if (g_rate_limiter.max_pps > 0 &&
-        entry->packet_count >= g_rate_limiter.max_pps) {
+    if (g_rate_limiter.max_pps > 0 && entry->packet_count >= g_rate_limiter.max_pps) {
         pthread_mutex_unlock(&g_rate_limiter.lock);
-        P_LOG_WARN("Packet rate limit exceeded for %s (%lu pps)",
-                   sockaddr_to_string(addr), entry->packet_count);
+        P_LOG_WARN("Packet rate limit exceeded for %s (%lu pps)", sockaddr_to_string(addr),
+                   entry->packet_count);
         return false;
     }
 
     /* Check byte rate limit */
-    if (g_rate_limiter.max_bps > 0 &&
-        entry->byte_count + packet_size > g_rate_limiter.max_bps) {
+    if (g_rate_limiter.max_bps > 0 && entry->byte_count + packet_size > g_rate_limiter.max_bps) {
         pthread_mutex_unlock(&g_rate_limiter.lock);
-        P_LOG_WARN("Byte rate limit exceeded for %s (%lu bps)",
-                   sockaddr_to_string(addr), entry->byte_count);
+        P_LOG_WARN("Byte rate limit exceeded for %s (%lu bps)", sockaddr_to_string(addr),
+                   entry->byte_count);
         return false;
     }
 
     /* Check per-IP connection limit */
-    if (g_rate_limiter.max_per_ip > 0 &&
-        entry->connection_count >= g_rate_limiter.max_per_ip) {
+    if (g_rate_limiter.max_per_ip > 0 && entry->connection_count >= g_rate_limiter.max_per_ip) {
         pthread_mutex_unlock(&g_rate_limiter.lock);
         P_LOG_WARN("Per-IP connection limit exceeded for %s (%u connections)",
                    sockaddr_to_string(addr), entry->connection_count);
@@ -430,8 +419,7 @@ static bool check_rate_limit(const union sockaddr_inx *addr,
 }
 
 /* Validate packet size and content */
-static bool validate_packet(const char *data, size_t len,
-                            const union sockaddr_inx *src) {
+static bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
 #if !ENABLE_PACKET_VALIDATION
     (void)data;
     (void)len;
@@ -440,8 +428,8 @@ static bool validate_packet(const char *data, size_t len,
 #else
     /* Check packet size limits */
     if (len < 1 || len > UDP_PROXY_DGRAM_CAP) {
-        P_LOG_WARN("Invalid packet size %zu from %s (min=1, max=%d)", len,
-                   sockaddr_to_string(src), UDP_PROXY_DGRAM_CAP);
+        P_LOG_WARN("Invalid packet size %zu from %s (min=1, max=%d)", len, sockaddr_to_string(src),
+                   UDP_PROXY_DGRAM_CAP);
         return false;
     }
 
@@ -479,8 +467,7 @@ static void destroy_backpressure_queue(void) {
 
 /* Add entry to backpressure queue */
 static bool enqueue_backpressure(int sock, const char *data, size_t len,
-                                 const union sockaddr_inx *dest_addr,
-                                 socklen_t dest_len) {
+                                 const union sockaddr_inx *dest_addr, socklen_t dest_len) {
     pthread_mutex_lock(&g_backpressure_queue.lock);
 
     if (g_backpressure_queue.count >= BACKPRESSURE_QUEUE_SIZE) {
@@ -488,8 +475,7 @@ static bool enqueue_backpressure(int sock, const char *data, size_t len,
         return false; /* Queue full */
     }
 
-    struct backpressure_entry *entry =
-        &g_backpressure_queue.entries[g_backpressure_queue.tail];
+    struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.tail];
     entry->sock = sock;
     memcpy(entry->data, data, len);
     entry->len = len;
@@ -500,8 +486,7 @@ static bool enqueue_backpressure(int sock, const char *data, size_t len,
         entry->dest_len = 0;
     }
 
-    g_backpressure_queue.tail =
-        (g_backpressure_queue.tail + 1) % BACKPRESSURE_QUEUE_SIZE;
+    g_backpressure_queue.tail = (g_backpressure_queue.tail + 1) % BACKPRESSURE_QUEUE_SIZE;
     g_backpressure_queue.count++;
 
     pthread_mutex_unlock(&g_backpressure_queue.lock);
@@ -513,15 +498,13 @@ static void process_backpressure_queue(void) {
     pthread_mutex_lock(&g_backpressure_queue.lock);
 
     while (g_backpressure_queue.count > 0) {
-        struct backpressure_entry *entry =
-            &g_backpressure_queue.entries[g_backpressure_queue.head];
+        struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.head];
 
         ssize_t sent;
         if (entry->dest_len > 0) {
             /* UDP sendto */
-            sent =
-                sendto(entry->sock, entry->data, entry->len, 0,
-                       (struct sockaddr *)&entry->dest_addr, entry->dest_len);
+            sent = sendto(entry->sock, entry->data, entry->len, 0,
+                          (struct sockaddr *)&entry->dest_addr, entry->dest_len);
         } else {
             /* Connected UDP send */
             sent = send(entry->sock, entry->data, entry->len, 0);
@@ -536,8 +519,7 @@ static void process_backpressure_queue(void) {
         }
 
         /* Move to next entry */
-        g_backpressure_queue.head =
-            (g_backpressure_queue.head + 1) % BACKPRESSURE_QUEUE_SIZE;
+        g_backpressure_queue.head = (g_backpressure_queue.head + 1) % BACKPRESSURE_QUEUE_SIZE;
         g_backpressure_queue.count--;
     }
 
@@ -568,31 +550,27 @@ static void adjust_batch_size(void) {
     if (batches > 0) {
         double avg_batch_size = (double)packets / batches;
 
-        if (avg_batch_size >
-            g_adaptive_batch.current_size * BATCH_HIGH_UTILIZATION_RATIO) {
+        if (avg_batch_size > g_adaptive_batch.current_size * BATCH_HIGH_UTILIZATION_RATIO) {
             /* High utilization - increase batch size */
             if (g_adaptive_batch.current_size < g_adaptive_batch.max_size) {
                 g_adaptive_batch.current_size =
-                    (int)(g_adaptive_batch.current_size *
-                          BATCH_INCREASE_FACTOR);
+                    (int)(g_adaptive_batch.current_size * BATCH_INCREASE_FACTOR);
                 if (g_adaptive_batch.current_size > g_adaptive_batch.max_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.max_size;
                 }
-                P_LOG_INFO("Increased batch size to %d (avg=%.1f)",
-                           g_adaptive_batch.current_size, avg_batch_size);
+                P_LOG_INFO("Increased batch size to %d (avg=%.1f)", g_adaptive_batch.current_size,
+                           avg_batch_size);
             }
-        } else if (avg_batch_size < g_adaptive_batch.current_size *
-                                        BATCH_LOW_UTILIZATION_RATIO) {
+        } else if (avg_batch_size < g_adaptive_batch.current_size * BATCH_LOW_UTILIZATION_RATIO) {
             /* Low utilization - decrease batch size */
             if (g_adaptive_batch.current_size > g_adaptive_batch.min_size) {
                 g_adaptive_batch.current_size =
-                    (int)(g_adaptive_batch.current_size *
-                          BATCH_DECREASE_FACTOR);
+                    (int)(g_adaptive_batch.current_size * BATCH_DECREASE_FACTOR);
                 if (g_adaptive_batch.current_size < g_adaptive_batch.min_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.min_size;
                 }
-                P_LOG_INFO("Decreased batch size to %d (avg=%.1f)",
-                           g_adaptive_batch.current_size, avg_batch_size);
+                P_LOG_INFO("Decreased batch size to %d (avg=%.1f)", g_adaptive_batch.current_size,
+                           avg_batch_size);
             }
         }
     }
@@ -761,8 +739,7 @@ static void segmented_update_lru(void) {
 
     /* Adjust buckets per segment based on total hash table size */
     if (g_lru_segment_state.buckets_per_segment == 0) {
-        g_lru_segment_state.buckets_per_segment =
-            (g_conn_tbl_hash_size / 32) + 1;
+        g_lru_segment_state.buckets_per_segment = (g_conn_tbl_hash_size / 32) + 1;
         if (g_lru_segment_state.buckets_per_segment > 256) {
             g_lru_segment_state.buckets_per_segment = 256;
         }
@@ -772,8 +749,7 @@ static void segmented_update_lru(void) {
 
     /* Process only a segment of buckets to spread the work over time */
     unsigned start_bucket = g_lru_segment_state.next_bucket;
-    unsigned end_bucket =
-        start_bucket + g_lru_segment_state.buckets_per_segment;
+    unsigned end_bucket = start_bucket + g_lru_segment_state.buckets_per_segment;
     if (end_bucket > g_conn_tbl_hash_size) {
         end_bucket = g_conn_tbl_hash_size;
     }
@@ -805,8 +781,7 @@ static void segmented_update_lru(void) {
 #endif
 }
 
-static struct proxy_conn *
-proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
+static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
     struct list_head *chain = &conn_tbl_hbase[bucket_index_fun(cli_addr)];
     struct proxy_conn *conn = NULL;
     int svr_sock = -1;
@@ -832,7 +807,6 @@ proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
         /* First, try to recycle any timed-out connections */
         proxy_conn_walk_continue(current_conn_count, epfd);
 
-
         /* Reload count after cleanup */
         current_conn_count = atomic_load(&conn_tbl_len);
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
@@ -842,10 +816,8 @@ proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
         /* Final check after eviction */
         current_conn_count = atomic_load(&conn_tbl_len);
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-            inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr),
-                      s_addr, sizeof(s_addr));
-            P_LOG_WARN("Conn table full (%u), dropping %s:%d",
-                       current_conn_count, s_addr,
+            inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
+            P_LOG_WARN("Conn table full (%u), dropping %s:%d", current_conn_count, s_addr,
                        ntohs(*port_of_sockaddr(cli_addr)));
             goto err;
         }
@@ -855,11 +827,10 @@ proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
     static bool warned_high_water = false;
     if (!warned_high_water && g_conn_pool.capacity > 0 &&
         conn_tbl_len >= (unsigned)((g_conn_pool.capacity * 9) / 10)) {
-        P_LOG_WARN(
-            "UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or "
-            "reducing -t.",
-            conn_tbl_len, (unsigned)g_conn_pool.capacity,
-            (int)((conn_tbl_len * 100) / (unsigned)g_conn_pool.capacity));
+        P_LOG_WARN("UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or "
+                   "reducing -t.",
+                   conn_tbl_len, (unsigned)g_conn_pool.capacity,
+                   (int)((conn_tbl_len * 100) / (unsigned)g_conn_pool.capacity));
         warned_high_water = true;
     }
 
@@ -870,14 +841,14 @@ proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
         goto err;
     }
     /* Connect to real server. */
-    if (connect(svr_sock, (struct sockaddr *)&g_cfg.dst_addr,
-                sizeof_sockaddr(&g_cfg.dst_addr)) != 0) {
+    if (connect(svr_sock, (struct sockaddr *)&g_cfg.dst_addr, sizeof_sockaddr(&g_cfg.dst_addr)) !=
+        0) {
         /* Error occurs, drop the session. */
         P_LOG_WARN("Connection failed: %s", strerror(errno));
         goto err;
     }
     set_nonblock(svr_sock);
-    
+
     /* Allocate session data for the connection */
     if (!(conn = init_proxy_conn(conn_pool_alloc(&g_conn_pool)))) {
         P_LOG_ERR("conn_pool_alloc: failed");
@@ -923,10 +894,9 @@ proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
     static _Atomic unsigned log_counter = 0;
     unsigned current_count = atomic_fetch_add(&log_counter, 1);
     if ((current_count % 100) == 0) {
-        inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr,
-                  sizeof(s_addr));
-        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every 100th)",
-                   s_addr, ntohs(*port_of_sockaddr(cli_addr)), new_count);
+        inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
+        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every 100th)", s_addr,
+                   ntohs(*port_of_sockaddr(cli_addr)), new_count);
     }
 
     conn->last_active = monotonic_seconds();
@@ -981,14 +951,12 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
 
     /* Remove from epoll and close socket */
     if (conn->svr_sock >= 0) {
-        if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 &&
-            errno != EBADF && errno != ENOENT) {
-            P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock,
-                       strerror(errno));
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && errno != EBADF &&
+            errno != ENOENT) {
+            P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock, strerror(errno));
         }
         if (safe_close(conn->svr_sock) < 0) {
-            P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock,
-                       strerror(errno));
+            P_LOG_WARN("close(svr_sock=%d): %s", conn->svr_sock, strerror(errno));
         }
         conn->svr_sock = -1;
     }
@@ -1010,8 +978,7 @@ static void proxy_conn_walk_continue(unsigned walk_max, int epfd) {
     }
 
     while (walked < walk_max && !list_empty(&g_lru_list)) {
-        struct proxy_conn *oldest =
-            list_first_entry(&g_lru_list, struct proxy_conn, lru);
+        struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
 
         long diff = (long)(now - oldest->last_active);
         if (diff < 0)
@@ -1028,10 +995,9 @@ static void proxy_conn_walk_continue(unsigned walk_max, int epfd) {
         pthread_mutex_unlock(&g_lru_lock);
 
         release_proxy_conn(oldest, epfd);
-        inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr,
-                  sizeof(s_addr));
-        P_LOG_INFO("Recycled %s:%d [%u]", s_addr,
-                   ntohs(*port_of_sockaddr(&addr)), atomic_load(&conn_tbl_len));
+        inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
+        P_LOG_INFO("Recycled %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
+                   atomic_load(&conn_tbl_len));
 
         walked++;
 
@@ -1049,8 +1015,7 @@ static bool proxy_conn_evict_one(int epfd) {
         return false;
     }
 
-    struct proxy_conn *oldest =
-        list_first_entry(&g_lru_list, struct proxy_conn, lru);
+    struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
     union sockaddr_inx addr = oldest->cli_addr;
     char s_addr[50] = "";
 
@@ -1058,10 +1023,9 @@ static bool proxy_conn_evict_one(int epfd) {
     pthread_mutex_unlock(&g_lru_lock);
 
     release_proxy_conn(oldest, epfd);
-    inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr,
-              sizeof(s_addr));
-    P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr,
-               ntohs(*port_of_sockaddr(&addr)), atomic_load(&conn_tbl_len));
+    inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
+    P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
+               atomic_load(&conn_tbl_len));
 
     return true;
 }
@@ -1071,9 +1035,8 @@ static bool proxy_conn_evict_one(int epfd) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #ifdef __linux__
-static void handle_client_data(int lsn_sock, int epfd,
-                               struct mmsghdr *c_msgs, struct mmsghdr *s_msgs,
-                               struct iovec *s_iovs,
+static void handle_client_data(int lsn_sock, int epfd, struct mmsghdr *c_msgs,
+                               struct mmsghdr *s_msgs, struct iovec *s_iovs,
                                char (*c_bufs)[UDP_PROXY_DGRAM_CAP]) {
 #else
 static void handle_client_data(int lsn_sock, int epfd) {
@@ -1085,8 +1048,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
         /* Drain multiple batches per epoll wake to reduce syscalls */
         int iterations = 0;
         const int max_iterations = 64; /* fairness cap per tick */
-        const int ncap =
-            g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
+        const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
         for (; iterations < max_iterations; iterations++) {
             /* Ensure namelen is reset before each recvmmsg call */
             for (int i = 0; i < ncap; i++) {
@@ -1095,8 +1057,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
             int n = recvmmsg(lsn_sock, c_msgs, ncap, 0, NULL);
             if (n <= 0) {
-                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                    errno != EINTR)
+                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
                     P_LOG_WARN("recvmmsg(): %s", strerror(errno));
                 break; /* no more to read now */
             }
@@ -1113,8 +1074,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
             memset(batch_hash, -1, sizeof(batch_hash));
 
             for (int i = 0; i < n; i++) {
-                union sockaddr_inx *sa =
-                    (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
+                union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
 
                 /* Validate packet size and rate limits */
                 size_t packet_len = c_msgs[i].msg_len;
@@ -1136,8 +1096,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 int probe_count = 0;
 
                 /* Linear probing to handle hash collisions */
-                while (batch_idx != -1 &&
-                       batches[batch_idx].sock != conn->svr_sock &&
+                while (batch_idx != -1 && batches[batch_idx].sock != conn->svr_sock &&
                        probe_count < BATCH_HASH_SIZE) {
                     hash_key = (hash_key + 1) % BATCH_HASH_SIZE;
                     batch_idx = batch_hash[hash_key];
@@ -1154,12 +1113,9 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     /* Check if we can create a new batch */
                     if (num_batches >= MAX_CONCURRENT_BATCHES) {
                         atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
-                        ssize_t wr = send(conn->svr_sock, c_bufs[i],
-                                          c_msgs[i].msg_len, 0);
-                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                            errno != EINTR) {
-                            P_LOG_WARN("send(server, overflow): %s",
-                                       strerror(errno));
+                        ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                            P_LOG_WARN("send(server, overflow): %s", strerror(errno));
                         }
                         continue;
                     }
@@ -1171,16 +1127,12 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 }
                 if (batches[batch_idx].count >= get_optimal_batch_size()) {
                     atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
-                    ssize_t wr =
-                        send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
-                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                        errno != EINTR) {
-                        P_LOG_WARN("send(server, batch_full): %s",
-                                   strerror(errno));
+                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                        P_LOG_WARN("send(server, batch_full): %s", strerror(errno));
                     }
                 } else {
-                    batches[batch_idx].msg_indices[batches[batch_idx].count++] =
-                        i;
+                    batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
                 }
             }
 
@@ -1201,14 +1153,12 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 do {
                     int sent = sendmmsg(b->sock, msgp, remaining, 0);
                     if (sent < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK ||
-                            errno == EINTR) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
                             /* Socket buffer full - rely on kernel buffering,
                              * don't queue in userspace */
                             /* This is more efficient than copying data to
                              * userspace queues */
-                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow,
-                                             remaining);
+                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, remaining);
                             break;
                         }
                         P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, "
@@ -1218,16 +1168,13 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     }
                     if (sent == 0) {
                         /* Avoid tight loop if nothing progressed */
-                        P_LOG_WARN(
-                            "sendmmsg(server) sent 0 packets, remaining=%d",
-                            remaining);
+                        P_LOG_WARN("sendmmsg(server) sent 0 packets, remaining=%d", remaining);
                         break;
                     }
                     if (sent < remaining) {
                         /* Partial send - log for debugging */
-                        P_LOG_INFO(
-                            "sendmmsg(server) partial: sent=%d, remaining=%d",
-                            sent, remaining);
+                        P_LOG_INFO("sendmmsg(server) partial: sent=%d, remaining=%d", sent,
+                                   remaining);
                     }
                     remaining -= sent;
                     msgp += sent;
@@ -1260,8 +1207,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
     union sockaddr_inx cli_addr;
     socklen_t cli_alen = sizeof(cli_addr);
 
-    int r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0,
-                     (struct sockaddr *)&cli_addr, &cli_alen);
+    int r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&cli_addr, &cli_alen);
     if (r < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
             P_LOG_WARN("recvfrom(): %s", strerror(errno));
@@ -1288,8 +1234,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
     }
 }
 
-static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
-                               int epfd) {
+static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) {
 #ifdef __linux__
     /* Use recvmmsg() to batch receive from server and sendmmsg() to client */
     struct mmsghdr msgs[UDP_PROXY_BATCH_SZ];
@@ -1300,8 +1245,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
 
     int iterations = 0;
     const int max_iterations = 64; /* fairness cap per event */
-    const int ncap =
-        g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
+    const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
 
     for (; iterations < max_iterations; iterations++) {
         /* Only initialize what we need instead of expensive full memset */
@@ -1334,8 +1278,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
         /* Prepare destination (original client) for each message */
         for (int i = 0; i < n; i++) {
             msgs[i].msg_hdr.msg_name = &conn->cli_addr;
-            msgs[i].msg_hdr.msg_namelen =
-                (socklen_t)sizeof_sockaddr(&conn->cli_addr);
+            msgs[i].msg_hdr.msg_namelen = (socklen_t)sizeof_sockaddr(&conn->cli_addr);
             /* Ensure iov_len matches actual datagram size */
             iovs[i].iov_len = msgs[i].msg_len;
             touch_proxy_conn(conn);
@@ -1351,21 +1294,18 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
                     /* leave remaining for later */
                     break;
                 }
-                P_LOG_WARN(
-                    "sendmmsg(client) failed: %s, attempted=%d, remaining=%d",
-                    strerror(errno), remaining, remaining);
+                P_LOG_WARN("sendmmsg(client) failed: %s, attempted=%d, remaining=%d",
+                           strerror(errno), remaining, remaining);
                 break;
             }
             if (sent == 0) {
                 /* Avoid tight loop if nothing progressed */
-                P_LOG_WARN("sendmmsg(client) sent 0 packets, remaining=%d",
-                           remaining);
+                P_LOG_WARN("sendmmsg(client) sent 0 packets, remaining=%d", remaining);
                 break;
             }
             if (sent < remaining) {
                 /* Partial send - log for debugging */
-                P_LOG_INFO("sendmmsg(client) partial: sent=%d, remaining=%d",
-                           sent, remaining);
+                P_LOG_INFO("sendmmsg(client) partial: sent=%d, remaining=%d", sent, remaining);
             }
             remaining -= sent;
             msgp += sent;
@@ -1390,11 +1330,9 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
         /* r >= 0: forward even zero-length datagrams */
         touch_proxy_conn(conn);
 
-        ssize_t wr =
-            sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
-                   sizeof_sockaddr(&conn->cli_addr));
-        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-            errno != EINTR) {
+        ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
+                            sizeof_sockaddr(&conn->cli_addr));
+        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
             P_LOG_WARN("sendto(client): %s", strerror(errno));
         }
 
@@ -1410,11 +1348,9 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock,
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #ifdef __linux__
-static void init_batching_resources(struct mmsghdr **c_msgs,
-                                    struct iovec **c_iov,
+static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
                                     struct sockaddr_storage **c_addrs,
-                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP],
-                                    struct mmsghdr **s_msgs,
+                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr **s_msgs,
                                     struct iovec **s_iovs) {
     int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
     *c_msgs = calloc(ncap, sizeof(**c_msgs));
@@ -1456,11 +1392,9 @@ static void init_batching_resources(struct mmsghdr **c_msgs,
     }
 }
 
-static void destroy_batching_resources(struct mmsghdr *c_msgs,
-                                       struct iovec *c_iov,
+static void destroy_batching_resources(struct mmsghdr *c_msgs, struct iovec *c_iov,
                                        struct sockaddr_storage *c_addrs,
-                                       char (*c_bufs)[UDP_PROXY_DGRAM_CAP],
-                                       struct mmsghdr *s_msgs,
+                                       char (*c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr *s_msgs,
                                        struct iovec *s_iovs) {
     free(c_msgs);
     free(c_iov);
@@ -1478,17 +1412,14 @@ static void destroy_batching_resources(struct mmsghdr *c_msgs,
 static void show_help(const char *prog) {
     P_LOG_INFO("Userspace UDP proxy.");
     P_LOG_INFO("Usage:");
-    P_LOG_INFO("  %s <local_ip:local_port> <dest_ip:dest_port> [options]",
-               prog);
+    P_LOG_INFO("  %s <local_ip:local_port> <dest_ip:dest_port> [options]", prog);
     P_LOG_INFO("Examples:");
     P_LOG_INFO("  %s 0.0.0.0:10000 10.0.0.1:20000", prog);
     P_LOG_INFO("  %s [::]:10000 [2001:db8::1]:20000", prog);
     P_LOG_INFO("Options:");
-    P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)",
-               DEFAULT_CONN_TIMEOUT_SEC);
-    P_LOG_INFO(
-        "  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d)",
-        UDP_PROXY_SOCKBUF_CAP);
+    P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)", DEFAULT_CONN_TIMEOUT_SEC);
+    P_LOG_INFO("  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d)",
+               UDP_PROXY_SOCKBUF_CAP);
     P_LOG_INFO("  -C <max_conns>   maximum tracked UDP sessions (default: %d)",
                UDP_PROXY_MAX_CONNS);
     P_LOG_INFO("  -B <batch>       Linux recvmmsg/sendmmsg batch size (1..%d, "
@@ -1536,8 +1467,10 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -t value '%s', keeping default %u", optarg,
                            g_cfg.proxy_conn_timeo);
             } else {
-                if (v == 0) v = 1;
-                if (v > 86400UL) v = 86400UL;
+                if (v == 0)
+                    v = 1;
+                if (v > 86400UL)
+                    v = 86400UL;
                 g_cfg.proxy_conn_timeo = (unsigned)v;
             }
             break;
@@ -1549,8 +1482,10 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -S value '%s', keeping default %d", optarg,
                            g_sockbuf_cap_runtime);
             } else {
-                if (v < 4096) v = 4096;
-                if (v > (8 << 20)) v = (8 << 20);
+                if (v < 4096)
+                    v = 4096;
+                if (v > (8 << 20))
+                    v = (8 << 20);
                 g_sockbuf_cap_runtime = (int)v;
             }
             break;
@@ -1562,8 +1497,10 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -C value '%s', keeping default %d", optarg,
                            g_conn_pool_capacity);
             } else {
-                if (v < 64) v = 64;
-                if (v > (1 << 20)) v = (1 << 20);
+                if (v < 64)
+                    v = 64;
+                if (v > (1 << 20))
+                    v = (1 << 20);
                 g_conn_pool_capacity = (int)v;
             }
             break;
@@ -1573,11 +1510,12 @@ int main(int argc, char *argv[]) {
             char *end = NULL;
             long v = strtol(optarg, &end, 10);
             if (end == optarg || *end != '\0') {
-                P_LOG_WARN("invalid -B value '%s', keeping default %d", optarg,
-                           g_batch_sz_runtime);
+                P_LOG_WARN("invalid -B value '%s', keeping default %d", optarg, g_batch_sz_runtime);
             } else {
-                if (v < 1) v = 1;
-                if (v > UDP_PROXY_BATCH_SZ) v = UDP_PROXY_BATCH_SZ;
+                if (v < 1)
+                    v = 1;
+                if (v > UDP_PROXY_BATCH_SZ)
+                    v = UDP_PROXY_BATCH_SZ;
                 g_batch_sz_runtime = (int)v;
             }
 #else
@@ -1592,14 +1530,19 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -H value '%s', keeping default %u", optarg,
                            g_cfg.conn_tbl_hash_size);
             } else {
-                if (v == 0) v = 4093UL;
-                if (v < 64UL) v = 64UL;
-                if (v > (1UL << 20)) v = (1UL << 20);
+                if (v == 0)
+                    v = 4093UL;
+                if (v < 64UL)
+                    v = 64UL;
+                if (v > (1UL << 20))
+                    v = (1UL << 20);
                 g_cfg.conn_tbl_hash_size = (unsigned)v;
             }
             break;
         }
-        default: show_help(argv[0]); return 1;
+        default:
+            show_help(argv[0]);
+            return 1;
         }
     }
 
@@ -1608,21 +1551,24 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (get_sockaddr_inx(argv[optind], &g_cfg.listen_addr, true) != 0) return 1;
-    if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0) return 1;
+    if (get_sockaddr_inx(argv[optind], &g_cfg.listen_addr, true) != 0)
+        return 1;
+    if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0)
+        return 1;
 
     openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
     if (g_cfg.daemonize) {
-        if (do_daemonize() != 0) return 1;
+        if (do_daemonize() != 0)
+            return 1;
     }
 
     if (g_cfg.pidfile) {
-        if (create_pid_file(g_cfg.pidfile) != 0) return 1;
+        if (create_pid_file(g_cfg.pidfile) != 0)
+            return 1;
     }
 
-    if (conn_pool_init(&g_conn_pool, g_conn_pool_capacity,
-                       sizeof(struct proxy_conn)) < 0) {
+    if (conn_pool_init(&g_conn_pool, g_conn_pool_capacity, sizeof(struct proxy_conn)) < 0) {
         P_LOG_ERR("conn_pool_init: failed");
         goto cleanup;
     }
@@ -1641,8 +1587,7 @@ int main(int argc, char *argv[]) {
 
     if (g_cfg.reuse_addr) {
         int on = 1;
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) <
-            0) {
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0) {
             P_LOG_WARN("setsockopt(SO_REUSEADDR): %s", strerror(errno));
         }
     }
@@ -1650,8 +1595,7 @@ int main(int argc, char *argv[]) {
 #ifdef SO_REUSEPORT
     if (g_cfg.reuse_port) {
         int on = 1;
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) <
-            0) {
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on)) < 0) {
             P_LOG_WARN("setsockopt(SO_REUSEPORT): %s", strerror(errno));
         }
     }
@@ -1669,17 +1613,20 @@ int main(int argc, char *argv[]) {
 
     set_nonblock(listen_sock);
     if (g_sockbuf_cap_runtime > 0) {
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime, sizeof(g_sockbuf_cap_runtime)) < 0) {
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime,
+                       sizeof(g_sockbuf_cap_runtime)) < 0) {
             P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
         }
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime, sizeof(g_sockbuf_cap_runtime)) < 0) {
+        if (setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime,
+                       sizeof(g_sockbuf_cap_runtime)) < 0) {
             P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
         }
     }
 
 #ifdef EPOLL_CLOEXEC
     epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL)) epfd = epoll_create(1);
+    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL))
+        epfd = epoll_create(1);
 #else
     epfd = epoll_create(1);
 #endif
@@ -1689,13 +1636,13 @@ int main(int argc, char *argv[]) {
     }
 
     g_conn_tbl_hash_size = g_cfg.conn_tbl_hash_size;
-    if (g_conn_tbl_hash_size < 64) g_conn_tbl_hash_size = 64;
-    if (g_conn_tbl_hash_size > (1u << 20)) g_conn_tbl_hash_size = (1u << 20);
+    if (g_conn_tbl_hash_size < 64)
+        g_conn_tbl_hash_size = 64;
+    if (g_conn_tbl_hash_size > (1u << 20))
+        g_conn_tbl_hash_size = (1u << 20);
 
     bucket_index_fun =
-        is_power_of_two(g_conn_tbl_hash_size)
-            ? proxy_conn_hash_bitwise
-            : proxy_conn_hash_mod;
+        is_power_of_two(g_conn_tbl_hash_size) ? proxy_conn_hash_bitwise : proxy_conn_hash_mod;
     assert(bucket_index_fun != NULL);
 
     conn_tbl_hbase = malloc(sizeof(struct list_head) * g_conn_tbl_hash_size);
@@ -1714,8 +1661,7 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
     for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
-        if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) !=
-            0) {
+        if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) != 0) {
             P_LOG_ERR("pthread_spin_init(lock %d): failed", i);
             rc = 1;
             goto cleanup;
@@ -1728,8 +1674,7 @@ int main(int argc, char *argv[]) {
 
     /* Optional Linux batching init */
 #ifdef __linux__
-    init_batching_resources(&c_msgs, &c_iov, &c_addrs, &c_bufs, &s_msgs,
-                            &s_iovs);
+    init_batching_resources(&c_msgs, &c_iov, &c_addrs, &c_bufs, &s_msgs, &s_iovs);
 #endif
 
     /* epoll loop */
@@ -1848,11 +1793,11 @@ cleanup:
     uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates);
 
     P_LOG_INFO("Performance statistics:");
-    P_LOG_INFO("  Batch overflows: sockets=%" PRIu64 ", entries=%" PRIu64,
-               socket_overflows, entry_overflows);
+    P_LOG_INFO("  Batch overflows: sockets=%" PRIu64 ", entries=%" PRIu64, socket_overflows,
+               entry_overflows);
     P_LOG_INFO("  Hash collisions: %" PRIu64, hash_collisions);
-    P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64,
-               lru_immediate, lru_deferred);
+    P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64, lru_immediate,
+               lru_deferred);
 
     if (socket_overflows > 0) {
         P_LOG_WARN("Consider increasing -B (batch size) or -C (max "

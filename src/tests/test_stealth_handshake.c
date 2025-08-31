@@ -27,9 +27,8 @@ int test_stealth_handshake_basic() {
     uint8_t packet[1024];
     size_t packet_len = sizeof(packet);
 
-    if (stealth_handshake_create_first_packet(
-            psk, token, (const uint8_t *)initial_data, initial_data_len, packet,
-            &packet_len) != 0) {
+    if (stealth_handshake_create_first_packet(psk, token, (const uint8_t *)initial_data,
+                                              initial_data_len, packet, &packet_len) != 0) {
         printf("✗ Failed to create stealth handshake packet\n");
         return 1;
     }
@@ -41,8 +40,7 @@ int test_stealth_handshake_basic() {
     uint8_t extracted_data[1024];
     size_t extracted_data_len = sizeof(extracted_data);
 
-    if (stealth_handshake_parse_first_packet(psk, packet, packet_len, &payload,
-                                             extracted_data,
+    if (stealth_handshake_parse_first_packet(psk, packet, packet_len, &payload, extracted_data,
                                              &extracted_data_len) != 0) {
         printf("✗ Failed to parse stealth handshake packet\n");
         return 1;
@@ -61,8 +59,8 @@ int test_stealth_handshake_basic() {
 
     /* Validate extracted data */
     if (extracted_data_len != initial_data_len) {
-        printf("✗ Extracted data length mismatch: expected %zu, got %zu\n",
-               initial_data_len, extracted_data_len);
+        printf("✗ Extracted data length mismatch: expected %zu, got %zu\n", initial_data_len,
+               extracted_data_len);
         return 1;
     }
 
@@ -93,8 +91,7 @@ int test_stealth_handshake_response() {
     uint8_t response_packet[1024];
     size_t response_len = sizeof(response_packet);
 
-    if (stealth_handshake_create_response(psk, conv, token, response_packet,
-                                          &response_len) != 0) {
+    if (stealth_handshake_create_response(psk, conv, token, response_packet, &response_len) != 0) {
         printf("✗ Failed to create stealth handshake response\n");
         return 1;
     }
@@ -103,8 +100,7 @@ int test_stealth_handshake_response() {
 
     /* Parse the response back */
     struct stealth_handshake_response response;
-    if (stealth_handshake_parse_response(psk, response_packet, response_len,
-                                         &response) != 0) {
+    if (stealth_handshake_parse_response(psk, response_packet, response_len, &response) != 0) {
         printf("✗ Failed to parse stealth handshake response\n");
         return 1;
     }
@@ -116,8 +112,8 @@ int test_stealth_handshake_response() {
     }
 
     if (ntohl(response.conv) != conv) {
-        printf("✗ Conversation ID mismatch: expected 0x%08x, got 0x%08x\n",
-               conv, ntohl(response.conv));
+        printf("✗ Conversation ID mismatch: expected 0x%08x, got 0x%08x\n", conv,
+               ntohl(response.conv));
         return 1;
     }
 
@@ -149,9 +145,9 @@ int test_stealth_handshake_full_flow() {
     uint8_t client_packet[1024];
     size_t client_packet_len = sizeof(client_packet);
 
-    if (stealth_handshake_create_first_packet(
-            psk, client_token, (const uint8_t *)initial_request, request_len,
-            client_packet, &client_packet_len) != 0) {
+    if (stealth_handshake_create_first_packet(psk, client_token, (const uint8_t *)initial_request,
+                                              request_len, client_packet,
+                                              &client_packet_len) != 0) {
         printf("✗ Client failed to create stealth handshake\n");
         return 1;
     }
@@ -161,9 +157,8 @@ int test_stealth_handshake_full_flow() {
     uint8_t server_extracted[1024];
     size_t server_extracted_len = sizeof(server_extracted);
 
-    if (stealth_handshake_parse_first_packet(
-            psk, client_packet, client_packet_len, &server_payload,
-            server_extracted, &server_extracted_len) != 0) {
+    if (stealth_handshake_parse_first_packet(psk, client_packet, client_packet_len, &server_payload,
+                                             server_extracted, &server_extracted_len) != 0) {
         printf("✗ Server failed to parse stealth handshake\n");
         return 1;
     }
@@ -173,8 +168,7 @@ int test_stealth_handshake_full_flow() {
     uint8_t server_response[1024];
     size_t server_response_len = sizeof(server_response);
 
-    if (stealth_handshake_create_response(psk, server_conv,
-                                          server_payload.token, server_response,
+    if (stealth_handshake_create_response(psk, server_conv, server_payload.token, server_response,
                                           &server_response_len) != 0) {
         printf("✗ Server failed to create response\n");
         return 1;
@@ -182,8 +176,8 @@ int test_stealth_handshake_full_flow() {
 
     /* Client parses response */
     struct stealth_handshake_response client_response;
-    if (stealth_handshake_parse_response(
-            psk, server_response, server_response_len, &client_response) != 0) {
+    if (stealth_handshake_parse_response(psk, server_response, server_response_len,
+                                         &client_response) != 0) {
         printf("✗ Client failed to parse server response\n");
         return 1;
     }
@@ -231,8 +225,8 @@ int test_stealth_handshake_wrong_psk() {
     uint8_t packet[1024];
     size_t packet_len = sizeof(packet);
 
-    if (stealth_handshake_create_first_packet(correct_psk, token, NULL, 0,
-                                              packet, &packet_len) != 0) {
+    if (stealth_handshake_create_first_packet(correct_psk, token, NULL, 0, packet, &packet_len) !=
+        0) {
         printf("✗ Failed to create packet with correct PSK\n");
         return 1;
     }
@@ -242,9 +236,8 @@ int test_stealth_handshake_wrong_psk() {
     uint8_t extracted_data[1024];
     size_t extracted_data_len = sizeof(extracted_data);
 
-    if (stealth_handshake_parse_first_packet(wrong_psk, packet, packet_len,
-                                             &payload, extracted_data,
-                                             &extracted_data_len) == 0) {
+    if (stealth_handshake_parse_first_packet(wrong_psk, packet, packet_len, &payload,
+                                             extracted_data, &extracted_data_len) == 0) {
         printf("✗ Parsing with wrong PSK should have failed but succeeded\n");
         return 1;
     }
@@ -270,8 +263,7 @@ int main() {
                "correctly.\n");
         return 0;
     } else {
-        printf("✗ %d test(s) failed. Stealth handshake protocol has issues.\n",
-               failures);
+        printf("✗ %d test(s) failed. Stealth handshake protocol has issues.\n", failures);
         return 1;
     }
 }

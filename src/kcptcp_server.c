@@ -59,7 +59,6 @@ struct rate_limiter {
     pthread_mutex_t lock;
 };
 
-
 struct cfg_server {
     union sockaddr_inx laddr; /* UDP listen address */
     union sockaddr_inx taddr; /* TCP target address */
@@ -90,16 +89,13 @@ static struct rate_limiter g_rate_limiter = {0};
 static struct conn_limiter g_conn_limiter = {0};
 
 /* Forward declarations */
-static void conn_cleanup_server(struct proxy_conn *conn, int epfd,
-                                struct kcp_map_safe *cmap);
+static void conn_cleanup_server(struct proxy_conn *conn, int epfd, struct kcp_map_safe *cmap);
 
 /* Thread-safe KCP map operations */
 static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets);
 static void kcp_map_safe_free(struct kcp_map_safe *cmap);
-static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap,
-                                           uint32_t conv);
-static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv,
-                            struct proxy_conn *c);
+static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap, uint32_t conv);
+static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv, struct proxy_conn *c);
 static void kcp_map_safe_del(struct kcp_map_safe *cmap, uint32_t conv);
 static void remove_pid_file(const char *pidfile) {
     if (pidfile) {
@@ -137,27 +133,20 @@ static bool rate_limit_check_addr(const union sockaddr_inx *addr);
 static bool conn_limit_check(const union sockaddr_inx *addr);
 static void conn_limit_release(const union sockaddr_inx *addr);
 static size_t addr_hash(const union sockaddr_inx *addr);
-static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,
-                                 struct proxy_conn *conn);
-static uint32_t derive_conv_from_psk_token(const uint8_t psk[32],
-                                           const uint8_t token[16]);
-
+static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev, struct proxy_conn *conn);
+static uint32_t derive_conv_from_psk_token(const uint8_t psk[32], const uint8_t token[16]);
 
 /* Enhanced error handling */
-#define LOG_CONN_ERR(conn, fmt, ...)                                           \
-    P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,           \
-              ##__VA_ARGS__)
+#define LOG_CONN_ERR(conn, fmt, ...)                                                               \
+    P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
 /* Enhanced error handling functions */
 
-#define LOG_CONN_WARN(conn, fmt, ...)                                          \
-    P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,          \
-               ##__VA_ARGS__)
+#define LOG_CONN_WARN(conn, fmt, ...)                                                              \
+    P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
-#define LOG_CONN_INFO(conn, fmt, ...)                                          \
-    P_LOG_INFO("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state,          \
-               ##__VA_ARGS__)
-
+#define LOG_CONN_INFO(conn, fmt, ...)                                                              \
+    P_LOG_INFO("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
 /* Safe epoll add/modify wrapper for server */
 static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,
@@ -173,15 +162,14 @@ static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev,
 }
 
 /* Optionally derive a deterministic conv from PSK + client token. */
-static uint32_t derive_conv_from_psk_token(const uint8_t psk[32],
-                                           const uint8_t token[16]) {
+static uint32_t derive_conv_from_psk_token(const uint8_t psk[32], const uint8_t token[16]) {
     if (!psk || !token)
         return 0;
     uint8_t out_key[32];
     hchacha20(psk, token, out_key);
     /* Fold first 4 bytes into 32-bit conv. Avoid 0. */
-    uint32_t v = (uint32_t)out_key[0] | ((uint32_t)out_key[1] << 8) |
-                 ((uint32_t)out_key[2] << 16) | ((uint32_t)out_key[3] << 24);
+    uint32_t v = (uint32_t)out_key[0] | ((uint32_t)out_key[1] << 8) | ((uint32_t)out_key[2] << 16) |
+                 ((uint32_t)out_key[3] << 24);
     if (v == 0)
         v = 1; /* avoid 0 */
     return v;
@@ -197,8 +185,7 @@ static void secure_zero(void *ptr, size_t len) {
 }
 
 /* Unified connection cleanup function */
-static void conn_cleanup_server(struct proxy_conn *conn, int epfd,
-                                struct kcp_map_safe *cmap) {
+static void conn_cleanup_server(struct proxy_conn *conn, int epfd, struct kcp_map_safe *cmap) {
     if (!conn)
         return;
 
@@ -236,8 +223,7 @@ static void conn_cleanup_server(struct proxy_conn *conn, int epfd,
     if (conn->udp_backlog.data) {
         free(conn->udp_backlog.data);
         conn->udp_backlog.data = NULL;
-        conn->udp_backlog.capacity = conn->udp_backlog.dlen =
-            conn->udp_backlog.rpos = 0;
+        conn->udp_backlog.capacity = conn->udp_backlog.dlen = conn->udp_backlog.rpos = 0;
     }
 
     /* Secure cleanup of sensitive data */
@@ -334,8 +320,7 @@ static bool conn_limit_check(const union sockaddr_inx *addr) {
     } else {
         if (entry->count >= DEFAULT_MAX_CONNECTIONS_PER_IP) {
             pthread_mutex_unlock(&g_conn_limiter.lock);
-            P_LOG_WARN("Per-IP connection limit exceeded for %s",
-                       sockaddr_to_string(addr));
+            P_LOG_WARN("Per-IP connection limit exceeded for %s", sockaddr_to_string(addr));
             return false;
         }
         entry->count++;
@@ -374,8 +359,7 @@ static uint32_t generate_secure_conv(void) {
     pthread_mutex_lock(&conv_lock);
 
     uint32_t random_part;
-    if (secure_random_bytes((unsigned char *)&random_part,
-                            sizeof(random_part)) != 0) {
+    if (secure_random_bytes((unsigned char *)&random_part, sizeof(random_part)) != 0) {
         /* Fail closed: return 0 to signal failure upstream */
         pthread_mutex_unlock(&conv_lock);
         return 0;
@@ -387,7 +371,6 @@ static uint32_t generate_secure_conv(void) {
     pthread_mutex_unlock(&conv_lock);
     return conv;
 }
-
 
 static int kcp_map_safe_init(struct kcp_map_safe *cmap, size_t nbuckets) {
     if (!cmap)
@@ -415,8 +398,7 @@ static void kcp_map_safe_free(struct kcp_map_safe *cmap) {
     pthread_rwlock_destroy(&cmap->lock);
 }
 
-static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap,
-                                           uint32_t conv) {
+static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap, uint32_t conv) {
     if (!cmap)
         return NULL;
 
@@ -427,8 +409,7 @@ static struct proxy_conn *kcp_map_safe_get(struct kcp_map_safe *cmap,
     return conn;
 }
 
-static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv,
-                            struct proxy_conn *c) {
+static int kcp_map_safe_put(struct kcp_map_safe *cmap, uint32_t conv, struct proxy_conn *c) {
     if (!cmap)
         return -1;
 
@@ -465,20 +446,17 @@ static int handle_system_error(const char *operation, int error_code) {
         return 1;
     case ENOMEM:
     case ENOBUFS:
-        P_LOG_ERR("Memory/buffer exhaustion in %s: %s", operation,
-                  strerror(error_code));
+        P_LOG_ERR("Memory/buffer exhaustion in %s: %s", operation, strerror(error_code));
         return -1;
     case ECONNRESET:
     case EPIPE:
-        P_LOG_INFO("Connection closed during %s: %s", operation,
-                   strerror(error_code));
+        P_LOG_INFO("Connection closed during %s: %s", operation, strerror(error_code));
         return -1;
     default:
         P_LOG_ERR("System error in %s: %s", operation, strerror(error_code));
         return -1;
     }
 }
-
 
 int main(int argc, char **argv) {
     int rc = 1;
@@ -505,8 +483,7 @@ int main(int argc, char **argv) {
     cfg.reuse_addr = true;
 
     int kcp_mtu = -1;
-    int kcp_nd = -1, kcp_it = -1, kcp_rs = -1, kcp_nc = -1, kcp_snd = -1,
-        kcp_rcv = -1;
+    int kcp_nd = -1, kcp_it = -1, kcp_rs = -1, kcp_nc = -1, kcp_snd = -1, kcp_rcv = -1;
 
     struct kcptcp_common_cli opts;
     int pos = 0;
@@ -583,9 +560,8 @@ int main(int argc, char **argv) {
     }
 
     /* Create UDP listen socket via shared helper */
-    usock =
-        kcptcp_setup_udp_listener(&cfg.laddr, cfg.reuse_addr, cfg.reuse_port,
-                                  cfg.v6only, cfg.sockbuf_bytes);
+    usock = kcptcp_setup_udp_listener(&cfg.laddr, cfg.reuse_addr, cfg.reuse_port, cfg.v6only,
+                                      cfg.sockbuf_bytes);
     if (usock < 0)
         goto cleanup;
 
@@ -600,27 +576,24 @@ int main(int argc, char **argv) {
     }
 
     /* Initialize connection pool */
-    if (conn_pool_init(&g_conn_pool, DEFAULT_CONN_POOL_SIZE,
-                       sizeof(struct proxy_conn)) != 0) {
+    if (conn_pool_init(&g_conn_pool, DEFAULT_CONN_POOL_SIZE, sizeof(struct proxy_conn)) != 0) {
         P_LOG_ERR("Failed to initialize connection pool");
         goto cleanup;
     }
 
-    P_LOG_INFO("kcptcp-server running: UDP %s -> TCP %s",
-               sockaddr_to_string(&cfg.laddr), sockaddr_to_string(&cfg.taddr));
+    P_LOG_INFO("kcptcp-server running: UDP %s -> TCP %s", sockaddr_to_string(&cfg.laddr),
+               sockaddr_to_string(&cfg.taddr));
 
     struct kcp_opts kopts;
     kcp_opts_set_defaults(&kopts);
-    kcp_opts_apply_overrides(&kopts, kcp_mtu, kcp_nd, kcp_it, kcp_rs, kcp_nc,
-                             kcp_snd, kcp_rcv);
+    kcp_opts_apply_overrides(&kopts, kcp_mtu, kcp_nd, kcp_it, kcp_rs, kcp_nc, kcp_snd, kcp_rcv);
 
     while (!g_shutdown_requested) {
         /* Compute timeout from all KCP sessions */
         int timeout_ms = kcptcp_compute_kcp_timeout_ms(&conns, 1000);
 
         struct epoll_event events[DEFAULT_EPOLL_MAX_EVENTS];
-        int nfds =
-            epoll_wait(epfd, events, DEFAULT_EPOLL_MAX_EVENTS, timeout_ms);
+        int nfds = epoll_wait(epfd, events, DEFAULT_EPOLL_MAX_EVENTS, timeout_ms);
         if (nfds < 0) {
             if (errno == EINTR) {
                 /* continue to timer */
@@ -656,8 +629,7 @@ int main(int argc, char **argv) {
                     } else if (rss.ss_family == AF_INET6) {
                         ra.sin6 = *(struct sockaddr_in6 *)&rss;
                     } else {
-                        P_LOG_WARN("drop UDP from unknown family=%d",
-                                   (int)rss.ss_family);
+                        P_LOG_WARN("drop UDP from unknown family=%d", (int)rss.ss_family);
                         continue;
                     }
                     /* Try stealth handshake first: attempt to decrypt any
@@ -677,8 +649,7 @@ int main(int argc, char **argv) {
                         size_t extracted_data_len = sizeof(extracted_data);
 
                         if (stealth_handshake_parse_first_packet(
-                                cfg.psk, (const uint8_t *)buf, (size_t)rn,
-                                &payload, extracted_data,
+                                cfg.psk, (const uint8_t *)buf, (size_t)rn, &payload, extracted_data,
                                 &extracted_data_len) == 0) {
                             /* Successfully parsed stealth handshake! */
 
@@ -692,19 +663,16 @@ int main(int argc, char **argv) {
                                 continue;
                             }
                             /* Create TCP to target via shared helper */
-                            int ts = kcptcp_create_tcp_socket(
-                                cfg.taddr.sa.sa_family, cfg.sockbuf_bytes,
-                                cfg.tcp_nodelay);
+                            int ts = kcptcp_create_tcp_socket(cfg.taddr.sa.sa_family,
+                                                              cfg.sockbuf_bytes, cfg.tcp_nodelay);
                             if (ts < 0) {
                                 continue;
                             }
                             int yes = 1;
-                            (void)setsockopt(ts, SOL_SOCKET, SO_KEEPALIVE, &yes,
-                                             sizeof(yes));
+                            (void)setsockopt(ts, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
 
                             int cr =
-                                connect(ts, &cfg.taddr.sa,
-                                        (socklen_t)sizeof_sockaddr(&cfg.taddr));
+                                connect(ts, &cfg.taddr.sa, (socklen_t)sizeof_sockaddr(&cfg.taddr));
                             if (cr < 0 && errno != EINPROGRESS) {
                                 P_LOG_ERR("connect: %s", strerror(errno));
                                 close(ts);
@@ -727,12 +695,9 @@ int main(int argc, char **argv) {
                             /* Prefer deterministic conv from PSK+token if
                              * available; fallback to secure random */
                             uint32_t conv_try = 0;
-                            if (cfg.has_psk &&
-                                kcptcp_deterministic_conv_enabled()) {
-                                conv_try = derive_conv_from_psk_token(
-                                    cfg.psk, nc->hs_token);
-                                if (conv_try != 0 &&
-                                    kcp_map_safe_get(&cmap, conv_try) != NULL) {
+                            if (cfg.has_psk && kcptcp_deterministic_conv_enabled()) {
+                                conv_try = derive_conv_from_psk_token(cfg.psk, nc->hs_token);
+                                if (conv_try != 0 && kcp_map_safe_get(&cmap, conv_try) != NULL) {
                                     /* Collision: reset to 0 to trigger random
                                      * generation */
                                     conv_try = 0;
@@ -743,8 +708,7 @@ int main(int argc, char **argv) {
                                 do {
                                     conv_try = generate_secure_conv();
                                     attempts++;
-                                    if (attempts >
-                                        MAX_CONV_GENERATION_ATTEMPTS) {
+                                    if (attempts > MAX_CONV_GENERATION_ATTEMPTS) {
                                         P_LOG_ERR("Failed to generate unique "
                                                   "conv after 100 attempts");
                                         close(ts);
@@ -753,17 +717,15 @@ int main(int argc, char **argv) {
                                         continue;
                                     }
                                 } while (conv_try == 0 ||
-                                         kcp_map_safe_get(&cmap, conv_try) !=
-                                             NULL);
+                                         kcp_map_safe_get(&cmap, conv_try) != NULL);
                             }
                             nc->conv = conv_try;
 
                             /* Derive session key if PSK provided */
-                            if (cfg.has_psk &&
-                                kcptcp_deterministic_conv_enabled()) {
-                                if (derive_session_key_from_psk(
-                                        (const uint8_t *)cfg.psk, nc->hs_token,
-                                        nc->conv, nc->session_key) == 0) {
+                            if (cfg.has_psk && kcptcp_deterministic_conv_enabled()) {
+                                if (derive_session_key_from_psk((const uint8_t *)cfg.psk,
+                                                                nc->hs_token, nc->conv,
+                                                                nc->session_key) == 0) {
                                     nc->has_session_key = true;
                                     /* Initialize AEAD nonce base and counters
                                      */
@@ -772,8 +734,7 @@ int main(int argc, char **argv) {
                                     /* Initialize anti-replay detector */
                                     anti_replay_init(&nc->replay_detector);
                                     nc->recv_seq = 0;
-                                    nc->recv_win =
-                                        UINT32_MAX; /* uninitialized */
+                                    nc->recv_win = UINT32_MAX; /* uninitialized */
                                     nc->recv_win_mask = 0ULL;
                                     nc->epoch = 0;
                                     nc->rekey_in_progress = false;
@@ -785,8 +746,7 @@ int main(int argc, char **argv) {
                                 }
                             }
 
-                            if (kcp_setup_conn(nc, usock, &ra, nc->conv,
-                                               &kopts) != 0) {
+                            if (kcp_setup_conn(nc, usock, &ra, nc->conv, &kopts) != 0) {
                                 P_LOG_ERR("kcp_setup_conn failed");
                                 close(ts);
                                 kcp_map_safe_del(&cmap, nc->conv);
@@ -795,22 +755,16 @@ int main(int argc, char **argv) {
                             }
 
                             /* Register TCP server socket */
-                            if (kcptcp_ep_register_tcp(epfd, ts, nc, true) <
-                                0) {
+                            if (kcptcp_ep_register_tcp(epfd, ts, nc, true) < 0) {
                                 int err = errno;
-                                P_LOG_ERR("epoll add tcp failed: %s",
-                                          strerror(err));
+                                P_LOG_ERR("epoll add tcp failed: %s", strerror(err));
                                 /* Use unified cleanup function */
-                                conn_cleanup_server(
-                                    nc, -1,
-                                    &cmap); /* Don't remove from epoll since
-                                               registration failed */
-                                if (handle_system_error("epoll_register_tcp",
-                                                        err) < 0) {
+                                conn_cleanup_server(nc, -1, &cmap); /* Don't remove from epoll since
+                                                                       registration failed */
+                                if (handle_system_error("epoll_register_tcp", err) < 0) {
                                     /* Critical error, might need to exit */
-                                    P_LOG_ERR(
-                                        "Critical epoll error, continuing with "
-                                        "degraded service");
+                                    P_LOG_ERR("Critical epoll error, continuing with "
+                                              "degraded service");
                                 }
                                 continue;
                             }
@@ -821,9 +775,9 @@ int main(int argc, char **argv) {
                             unsigned char response_buf[1024];
                             size_t response_len = sizeof(response_buf);
 
-                            if (stealth_handshake_create_response(
-                                    cfg.psk, nc->conv, nc->hs_token,
-                                    response_buf, &response_len) != 0) {
+                            if (stealth_handshake_create_response(cfg.psk, nc->conv, nc->hs_token,
+                                                                  response_buf,
+                                                                  &response_len) != 0) {
                                 P_LOG_ERR("Failed to create stealth handshake "
                                           "response");
                                 close(nc->svr_sock);
@@ -834,37 +788,30 @@ int main(int argc, char **argv) {
 
                             /* Apply small response jitter to look like normal
                              * traffic */
-                            uint32_t jitter = rand_between(
-                                cfg.hs_rsp_jitter_min_ms, cfg.hs_rsp_jitter_max_ms);
+                            uint32_t jitter =
+                                rand_between(cfg.hs_rsp_jitter_min_ms, cfg.hs_rsp_jitter_max_ms);
                             if (jitter == 0) {
-                                (void)sendto(
-                                    usock, response_buf, response_len,
-                                    MSG_DONTWAIT, &nc->peer_addr.sa,
-                                    (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
+                                             &nc->peer_addr.sa,
+                                             (socklen_t)sizeof_sockaddr(&nc->peer_addr));
                                 P_LOG_INFO("sent stealth handshake response "
                                            "conv=%u for %s (%zu bytes)",
-                                           nc->conv, sockaddr_to_string(&ra),
-                                           response_len);
+                                           nc->conv, sockaddr_to_string(&ra), response_len);
                             } else {
                                 if (response_len <= sizeof(nc->hs_resp_buf)) {
-                                    memcpy(nc->hs_resp_buf, response_buf,
-                                           response_len);
+                                    memcpy(nc->hs_resp_buf, response_buf, response_len);
                                     nc->hs_resp_len = response_len;
-                                    nc->hs_resp_send_at_ms =
-                                        kcp_now_ms() + jitter;
+                                    nc->hs_resp_send_at_ms = kcp_now_ms() + jitter;
                                     nc->hs_resp_pending = true;
                                     P_LOG_DEBUG("queued handshake response "
                                                 "conv=%u with %u ms jitter",
                                                 nc->conv, jitter);
                                 } else {
-                                    P_LOG_WARN(
-                                        "handshake response too large to "
-                                        "buffer; sending immediately");
-                                    (void)sendto(usock, response_buf,
-                                                 response_len, MSG_DONTWAIT,
+                                    P_LOG_WARN("handshake response too large to "
+                                               "buffer; sending immediately");
+                                    (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
                                                  &nc->peer_addr.sa,
-                                                 (socklen_t)sizeof_sockaddr(
-                                                     &nc->peer_addr));
+                                                 (socklen_t)sizeof_sockaddr(&nc->peer_addr));
                                 }
                             }
 
@@ -876,13 +823,11 @@ int main(int argc, char **argv) {
                                             extracted_data_len);
                                 /* Buffer initial data to be sent once connect
                                  * completes */
-                                size_t need =
-                                    nc->request.dlen + extracted_data_len;
-                                if (ensure_buffer_capacity(
-                                        &nc->request, need,
-                                        MAX_TCP_BUFFER_SIZE) == 0) {
-                                    memcpy(nc->request.data + nc->request.dlen,
-                                           extracted_data, extracted_data_len);
+                                size_t need = nc->request.dlen + extracted_data_len;
+                                if (ensure_buffer_capacity(&nc->request, need,
+                                                           MAX_TCP_BUFFER_SIZE) == 0) {
+                                    memcpy(nc->request.data + nc->request.dlen, extracted_data,
+                                           extracted_data_len);
                                     nc->request.dlen += extracted_data_len;
                                 } else {
                                     P_LOG_WARN("Initial data buffer exceeds "
@@ -891,11 +836,9 @@ int main(int argc, char **argv) {
                                 }
                                 /* Ensure EPOLLOUT is enabled so data flushes
                                  * when connect finishes */
-                                if (kcptcp_ep_register_tcp(epfd, nc->svr_sock,
-                                                           nc, true) < 0) {
-                                    LOG_CONN_WARN(nc,
-                                                  "Failed to enable TCP write "
-                                                  "events for initial data");
+                                if (kcptcp_ep_register_tcp(epfd, nc->svr_sock, nc, true) < 0) {
+                                    LOG_CONN_WARN(nc, "Failed to enable TCP write "
+                                                      "events for initial data");
                                 }
                             }
 
@@ -908,8 +851,7 @@ int main(int argc, char **argv) {
 
                     /* Otherwise expect KCP packet for existing conv */
                     if (rn < 24) {
-                        P_LOG_WARN("drop non-handshake short UDP pkt len=%zd",
-                                   rn);
+                        P_LOG_WARN("drop non-handshake short UDP pkt len=%zd", rn);
                         continue;
                     }
                     uint32_t conv = ikcp_getconv(buf);
@@ -920,10 +862,8 @@ int main(int argc, char **argv) {
                         continue;
                     }
                     if (!is_sockaddr_inx_equal(&ra, &c->peer_addr)) {
-                        P_LOG_WARN(
-                            "drop UDP conv=%u from unexpected %s (expected %s)",
-                            conv, sockaddr_to_string(&ra),
-                            sockaddr_to_string(&c->peer_addr));
+                        P_LOG_WARN("drop UDP conv=%u from unexpected %s (expected %s)", conv,
+                                   sockaddr_to_string(&ra), sockaddr_to_string(&c->peer_addr));
                         continue;
                     }
                     /* Feed KCP */
@@ -956,8 +896,7 @@ int main(int argc, char **argv) {
                         }
                         if (res > 0) { // Control packet handled
                             if (c->svr_in_eof && !c->svr2cli_shutdown &&
-                                c->response.dlen == c->response.rpos &&
-                                c->svr_sock > 0) {
+                                c->response.dlen == c->response.rpos && c->svr_sock > 0) {
                                 shutdown(c->svr_sock, SHUT_WR);
                                 c->svr2cli_shutdown = true;
                             }
@@ -974,44 +913,36 @@ int main(int argc, char **argv) {
                          * sending */
                         if (c->state != S_FORWARDING) {
                             size_t need = c->request.dlen + (size_t)plen;
-                            if (ensure_buffer_capacity(&c->request, need,
-                                                       MAX_TCP_BUFFER_SIZE) !=
+                            if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) !=
                                 0) {
                                 P_LOG_WARN("Request buffer size limit "
                                            "exceeded, closing connection");
                                 c->state = S_CLOSING;
                                 break;
                             }
-                            memcpy(c->request.data + c->request.dlen, payload,
-                                   (size_t)plen);
+                            memcpy(c->request.data + c->request.dlen, payload, (size_t)plen);
                             c->request.dlen += (size_t)plen;
-                            if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c,
-                                                       true) < 0) {
+                            if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c, true) < 0) {
                                 LOG_CONN_WARN(c, "Failed to re-register TCP "
                                                  "socket for write");
                             }
                             break;
                         }
-                        ssize_t wn = send(c->svr_sock, payload, (size_t)plen,
-                                          MSG_NOSIGNAL);
-                        if (wn < 0 &&
-                            (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        ssize_t wn = send(c->svr_sock, payload, (size_t)plen, MSG_NOSIGNAL);
+                        if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                             /* Would block: buffer all and enable EPOLLOUT */
                             size_t rem = (size_t)plen;
                             size_t need = c->request.dlen + rem;
-                            if (ensure_buffer_capacity(&c->request, need,
-                                                       MAX_TCP_BUFFER_SIZE) !=
+                            if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) !=
                                 0) {
                                 P_LOG_WARN("Buffer size limit exceeded for "
                                            "connection, closing");
                                 c->state = S_CLOSING;
                                 break;
                             }
-                            memcpy(c->request.data + c->request.dlen, payload,
-                                   rem);
+                            memcpy(c->request.data + c->request.dlen, payload, rem);
                             c->request.dlen += rem;
-                            if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c,
-                                                       true) < 0) {
+                            if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c, true) < 0) {
                                 LOG_CONN_WARN(c, "Failed to re-register TCP "
                                                  "socket for write");
                             }
@@ -1024,22 +955,18 @@ int main(int argc, char **argv) {
                              */
                             size_t rem = (size_t)plen - (size_t)wn;
                             size_t need = c->request.dlen + rem;
-                            if (ensure_buffer_capacity(&c->request, need,
-                                                       MAX_TCP_BUFFER_SIZE) !=
+                            if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) !=
                                 0) {
                                 P_LOG_WARN("Buffer size limit exceeded for "
                                            "connection, closing");
                                 c->state = S_CLOSING;
                                 break;
                             }
-                            memcpy(c->request.data + c->request.dlen,
-                                   payload + wn, rem);
+                            memcpy(c->request.data + c->request.dlen, payload + wn, rem);
                             c->request.dlen += rem;
                             if (wn > 0)
-                                c->tcp_tx_bytes +=
-                                    (uint64_t)wn; /* Stats: TCP TX */
-                            if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c,
-                                                       true) < 0) {
+                                c->tcp_tx_bytes += (uint64_t)wn; /* Stats: TCP TX */
+                            if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c, true) < 0) {
                                 LOG_CONN_WARN(c, "Failed to re-register TCP "
                                                  "socket for write");
                             }
@@ -1061,12 +988,10 @@ int main(int argc, char **argv) {
                 if (events[i].events & (EPOLLERR | EPOLLHUP)) {
                     c->state = S_CLOSING;
                 }
-                if ((events[i].events & EPOLLOUT) &&
-                    c->state == S_SERVER_CONNECTING) {
+                if ((events[i].events & EPOLLOUT) && c->state == S_SERVER_CONNECTING) {
                     int err = 0;
                     socklen_t elen = sizeof(err);
-                    if (getsockopt(c->svr_sock, SOL_SOCKET, SO_ERROR, &err,
-                                   &elen) == 0 &&
+                    if (getsockopt(c->svr_sock, SOL_SOCKET, SO_ERROR, &err, &elen) == 0 &&
                         err == 0) {
                         c->state = S_FORWARDING;
                     } else {
@@ -1076,14 +1001,12 @@ int main(int argc, char **argv) {
                 if ((events[i].events & EPOLLOUT) && c->state == S_FORWARDING) {
                     /* Flush pending request data to target TCP */
                     while (c->request.rpos < c->request.dlen) {
-                        ssize_t wn = send(
-                            c->svr_sock, c->request.data + c->request.rpos,
-                            c->request.dlen - c->request.rpos, MSG_NOSIGNAL);
+                        ssize_t wn = send(c->svr_sock, c->request.data + c->request.rpos,
+                                          c->request.dlen - c->request.rpos, MSG_NOSIGNAL);
                         if (wn > 0) {
                             c->request.rpos += (size_t)wn;
                             c->tcp_tx_bytes += (uint64_t)wn; /* Stats: TCP TX */
-                        } else if (wn < 0 &&
-                                   (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        } else if (wn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                             break;
                         } else {
                             c->state = S_CLOSING;
@@ -1093,15 +1016,12 @@ int main(int argc, char **argv) {
                     if (c->request.rpos >= c->request.dlen) {
                         c->request.rpos = 0;
                         c->request.dlen = 0;
-                        if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c,
-                                                   false) < 0) {
-                            LOG_CONN_WARN(
-                                c, "Failed to disable TCP socket write events");
+                        if (kcptcp_ep_register_tcp(epfd, c->svr_sock, c, false) < 0) {
+                            LOG_CONN_WARN(c, "Failed to disable TCP socket write events");
                         }
                         /* If we got FIN from peer earlier, perform shutdown
                          * write now */
-                        if (c->cli_in_eof && !c->cli2svr_shutdown &&
-                            c->svr_sock > 0) {
+                        if (c->cli_in_eof && !c->cli2svr_shutdown && c->svr_sock > 0) {
                             shutdown(c->svr_sock, SHUT_WR);
                             c->cli2svr_shutdown = true;
                         }
@@ -1110,11 +1030,9 @@ int main(int argc, char **argv) {
                 if (events[i].events & EPOLLIN) {
                     char sbuf[UDP_RECV_BUFFER_SIZE];
                     ssize_t rn;
-                    while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) >
-                           0) {
+                    while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) > 0) {
                         c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
-                        if (aead_protocol_send_data(c, sbuf, rn, cfg.psk,
-                                                    cfg.has_psk) < 0) {
+                        if (aead_protocol_send_data(c, sbuf, rn, cfg.psk, cfg.has_psk) < 0) {
                             c->state = S_CLOSING;
                             break;
                         }
@@ -1122,19 +1040,16 @@ int main(int argc, char **argv) {
                     if (rn == 0) {
                         /* TCP target sent EOF: send FIN/EFIN over KCP, stop
                          * further reads, allow pending KCP to flush */
-                        if (aead_protocol_send_fin(c, cfg.psk, cfg.has_psk) <
-                            0) {
+                        if (aead_protocol_send_fin(c, cfg.psk, cfg.has_psk) < 0) {
                             c->state = S_CLOSING;
                         }
                         c->svr_in_eof = true;
                         struct epoll_event tev2 = (struct epoll_event){0};
-                        tev2.events = EPOLLOUT | EPOLLRDHUP | EPOLLERR |
-                                      EPOLLHUP; /* disable EPOLLIN */
+                        tev2.events =
+                            EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP; /* disable EPOLLIN */
                         tev2.data.ptr = c;
-                        (void)safe_epoll_mod_server(epfd, c->svr_sock, &tev2,
-                                                    c);
-                    } else if (rn < 0 && errno != EAGAIN &&
-                               errno != EWOULDBLOCK) {
+                        (void)safe_epoll_mod_server(epfd, c->svr_sock, &tev2, c);
+                    } else if (rn < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                         c->state = S_CLOSING;
                     }
                 }
@@ -1149,13 +1064,11 @@ int main(int argc, char **argv) {
             /* Send delayed handshake responses if due */
             if (conn->hs_resp_pending) {
                 if ((int32_t)(now - conn->hs_resp_send_at_ms) >= 0) {
-                    (void)sendto(usock, conn->hs_resp_buf, conn->hs_resp_len,
-                                 MSG_DONTWAIT, &conn->peer_addr.sa,
-                                 (socklen_t)sizeof_sockaddr(&conn->peer_addr));
+                    (void)sendto(usock, conn->hs_resp_buf, conn->hs_resp_len, MSG_DONTWAIT,
+                                 &conn->peer_addr.sa, (socklen_t)sizeof_sockaddr(&conn->peer_addr));
                     conn->hs_resp_pending = false;
-                    P_LOG_INFO(
-                        "sent delayed handshake response conv=%u (%zu bytes)",
-                        conn->conv, conn->hs_resp_len);
+                    P_LOG_INFO("sent delayed handshake response conv=%u (%zu bytes)", conn->conv,
+                               conn->hs_resp_len);
                 }
             }
             (void)kcp_update_flush(conn, now);
@@ -1178,11 +1091,9 @@ int main(int argc, char **argv) {
                 conn->state = S_CLOSING;
             }
             /* Rekey timeout enforcement */
-            if (conn->state != S_CLOSING && conn->has_session_key &&
-                conn->rekey_in_progress) {
+            if (conn->state != S_CLOSING && conn->has_session_key && conn->rekey_in_progress) {
                 if (now >= conn->rekey_deadline_ms) {
-                    P_LOG_ERR("rekey timeout, closing conv=%u (svr)",
-                              conn->conv);
+                    P_LOG_ERR("rekey timeout, closing conv=%u (svr)", conn->conv);
                     conn->state = S_CLOSING;
                 }
             }
@@ -1211,4 +1122,3 @@ cleanup:
 
     return rc;
 }
-

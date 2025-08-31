@@ -19,8 +19,7 @@ extern "C" {
  * @param max_size Maximum allowed size
  * @return 1 if allowed, 0 if would exceed limits
  */
-static inline int buffer_size_check(size_t current_size, size_t requested_size,
-                                    size_t max_size) {
+static inline int buffer_size_check(size_t current_size, size_t requested_size, size_t max_size) {
     (void)current_size; /* unused for now */
     return (requested_size <= max_size) ? 1 : 0;
 }

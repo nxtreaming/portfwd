@@ -36,10 +36,9 @@ static bool parse_totals_line(const char *ptr, struct totals *out) {
                   "stats total conv=%u: tcp_rx=%llu tcp_tx=%llu udp_rx=%llu "
                   "udp_tx=%llu kcp_rx_msgs=%llu kcp_tx_msgs=%llu "
                   "kcp_rx_bytes=%llu kcp_tx_bytes=%llu rekeys_i=%u rekeys_c=%u",
-                  &out->conv, &out->tcp_rx, &out->tcp_tx, &out->udp_rx,
-                  &out->udp_tx, &out->kcp_rx_msgs, &out->kcp_tx_msgs,
-                  &out->kcp_rx_bytes, &out->kcp_tx_bytes, &out->rekeys_i,
-                  &out->rekeys_c) == 11;
+                  &out->conv, &out->tcp_rx, &out->tcp_tx, &out->udp_rx, &out->udp_tx,
+                  &out->kcp_rx_msgs, &out->kcp_tx_msgs, &out->kcp_rx_bytes, &out->kcp_tx_bytes,
+                  &out->rekeys_i, &out->rekeys_c) == 11;
 }
 
 /* Scan buffer for the last totals line; if found, parse into out and return
@@ -76,8 +75,7 @@ static double find_max_double(const char *buf, size_t len, const char *key) {
             // allow optional sign, digits, dot
             while (j < len && t + 1 < sizeof(tmp)) {
                 char c = buf[j];
-                if ((c >= '0' && c <= '9') || c == '.' || c == '-' ||
-                    c == '+') {
+                if ((c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+') {
                     tmp[t++] = c;
                     j++;
                 } else {
@@ -272,10 +270,9 @@ int main(int argc, char **argv) {
     const char *mode = (argc >= 2) ? argv[1] : "normal";
     bool mode_timeout = (strcmp(mode, "timeout") == 0);
     size_t send_mb = (argc >= 3) ? (size_t)strtoul(argv[2], NULL, 10) : 8;
-    int pause_ms = (argc >= 4) ? (int)strtol(argv[3], NULL, 10)
-                               : 5000; // > REKEY_TIMEOUT_MS
-    size_t pause_at_mb = (argc >= 5) ? (size_t)strtoul(argv[4], NULL, 10)
-                                     : (send_mb / 2 ? send_mb / 2 : 1);
+    int pause_ms = (argc >= 4) ? (int)strtol(argv[3], NULL, 10) : 5000; // > REKEY_TIMEOUT_MS
+    size_t pause_at_mb =
+        (argc >= 5) ? (size_t)strtoul(argv[4], NULL, 10) : (send_mb / 2 ? send_mb / 2 : 1);
 
     signal(SIGINT, on_sig);
     signal(SIGTERM, on_sig);
@@ -286,8 +283,7 @@ int main(int argc, char **argv) {
     setenv("PFWD_STATS_DUMP", "1", 1);
 
     // Launch tcp_echo 127.0.0.1:2323
-    char *echo_argv[] = {(char *)"./tcp_echo", (char *)"127.0.0.1",
-                         (char *)"2323", NULL};
+    char *echo_argv[] = {(char *)"./tcp_echo", (char *)"127.0.0.1", (char *)"2323", NULL};
     pid_t pid_echo = spawn(echo_argv);
     fprintf(stderr, "[it] started tcp_echo pid=%d\n", (int)pid_echo);
     msleep(150);
@@ -333,8 +329,7 @@ int main(int argc, char **argv) {
     bool did_pause = false;
     bool timeout_observed = false;
     fprintf(stderr, "[it] mode=%s send=%zuMB pause_ms=%d at=%zuMB\n",
-            mode_timeout ? "timeout" : "normal", send_mb, pause_ms,
-            pause_at_mb);
+            mode_timeout ? "timeout" : "normal", send_mb, pause_ms, pause_at_mb);
 
     while (sent < total && !g_stop) {
         size_t n = (total - sent) < chunk ? (total - sent) : chunk;
@@ -342,9 +337,7 @@ int main(int argc, char **argv) {
 
         // Inject pause around rekey window to induce timeout
         if (mode_timeout && !did_pause && sent >= pause_at) {
-            fprintf(stderr,
-                    "[it] SIGSTOP server for %d ms to induce timeout...\n",
-                    pause_ms);
+            fprintf(stderr, "[it] SIGSTOP server for %d ms to induce timeout...\n", pause_ms);
             kill(pid_srv, SIGSTOP);
             msleep(pause_ms);
             kill(pid_srv, SIGCONT);
@@ -365,8 +358,7 @@ int main(int argc, char **argv) {
                 if (errno == EINTR)
                     continue;
                 if (mode_timeout) {
-                    fprintf(stderr,
-                            "[it] send error after pause (expected): %s\n",
+                    fprintf(stderr, "[it] send error after pause (expected): %s\n",
                             strerror(errno));
                     timeout_observed = true;
                     goto out;
@@ -383,8 +375,7 @@ int main(int argc, char **argv) {
             ssize_t rn = recv(s, rcv + roff, n - roff, 0);
             if (rn == 0) {
                 if (mode_timeout) {
-                    fprintf(stderr,
-                            "[it] peer closed (expected in timeout mode)\n");
+                    fprintf(stderr, "[it] peer closed (expected in timeout mode)\n");
                     timeout_observed = true;
                     goto out;
                 }
@@ -394,8 +385,7 @@ int main(int argc, char **argv) {
                 if (errno == EINTR)
                     continue;
                 if (mode_timeout) {
-                    fprintf(stderr,
-                            "[it] recv error after pause (expected): %s\n",
+                    fprintf(stderr, "[it] recv error after pause (expected): %s\n",
                             strerror(errno));
                     timeout_observed = true;
                     goto out;
@@ -501,10 +491,8 @@ out:
         if (!ok)
             die("missing expected rekey logs (trigger/ACK/epoch) in "
                 "client/server output");
-        fprintf(
-            stderr,
-            "[it] completed echo %zu/%zu bytes OK and rekey logs verified\n",
-            recvd, total);
+        fprintf(stderr, "[it] completed echo %zu/%zu bytes OK and rekey logs verified\n", recvd,
+                total);
     }
 
     // Cleanup

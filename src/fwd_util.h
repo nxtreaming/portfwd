@@ -7,7 +7,6 @@
 #include <stdbool.h>
 #include <netinet/in.h>
 #include "conn_pool.h"
-
 #include <signal.h>
 
 /**

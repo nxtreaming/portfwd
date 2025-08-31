@@ -8,8 +8,7 @@ static inline int32_t seq_diff_u32(uint32_t a, uint32_t b) {
     return (int32_t)(a - b);
 }
 
-static inline bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win,
-                                                uint64_t *p_mask) {
+static inline bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win, uint64_t *p_mask) {
     uint32_t win = *p_win;
     uint64_t mask = *p_mask;
     if (win == UINT32_MAX) { /* uninitialized */
@@ -66,19 +65,15 @@ int main(void) {
     uint64_t mask = 0;
 
     /* First packet initializes */
-    fails += expect_true(aead_replay_check_and_update(1000, &win, &mask),
-                         "init accept 1000");
+    fails += expect_true(aead_replay_check_and_update(1000, &win, &mask), "init accept 1000");
 
     /* Replay same seq -> reject */
-    fails += expect_false(aead_replay_check_and_update(1000, &win, &mask),
-                          "reject replay 1000");
+    fails += expect_false(aead_replay_check_and_update(1000, &win, &mask), "reject replay 1000");
 
     /* In-window older but unseen seq -> accept */
-    fails += expect_true(aead_replay_check_and_update(999, &win, &mask),
-                         "accept 999 in-window");
+    fails += expect_true(aead_replay_check_and_update(999, &win, &mask), "accept 999 in-window");
     /* Replay 999 -> reject */
-    fails += expect_false(aead_replay_check_and_update(999, &win, &mask),
-                          "reject replay 999");
+    fails += expect_false(aead_replay_check_and_update(999, &win, &mask), "reject replay 999");
 
     /* Too old (beyond 64) -> reject */
     fails += expect_false(aead_replay_check_and_update(1000 - 64, &win, &mask),
@@ -86,25 +81,22 @@ int main(void) {
 
     /* Advance window forward by large gap -> accept and reset mask
      * appropriately */
-    fails += expect_true(aead_replay_check_and_update(2000, &win, &mask),
-                         "advance to 2000");
+    fails += expect_true(aead_replay_check_and_update(2000, &win, &mask), "advance to 2000");
     /* Now in-window older (1999) unseen -> accept */
-    fails += expect_true(aead_replay_check_and_update(1999, &win, &mask),
-                         "accept 1999 after advance");
+    fails +=
+        expect_true(aead_replay_check_and_update(1999, &win, &mask), "accept 1999 after advance");
 
     /* Wraparound behavior: accept high values then low wrap to small increases
      * should be considered older (depending on signed diff) */
     win = UINT32_MAX;
     mask = 0; /* reset */
-    fails += expect_true(aead_replay_check_and_update(0xFFFFFFF0u, &win, &mask),
-                         "accept near-max");
+    fails += expect_true(aead_replay_check_and_update(0xFFFFFFF0u, &win, &mask), "accept near-max");
     /* small forward (wrap) should be ahead (positive diff) because of 2's
      * complement diff */
-    fails += expect_true(aead_replay_check_and_update(0xFFFFFFF1u, &win, &mask),
-                         "accept +1 near wrap");
+    fails +=
+        expect_true(aead_replay_check_and_update(0xFFFFFFF1u, &win, &mask), "accept +1 near wrap");
     /* big forward past wrap */
-    fails += expect_true(aead_replay_check_and_update(5u, &win, &mask),
-                         "accept wrap to 5");
+    fails += expect_true(aead_replay_check_and_update(5u, &win, &mask), "accept wrap to 5");
 
     if (fails) {
         fprintf(stderr, "Replay window tests failed: %d\n", fails);

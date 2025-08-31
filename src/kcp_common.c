@@ -15,16 +15,14 @@
 #endif
 
 /* Output callback: sendto over UDP with simple backlog handling on EAGAIN */
-static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp,
-                         void *user) {
+static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *user) {
     (void)kcp;
     struct proxy_conn *pc = (struct proxy_conn *)user;
     if (!pc)
         return -1;
     /* Try to send current datagram */
-    ssize_t n =
-        sendto(pc->udp_sock, buf, (size_t)len, MSG_DONTWAIT, &pc->peer_addr.sa,
-               (socklen_t)sizeof_sockaddr(&pc->peer_addr));
+    ssize_t n = sendto(pc->udp_sock, buf, (size_t)len, MSG_DONTWAIT, &pc->peer_addr.sa,
+                       (socklen_t)sizeof_sockaddr(&pc->peer_addr));
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Kernel TX queue full: store one-packet backlog and retry on next
@@ -78,8 +76,7 @@ uint32_t kcp_now_ms(void) {
 #endif
 }
 
-int kcp_setup_conn(struct proxy_conn *c, int udp_fd,
-                   const union sockaddr_inx *peer, uint32_t conv,
+int kcp_setup_conn(struct proxy_conn *c, int udp_fd, const union sockaddr_inx *peer, uint32_t conv,
                    const struct kcp_opts *opts) {
     if (!c || !peer || !opts)
         return -1;
@@ -100,8 +97,7 @@ int kcp_setup_conn(struct proxy_conn *c, int udp_fd,
     ikcp_setoutput(c->kcp, kcp_output_cb);
 
     /* Apply options */
-    ikcp_nodelay(c->kcp, opts->nodelay, opts->interval_ms, opts->resend,
-                 opts->nc);
+    ikcp_nodelay(c->kcp, opts->nodelay, opts->interval_ms, opts->resend, opts->nc);
     ikcp_setmtu(c->kcp, opts->mtu);
     ikcp_wndsize(c->kcp, opts->sndwnd, opts->rcvwnd);
 
@@ -114,10 +110,9 @@ int kcp_update_flush(struct proxy_conn *c, uint32_t now_ms) {
     /* If we have a pending UDP datagram due to previous EAGAIN, try to flush it
      * first */
     if (c->udp_backlog.dlen > 0) {
-        ssize_t n =
-            sendto(c->udp_sock, c->udp_backlog.data + c->udp_backlog.rpos,
-                   c->udp_backlog.dlen - c->udp_backlog.rpos, MSG_DONTWAIT,
-                   &c->peer_addr.sa, (socklen_t)sizeof_sockaddr(&c->peer_addr));
+        ssize_t n = sendto(c->udp_sock, c->udp_backlog.data + c->udp_backlog.rpos,
+                           c->udp_backlog.dlen - c->udp_backlog.rpos, MSG_DONTWAIT,
+                           &c->peer_addr.sa, (socklen_t)sizeof_sockaddr(&c->peer_addr));
         if (n > 0) {
             c->udp_backlog.rpos += (size_t)n;
             c->udp_tx_bytes += (uint64_t)n;
@@ -134,5 +129,6 @@ int kcp_update_flush(struct proxy_conn *c, uint32_t now_ms) {
         }
     }
     ikcp_update(c->kcp, now_ms);
+
     return 0;
 }

@@ -69,7 +69,6 @@
 
 #define LISTEN_BACKLOG 128
 
-
 #define MIN_VALID_POINTER 4096
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
@@ -94,11 +93,13 @@ static int g_backpressure_wm = TCP_PROXY_BACKPRESSURE_WM;
 /* Core event handling */
 static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg);
 static int handle_new_connection(int listen_sock, int epfd, const struct fwd_config *cfg);
-static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd, struct epoll_event *ev);
+static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
+                                     struct epoll_event *ev);
 static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd, struct epoll_event *ev);
 
 /* Connection management */
-static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *events, int *nfds, int epfd);
+static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *events, int *nfds,
+                               int epfd);
 static void check_idle_connections(const struct fwd_config *cfg);
 
 /* Socket and epoll utilities */
@@ -162,14 +163,11 @@ static int set_sock_buffers(int sockfd) {
         int actual_rcv = 0, actual_snd = 0;
         socklen_t optlen = sizeof(actual_rcv);
 
-        if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) ==
-                0 &&
-            getsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) ==
-                0) {
+        if (getsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) == 0 &&
+            getsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) == 0) {
             if (actual_rcv < sz || actual_snd < sz) {
-                P_LOG_INFO(
-                    "Socket buffer sizes: requested=%d, actual rcv=%d snd=%d",
-                    sz, actual_rcv, actual_snd);
+                P_LOG_INFO("Socket buffer sizes: requested=%d, actual rcv=%d snd=%d", sz,
+                           actual_rcv, actual_snd);
             }
         }
     }
@@ -184,8 +182,7 @@ static int set_keepalive(int sockfd) {
 
     if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0) {
         saved_errno = errno;
-        P_LOG_WARN("setsockopt(SO_KEEPALIVE) on fd %d failed: %s", sockfd,
-                   strerror(saved_errno));
+        P_LOG_WARN("setsockopt(SO_KEEPALIVE) on fd %d failed: %s", sockfd, strerror(saved_errno));
         /* Keepalive failure is not fatal, but we should return error */
         return -1;
     }
@@ -196,34 +193,30 @@ static int set_keepalive(int sockfd) {
     int intvl = g_ka_intvl;
     int cnt = g_ka_cnt;
 
-    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) <
-        0) {
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle)) < 0) {
         saved_errno = errno;
-        P_LOG_WARN("setsockopt(TCP_KEEPIDLE=%d) on fd %d failed: %s", idle,
-                   sockfd, strerror(saved_errno));
+        P_LOG_WARN("setsockopt(TCP_KEEPIDLE=%d) on fd %d failed: %s", idle, sockfd,
+                   strerror(saved_errno));
         ret = -1;
     }
-    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) <
-        0) {
+    if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl)) < 0) {
         saved_errno = errno;
-        P_LOG_WARN("setsockopt(TCP_KEEPINTVL=%d) on fd %d failed: %s", intvl,
-                   sockfd, strerror(saved_errno));
+        P_LOG_WARN("setsockopt(TCP_KEEPINTVL=%d) on fd %d failed: %s", intvl, sockfd,
+                   strerror(saved_errno));
         ret = -1;
     }
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt)) < 0) {
         saved_errno = errno;
-        P_LOG_WARN("setsockopt(TCP_KEEPCNT=%d) on fd %d failed: %s", cnt,
-                   sockfd, strerror(saved_errno));
+        P_LOG_WARN("setsockopt(TCP_KEEPCNT=%d) on fd %d failed: %s", cnt, sockfd,
+                   strerror(saved_errno));
         ret = -1;
     }
 
     if (ret == 0) {
-        P_LOG_INFO("TCP keepalive configured: idle=%ds, interval=%ds, count=%d",
-                   idle, intvl, cnt);
+        P_LOG_INFO("TCP keepalive configured: idle=%ds, interval=%ds, count=%d", idle, intvl, cnt);
     }
 #else
-    P_LOG_INFO(
-        "Basic TCP keepalive enabled (platform-specific tuning not available)");
+    P_LOG_INFO("Basic TCP keepalive enabled (platform-specific tuning not available)");
 #endif
     return ret;
 }
@@ -231,8 +224,7 @@ static int set_keepalive(int sockfd) {
 static int set_tcp_nodelay(int sockfd) {
     int on = 1;
     if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) {
-        P_LOG_WARN("setsockopt(TCP_NODELAY) on fd %d: %s", sockfd,
-                   strerror(errno));
+        P_LOG_WARN("setsockopt(TCP_NODELAY) on fd %d: %s", sockfd, strerror(errno));
         return -1;
     }
     return 0;
@@ -249,7 +241,6 @@ static int safe_close(int fd) {
         return -1;
     }
 }
-
 
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 /* Statistics Functions */
@@ -285,8 +276,8 @@ static void update_connection_stats(bool connected, bool failed) {
 
         /* Update peak concurrent connections */
         uint64_t peak = g_stats.peak_concurrent;
-        while (current > peak && !__sync_bool_compare_and_swap(
-                                     &g_stats.peak_concurrent, peak, current)) {
+        while (current > peak &&
+               !__sync_bool_compare_and_swap(&g_stats.peak_concurrent, peak, current)) {
             peak = g_stats.peak_concurrent;
         }
     }
@@ -323,8 +314,8 @@ static int init_conn_limiter(int max_total, int max_per_ip) {
     g_conn_limiter.max_per_ip = max_per_ip;
     g_conn_limiter.total_connections = 0;
 
-    P_LOG_INFO("Connection limiter initialized: max_total=%d, max_per_ip=%d",
-               max_total, max_per_ip);
+    P_LOG_INFO("Connection limiter initialized: max_total=%d, max_per_ip=%d", max_total,
+               max_per_ip);
     return 0;
 }
 
@@ -346,8 +337,7 @@ static bool check_connection_limit(const union sockaddr_inx *addr) {
     if (g_conn_limiter.max_total > 0 &&
         g_conn_limiter.total_connections >= g_conn_limiter.max_total) {
         pthread_mutex_unlock(&g_conn_limiter.lock);
-        P_LOG_WARN("Total connection limit reached (%d)",
-                   g_conn_limiter.max_total);
+        P_LOG_WARN("Total connection limit reached (%d)", g_conn_limiter.max_total);
         return false;
     }
 
@@ -372,8 +362,7 @@ static bool check_connection_limit(const union sockaddr_inx *addr) {
                 entry->last_seen = now;
             } else {
                 /* Hash collision - allow but log warning */
-                P_LOG_WARN("Hash collision in connection limiter for %s",
-                           sockaddr_to_string(addr));
+                P_LOG_WARN("Hash collision in connection limiter for %s", sockaddr_to_string(addr));
             }
         } else {
             /* New entry */
@@ -422,8 +411,10 @@ static void release_connection_limit(const union sockaddr_inx *addr) {
 /* Connection Management */
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
-static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *events, int *nfds, int epfd) {
-    if (!conn) return;
+static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *events, int *nfds,
+                               int epfd) {
+    if (!conn)
+        return;
 
     if (events && nfds) {
         for (int i = 0; i < *nfds; i++) {
@@ -469,7 +460,8 @@ static void check_idle_connections(const struct fwd_config *cfg) {
      * the state of each connection object to see if it's currently in use.
      */
     for (size_t i = 0; i < g_conn_pool.capacity; ++i) {
-        struct proxy_conn *conn = (struct proxy_conn *)((char *)g_conn_pool.pool_mem + i * g_conn_pool.item_size);
+        struct proxy_conn *conn =
+            (struct proxy_conn *)((char *)g_conn_pool.pool_mem + i * g_conn_pool.item_size);
 
         /*
          * A connection is active if its state is S_FORWARDING. We don't want to
@@ -497,17 +489,22 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
     uint32_t cli_events = 0;
     uint32_t srv_events = 0;
 
-    if (conn->state != S_FORWARDING) return;
+    if (conn->state != S_FORWARDING)
+        return;
 
     // Read from client if server buffer has space
-    if (conn->response.dlen < (size_t)g_backpressure_wm) cli_events |= EPOLLIN;
+    if (conn->response.dlen < (size_t)g_backpressure_wm)
+        cli_events |= EPOLLIN;
     // Write to client if we have data for it
-    if (conn->response.dlen > 0) srv_events |= EPOLLOUT;
+    if (conn->response.dlen > 0)
+        srv_events |= EPOLLOUT;
 
     // Read from server if client buffer has space
-    if (conn->request.dlen < (size_t)g_backpressure_wm) srv_events |= EPOLLIN;
+    if (conn->request.dlen < (size_t)g_backpressure_wm)
+        srv_events |= EPOLLIN;
     // Write to server if we have data for it
-    if (conn->request.dlen > 0) cli_events |= EPOLLOUT;
+    if (conn->request.dlen > 0)
+        cli_events |= EPOLLOUT;
 
     ev.events = cli_events | EPOLLET | EPOLLRDHUP;
     ev.data.u64 = conn->magic_client;
@@ -561,17 +558,21 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd, struct 
 
     if (magic == conn->magic_client) { // Event on client socket
         if (ev->events & EPOLLIN) {
-            if (do_forward(conn, conn->cli_sock, conn->svr_sock, &conn->request) < 0) return -1;
+            if (do_forward(conn, conn->cli_sock, conn->svr_sock, &conn->request) < 0)
+                return -1;
         }
         if (ev->events & EPOLLOUT) {
-            if (do_forward(conn, conn->svr_sock, conn->cli_sock, &conn->response) < 0) return -1;
+            if (do_forward(conn, conn->svr_sock, conn->cli_sock, &conn->response) < 0)
+                return -1;
         }
     } else if (magic == conn->magic_server) { // Event on server socket
         if (ev->events & EPOLLIN) {
-            if (do_forward(conn, conn->svr_sock, conn->cli_sock, &conn->response) < 0) return -1;
+            if (do_forward(conn, conn->svr_sock, conn->cli_sock, &conn->response) < 0)
+                return -1;
         }
         if (ev->events & EPOLLOUT) {
-            if (do_forward(conn, conn->cli_sock, conn->svr_sock, &conn->request) < 0) return -1;
+            if (do_forward(conn, conn->cli_sock, conn->svr_sock, &conn->request) < 0)
+                return -1;
         }
     }
 
@@ -579,12 +580,14 @@ static int handle_forwarding(struct proxy_conn *conn, int efd, int epfd, struct 
     return 0;
 }
 
-static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd, struct epoll_event *ev) {
+static void handle_server_connecting(struct proxy_conn *conn, int efd, int epfd,
+                                     struct epoll_event *ev) {
     (void)efd;
     int err = 0;
     socklen_t len = sizeof(err);
 
-    if ((ev->events & (EPOLLERR | EPOLLHUP)) || (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0)) {
+    if ((ev->events & (EPOLLERR | EPOLLHUP)) ||
+        (getsockopt(conn->svr_sock, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0)) {
         P_LOG_WARN("Server connection failed: %s", strerror(err == 0 ? ETIMEDOUT : err));
         __sync_fetch_and_add(&g_stats.connect_errors, 1);
         release_proxy_conn(conn, NULL, NULL, epfd);
@@ -615,7 +618,8 @@ static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg) 
         num_events = epoll_wait(epfd, events, EPOLL_EVENTS_DEFAULT, 1000);
 
         if (num_events < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR)
+                continue;
             P_LOG_ERR("epoll_wait(): %s", strerror(errno));
             break;
         }
@@ -630,7 +634,8 @@ static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg) 
                     goto end_loop;
                 }
             } else if (ptr >= MIN_VALID_POINTER) {
-                struct proxy_conn *conn = (ptr & 0xFU) ? (struct proxy_conn *)(ptr & ~0xFU) : (struct proxy_conn *)ptr;
+                struct proxy_conn *conn =
+                    (ptr & 0xFU) ? (struct proxy_conn *)(ptr & ~0xFU) : (struct proxy_conn *)ptr;
                 if (conn->state == S_SERVER_CONNECTING) {
                     handle_server_connecting(conn, i, epfd, ev);
                 } else if (conn->state == S_FORWARDING) {
@@ -661,12 +666,15 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         int cli_sock = accept4(listen_sock, &cli_addr.sa, &cli_alen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 
         if (cli_sock < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return 0;
             P_LOG_ERR("accept4(): %s", strerror(errno));
             time_t now = time(NULL);
-            if (now - last_error_time > ACCEPT_ERROR_RESET_INTERVAL) consecutive_errors = 0;
+            if (now - last_error_time > ACCEPT_ERROR_RESET_INTERVAL)
+                consecutive_errors = 0;
             last_error_time = now;
-            if (++consecutive_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS) return -1;
+            if (++consecutive_errors > MAX_CONSECUTIVE_ACCEPT_ERRORS)
+                return -1;
             usleep(ACCEPT_ERROR_DELAY_US);
             continue;
         }
@@ -712,7 +720,8 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         }
 #endif
 
-        conn->svr_sock = socket(dst_addr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+        conn->svr_sock =
+            socket(dst_addr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
         if (conn->svr_sock < 0) {
             P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
             release_proxy_conn(conn, NULL, NULL, epfd);
@@ -733,7 +742,8 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
             epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &srv_ev);
         } else if (errno == EINPROGRESS) {
             conn->state = S_SERVER_CONNECTING;
-            struct epoll_event ev = { .events = EPOLLOUT | EPOLLIN | EPOLLET, .data.u64 = (uintptr_t)conn };
+            struct epoll_event ev = {.events = EPOLLOUT | EPOLLIN | EPOLLET,
+                                     .data.u64 = (uintptr_t)conn};
             if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
                 P_LOG_ERR("epoll_ctl(ADD, svr_sock): %s", strerror(errno));
                 release_proxy_conn(conn, NULL, NULL, epfd);
@@ -745,8 +755,8 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         }
         __sync_fetch_and_add(&g_stats.total_accepted, 1);
         int64_t current = __sync_fetch_and_add(&g_stats.current_active, 1) + 1;
-        if ((uint64_t)current > 0 && (uint64_t)current > g_stats.peak_concurrent) g_stats.peak_concurrent = (uint64_t)current;
-
+        if ((uint64_t)current > 0 && (uint64_t)current > g_stats.peak_concurrent)
+            g_stats.peak_concurrent = (uint64_t)current;
     }
     return 0;
 }
@@ -764,13 +774,16 @@ static void report_stats_if_needed(void) {
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 void usage(const char *prog) {
-    fprintf(stderr, "Usage: %s [options] <listen_addr> <listen_port> <dest_addr> <dest_port>\n", prog);
+    fprintf(stderr, "Usage: %s [options] <listen_addr> <listen_port> <dest_addr> <dest_port>\n",
+            prog);
     fprintf(stderr, "Options:\n");
     fprintf(stderr, "  -d, --daemonize                Daemonize the process\n");
     fprintf(stderr, "  -p, --pidfile <path>           PID file path\n");
     fprintf(stderr, "  -u, --user <user>              Drop privileges to this user\n");
-    fprintf(stderr, "  -t, --transparent              Enable transparent proxy mode (Linux only)\n");
-    fprintf(stderr, "  -z, --zero-copy                Enable zero-copy (splice) forwarding (Linux only)\n");
+    fprintf(stderr,
+            "  -t, --transparent              Enable transparent proxy mode (Linux only)\n");
+    fprintf(stderr,
+            "  -z, --zero-copy                Enable zero-copy (splice) forwarding (Linux only)\n");
     fprintf(stderr, "  -c, --max-conns <num>          Maximum total connections\n");
     fprintf(stderr, "  -i, --max-per-ip <num>         Maximum connections per source IP\n");
     fprintf(stderr, "  -k, --keepalive-idle <sec>     Keepalive idle time (seconds)\n");
@@ -784,37 +797,61 @@ int parse_opts(int argc, char **argv, struct fwd_config *cfg) {
     int opt;
     const char *prog = argv[0];
 
-    static const struct option long_opts[] = {
-        {"daemonize", no_argument, 0, 'd'},
-        {"pidfile", required_argument, 0, 'p'},
-        {"user", required_argument, 0, 'u'},
-        {"transparent", no_argument, 0, 't'},
-        {"zero-copy", no_argument, 0, 'z'},
-        {"max-conns", required_argument, 0, 'c'},
-        {"max-per-ip", required_argument, 0, 'i'},
-        {"keepalive-idle", required_argument, 0, 'k'},
-        {"keepalive-interval", required_argument, 0, 'K'},
-        {"keepalive-count", required_argument, 0, 'C'},
-        {"sock-buffer", required_argument, 0, 'b'},
-        {"help", no_argument, 0, 'h'},
-        {0, 0, 0, 0}
-    };
+    static const struct option long_opts[] = {{"daemonize", no_argument, 0, 'd'},
+                                              {"pidfile", required_argument, 0, 'p'},
+                                              {"user", required_argument, 0, 'u'},
+                                              {"transparent", no_argument, 0, 't'},
+                                              {"zero-copy", no_argument, 0, 'z'},
+                                              {"max-conns", required_argument, 0, 'c'},
+                                              {"max-per-ip", required_argument, 0, 'i'},
+                                              {"keepalive-idle", required_argument, 0, 'k'},
+                                              {"keepalive-interval", required_argument, 0, 'K'},
+                                              {"keepalive-count", required_argument, 0, 'C'},
+                                              {"sock-buffer", required_argument, 0, 'b'},
+                                              {"help", no_argument, 0, 'h'},
+                                              {0, 0, 0, 0}};
 
     while ((opt = getopt_long(argc, argv, "dp:u:tzc:i:k:K:C:b:h", long_opts, NULL)) != -1) {
         switch (opt) {
-            case 'd': cfg->daemonize = true; break;
-            case 'p': cfg->pidfile = optarg; break;
-            case 'u': cfg->username = optarg; break;
-            case 't': cfg->transparent_proxy = true; break;
-            case 'z': cfg->use_splice = true; break;
-            case 'c': cfg->max_total_connections = atoi(optarg); break;
-            case 'i': cfg->max_per_ip_connections = atoi(optarg); break;
-            case 'k': cfg->ka_idle = atoi(optarg); break;
-            case 'K': cfg->ka_intvl = atoi(optarg); break;
-            case 'C': cfg->ka_cnt = atoi(optarg); break;
-            case 'b': cfg->sockbuf_size = atoi(optarg); break;
-            case 'h': usage(prog); return 1;
-            default: usage(prog); return 1;
+        case 'd':
+            cfg->daemonize = true;
+            break;
+        case 'p':
+            cfg->pidfile = optarg;
+            break;
+        case 'u':
+            cfg->username = optarg;
+            break;
+        case 't':
+            cfg->transparent_proxy = true;
+            break;
+        case 'z':
+            cfg->use_splice = true;
+            break;
+        case 'c':
+            cfg->max_total_connections = atoi(optarg);
+            break;
+        case 'i':
+            cfg->max_per_ip_connections = atoi(optarg);
+            break;
+        case 'k':
+            cfg->ka_idle = atoi(optarg);
+            break;
+        case 'K':
+            cfg->ka_intvl = atoi(optarg);
+            break;
+        case 'C':
+            cfg->ka_cnt = atoi(optarg);
+            break;
+        case 'b':
+            cfg->sockbuf_size = atoi(optarg);
+            break;
+        case 'h':
+            usage(prog);
+            return 1;
+        default:
+            usage(prog);
+            return 1;
         }
     }
 
@@ -823,12 +860,13 @@ int parse_opts(int argc, char **argv, struct fwd_config *cfg) {
         return 1;
     }
 
-    if (resolve_address(&cfg->listen_addr, argv[optind], argv[optind + 1]) != 0) return 1;
-    if (resolve_address(&cfg->dst_addr, argv[optind + 2], argv[optind + 3]) != 0) return 1;
+    if (resolve_address(&cfg->listen_addr, argv[optind], argv[optind + 1]) != 0)
+        return 1;
+    if (resolve_address(&cfg->dst_addr, argv[optind + 2], argv[optind + 3]) != 0)
+        return 1;
 
     return 0;
 }
-
 
 int create_listen_socket(const union sockaddr_inx *addr, const struct fwd_config *cfg) {
     int sock = -1;
@@ -846,7 +884,8 @@ int create_listen_socket(const union sockaddr_inx *addr, const struct fwd_config
 #ifdef __linux__
     if (cfg->transparent_proxy) {
         if (setsockopt(sock, SOL_IP, IP_TRANSPARENT, &on, sizeof(on)) < 0) {
-            P_LOG_ERR("setsockopt(IP_TRANSPARENT): %s. This requires CAP_NET_ADMIN.", strerror(errno));
+            P_LOG_ERR("setsockopt(IP_TRANSPARENT): %s. This requires CAP_NET_ADMIN.",
+                      strerror(errno));
             close(sock);
             return -1;
         }
@@ -909,7 +948,10 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
 
-    if (conn_pool_init(&g_conn_pool, g_cfg.max_total_connections > 0 ? g_cfg.max_total_connections : TCP_PROXY_CONN_POOL_SIZE, sizeof(struct proxy_conn)) != 0) {
+    if (conn_pool_init(&g_conn_pool,
+                       g_cfg.max_total_connections > 0 ? g_cfg.max_total_connections
+                                                       : TCP_PROXY_CONN_POOL_SIZE,
+                       sizeof(struct proxy_conn)) != 0) {
         rc = 1;
         goto cleanup;
     }
@@ -921,7 +963,8 @@ int main(int argc, char **argv) {
 
 #ifdef EPOLL_CLOEXEC
     epfd = epoll_create1(EPOLL_CLOEXEC);
-    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL)) epfd = epoll_create(1);
+    if (epfd < 0 && (errno == ENOSYS || errno == EINVAL))
+        epfd = epoll_create(1);
 #else
     epfd = epoll_create(1);
 #endif
@@ -954,9 +997,12 @@ cleanup:
     P_LOG_INFO("Shutting down...");
     print_stats_summary();
 
-    if (listen_sock >= 0) close(listen_sock);
-    if (epfd >= 0) close(epfd);
-    if (g_cfg.pidfile) cleanup_pidfile();
+    if (listen_sock >= 0)
+        close(listen_sock);
+    if (epfd >= 0)
+        close(epfd);
+    if (g_cfg.pidfile)
+        cleanup_pidfile();
 
     conn_pool_destroy(&g_conn_pool);
     destroy_conn_limiter();
@@ -964,4 +1010,3 @@ cleanup:
 
     return rc;
 }
-

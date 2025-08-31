@@ -16,8 +16,7 @@
 static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk);
 
 static int trigger_rekey_if_needed(struct proxy_conn *c, const uint8_t *psk) {
-    if (!c->has_session_key || !psk || c->rekey_in_progress ||
-        c->send_seq < REKEY_SEQ_THRESHOLD) {
+    if (!c->has_session_key || !psk || c->rekey_in_progress || c->send_seq < REKEY_SEQ_THRESHOLD) {
         return 0;
     }
     return send_rekey_init(c, psk);
@@ -25,8 +24,8 @@ static int trigger_rekey_if_needed(struct proxy_conn *c, const uint8_t *psk) {
 
 static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk) {
     c->next_epoch = c->epoch + 1;
-    if (derive_session_key_epoch(psk, c->hs_token, c->conv, c->next_epoch,
-                                 c->next_session_key) != 0) {
+    if (derive_session_key_epoch(psk, c->hs_token, c->conv, c->next_epoch, c->next_session_key) !=
+        0) {
         return -1;
     }
     memcpy(c->next_nonce_base, c->next_session_key, 12);
@@ -41,8 +40,7 @@ static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk) {
 
     uint8_t ad[5];
     unsigned char pkt[1 + 4 + 16];
-    aead_gen_control_packet(KTP_REKEY_INIT, seq, c->session_key, c->nonce_base,
-                            ad, pkt);
+    aead_gen_control_packet(KTP_REKEY_INIT, seq, c->session_key, c->nonce_base, ad, pkt);
 
     if (ikcp_send(c->kcp, (const char *)pkt, sizeof(pkt)) < 0) {
         return -1;
@@ -51,9 +49,8 @@ static int send_rekey_init(struct proxy_conn *c, const uint8_t *psk) {
     return 0;
 }
 
-int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
-                                         int len, const uint8_t *psk,
-                                         bool has_psk, char **out_payload,
+int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data, int len,
+                                         const uint8_t *psk, bool has_psk, char **out_payload,
                                          int *out_plen) {
     if (len < 1)
         return 0;
@@ -63,8 +60,7 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
     *out_plen = 0;
 
     if (has_psk && (t == KTP_DATA || t == KTP_FIN)) {
-        P_LOG_ERR("Plaintext packet type %d in encrypted session conv=%u",
-                  (int)t, c->conv);
+        P_LOG_ERR("Plaintext packet type %d in encrypted session conv=%u", (int)t, c->conv);
         return -1;
     }
 
@@ -83,8 +79,7 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
     uint32_t seq;
     int verified = aead_verify_packet(c, (uint8_t *)data, len, &seq);
     if (verified < 0) {
-        P_LOG_WARN("Packet verification failed for type %d, len %d", (int)t,
-                   len);
+        P_LOG_WARN("Packet verification failed for type %d, len %d", (int)t, len);
         return (t == KTP_EDATA) ? 0 : -1; // Drop data, close on control failure
     }
 
@@ -101,8 +96,7 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
     case KTP_REKEY_INIT: {
         if (!c->rekey_in_progress) {
             c->next_epoch = c->epoch + 1;
-            if (derive_session_key_epoch(psk, c->hs_token, c->conv,
-                                         c->next_epoch,
+            if (derive_session_key_epoch(psk, c->hs_token, c->conv, c->next_epoch,
                                          c->next_session_key) != 0) {
                 return -1;
             }
@@ -112,8 +106,8 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
 
         unsigned char ack_pkt[1 + 4 + 16];
         uint8_t ack_ad[5];
-        aead_gen_control_packet(KTP_REKEY_ACK, seq, c->next_session_key,
-                                c->next_nonce_base, ack_ad, ack_pkt);
+        aead_gen_control_packet(KTP_REKEY_ACK, seq, c->next_session_key, c->next_nonce_base, ack_ad,
+                                ack_pkt);
         ikcp_send(c->kcp, (const char *)ack_pkt, sizeof(ack_pkt));
 
         // Switch to next epoch immediately
@@ -144,8 +138,8 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
     return 0;
 }
 
-int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len,
-                            const uint8_t *psk, bool has_psk) {
+int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len, const uint8_t *psk,
+                            bool has_psk) {
     if (!has_psk) {
         char *buf = (char *)malloc(len + 1);
         if (!buf)
@@ -183,8 +177,7 @@ int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len,
     return ret;
 }
 
-int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk,
-                           bool has_psk) {
+int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk, bool has_psk) {
     if (!has_psk) {
         unsigned char fin = (unsigned char)KTP_FIN;
         return ikcp_send(c->kcp, (const char *)&fin, 1);
@@ -201,8 +194,7 @@ int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk,
 
     uint8_t pkt[1 + 4 + 16];
     uint8_t ad[5];
-    aead_gen_control_packet(KTP_EFIN, seq, c->session_key, c->nonce_base, ad,
-                            pkt);
+    aead_gen_control_packet(KTP_EFIN, seq, c->session_key, c->nonce_base, ad, pkt);
 
     int ret = ikcp_send(c->kcp, (const char *)pkt, sizeof(pkt));
     if (ret >= 0) {

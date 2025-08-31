@@ -14,10 +14,8 @@
 #include <pwd.h>
 #include <grp.h>
 
-
 // Global signal-safe flag for graceful shutdown
 volatile sig_atomic_t g_shutdown_requested = 0;
-
 
 /* Signal-safe shutdown handler */
 static void handle_shutdown_signal(int sig) {
@@ -136,9 +134,7 @@ int create_pid_file(const char *filepath) {
 
     if (flock(g_pidfile_fd, LOCK_EX | LOCK_NB) < 0) {
         if (errno == EWOULDBLOCK) {
-            P_LOG_ERR(
-                "pidfile %s exists and is locked, another instance running?",
-                filepath);
+            P_LOG_ERR("pidfile %s exists and is locked, another instance running?", filepath);
         } else {
             P_LOG_ERR("flock(%s): %s", filepath, strerror(errno));
         }
@@ -184,7 +180,6 @@ int parse_common_args(int argc, char **argv, struct fwd_config *cfg) {
 
     // Reset getopt's internal state.
     optind = 1;
-
 
     // A colon after an option character indicates it takes an argument.
     while ((opt = getopt(argc, argv, "drR6P:i:")) != -1) {
@@ -276,9 +271,9 @@ int get_sockaddr_inx(const char *str, union sockaddr_inx *addr, bool is_source) 
         port_str = strrchr(dup, ':');
         if (!port_str) {
             if (is_source) {
-                 P_LOG_ERR("Source address requires a port.");
-                 free(dup);
-                 return -1;
+                P_LOG_ERR("Source address requires a port.");
+                free(dup);
+                return -1;
             }
             port_str = "0"; // Destination port can be 0
         } else {
@@ -322,4 +317,3 @@ int resolve_address(union sockaddr_inx *addr, const char *host, const char *port
 
     return 0;
 }
-

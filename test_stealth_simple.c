@@ -27,8 +27,7 @@ int main() {
     size_t packet_len = sizeof(packet);
 
     printf("Creating stealth handshake packet...\n");
-    if (stealth_handshake_create_first_packet(psk, token, NULL, 0, packet,
-                                              &packet_len) != 0) {
+    if (stealth_handshake_create_first_packet(psk, token, NULL, 0, packet, &packet_len) != 0) {
         printf("✗ Failed to create stealth handshake packet\n");
         return 1;
     }
@@ -41,8 +40,7 @@ int main() {
     size_t extracted_data_len = sizeof(extracted_data);
 
     printf("Parsing stealth handshake packet...\n");
-    if (stealth_handshake_parse_first_packet(psk, packet, packet_len, &payload,
-                                             extracted_data,
+    if (stealth_handshake_parse_first_packet(psk, packet, packet_len, &payload, extracted_data,
                                              &extracted_data_len) != 0) {
         printf("✗ Failed to parse stealth handshake packet\n");
         return 1;
@@ -52,8 +50,8 @@ int main() {
 
     /* Validate payload */
     if (ntohl(payload.magic) != STEALTH_HANDSHAKE_MAGIC) {
-        printf("✗ Invalid magic number: expected 0x%08x, got 0x%08x\n",
-               STEALTH_HANDSHAKE_MAGIC, ntohl(payload.magic));
+        printf("✗ Invalid magic number: expected 0x%08x, got 0x%08x\n", STEALTH_HANDSHAKE_MAGIC,
+               ntohl(payload.magic));
         return 1;
     }
 
@@ -70,8 +68,7 @@ int main() {
     size_t response_len = sizeof(response_packet);
 
     printf("Creating stealth handshake response...\n");
-    if (stealth_handshake_create_response(psk, conv, token, response_packet,
-                                          &response_len) != 0) {
+    if (stealth_handshake_create_response(psk, conv, token, response_packet, &response_len) != 0) {
         printf("✗ Failed to create stealth handshake response\n");
         return 1;
     }
@@ -81,8 +78,7 @@ int main() {
     /* Parse the response */
     struct stealth_handshake_response response;
     printf("Parsing stealth handshake response...\n");
-    if (stealth_handshake_parse_response(psk, response_packet, response_len,
-                                         &response) != 0) {
+    if (stealth_handshake_parse_response(psk, response_packet, response_len, &response) != 0) {
         printf("✗ Failed to parse stealth handshake response\n");
         return 1;
     }
@@ -91,14 +87,14 @@ int main() {
 
     /* Validate response */
     if (ntohl(response.magic) != STEALTH_RESPONSE_MAGIC) {
-        printf("✗ Invalid response magic: expected 0x%08x, got 0x%08x\n",
-               STEALTH_RESPONSE_MAGIC, ntohl(response.magic));
+        printf("✗ Invalid response magic: expected 0x%08x, got 0x%08x\n", STEALTH_RESPONSE_MAGIC,
+               ntohl(response.magic));
         return 1;
     }
 
     if (ntohl(response.conv) != conv) {
-        printf("✗ Conversation ID mismatch: expected 0x%08x, got 0x%08x\n",
-               conv, ntohl(response.conv));
+        printf("✗ Conversation ID mismatch: expected 0x%08x, got 0x%08x\n", conv,
+               ntohl(response.conv));
         return 1;
     }
 

@@ -25,9 +25,8 @@ struct proxy_conn;
  * control packet, -1 on error (e.g., tag verification failed, which should lead
  * to connection closure).
  */
-int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
-                                         int len, const uint8_t *psk,
-                                         bool has_psk, char **out_payload,
+int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data, int len,
+                                         const uint8_t *psk, bool has_psk, char **out_payload,
                                          int *out_plen);
 
 /**
@@ -43,8 +42,8 @@ int aead_protocol_handle_incoming_packet(struct proxy_conn *c, char *data,
  * @param has_psk Whether a PSK is configured.
  * @return int 0 on success, -1 on failure.
  */
-int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len,
-                            const uint8_t *psk, bool has_psk);
+int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len, const uint8_t *psk,
+                            bool has_psk);
 
 /**
  * @brief Sends a FIN message, encrypted if AEAD is enabled.
@@ -54,7 +53,6 @@ int aead_protocol_send_data(struct proxy_conn *c, const char *data, int len,
  * @param has_psk Whether a PSK is configured.
  * @return int 0 on success, -1 on failure.
  */
-int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk,
-                           bool has_psk);
+int aead_protocol_send_fin(struct proxy_conn *c, const uint8_t *psk, bool has_psk);
 
 #endif // AEAD_PROTOCOL_H

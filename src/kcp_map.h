@@ -10,8 +10,6 @@
 extern "C" {
 #endif
 
-/* Minimal conv -> proxy_conn* mapping for kcptcp-server. */
-
 struct kcp_map_entry {
     struct list_head node;
     uint32_t conv;

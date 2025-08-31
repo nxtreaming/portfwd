@@ -3,13 +3,7 @@
 #include <assert.h>
 #include <sys/file.h>
 
-struct app_state g_state = {
-    .daemonized = false
-};
-
-
-
-
+struct app_state g_state = {.daemonized = false};
 
 void set_nonblock(int sockfd) {
     int flags;
@@ -55,8 +49,7 @@ size_t sizeof_sockaddr(const union sockaddr_inx *addr) {
     return sizeof(struct sockaddr_in);
 }
 
-bool is_sockaddr_inx_equal(const union sockaddr_inx *a,
-                           const union sockaddr_inx *b) {
+bool is_sockaddr_inx_equal(const union sockaddr_inx *a, const union sockaddr_inx *b) {
     if (a->sa.sa_family != b->sa.sa_family)
         return false;
     if (*port_of_sockaddr(a) != *port_of_sockaddr(b))
@@ -65,14 +58,12 @@ bool is_sockaddr_inx_equal(const union sockaddr_inx *a,
         return a->sin.sin_addr.s_addr == b->sin.sin_addr.s_addr;
     } else if (a->sa.sa_family == AF_INET6) {
         return a->sin6.sin6_scope_id == b->sin6.sin6_scope_id &&
-               memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr,
-                      sizeof(struct in6_addr)) == 0;
+               memcmp(&a->sin6.sin6_addr, &b->sin6.sin6_addr, sizeof(struct in6_addr)) == 0;
     }
     return false;
 }
 
-int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa,
-                          bool is_udp) {
+int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp) {
     char s_addr[256];
     char *host = NULL, *port = NULL;
     struct addrinfo hints, *result = NULL;
@@ -89,8 +80,7 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa,
         host = s_addr + 1;
         *bracket = '\0';
         port = last_colon + 1;
-    } else if (last_colon != NULL &&
-               (bracket == NULL || last_colon > bracket)) {
+    } else if (last_colon != NULL && (bracket == NULL || last_colon > bracket)) {
         /* IPv4 or hostname format: host:port */
         host = s_addr;
         *last_colon = '\0';
@@ -115,8 +105,7 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa,
 
     rc = getaddrinfo(host, port, &hints, &result);
     if (rc != 0) {
-        P_LOG_ERR("getaddrinfo(%s:%s): %s", host ? host : "<any>", port,
-                  gai_strerror(rc));
+        P_LOG_ERR("getaddrinfo(%s:%s): %s", host ? host : "<any>", port, gai_strerror(rc));
         return -EHOSTUNREACH;
     }
 

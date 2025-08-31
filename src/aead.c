@@ -6,8 +6,7 @@
 #include "kcptcp_common.h"
 #include "anti_replay.h"
 
-int derive_session_key_from_psk(const uint8_t psk[32],
-                                const uint8_t token16[16], uint32_t conv,
+int derive_session_key_from_psk(const uint8_t psk[32], const uint8_t token16[16], uint32_t conv,
                                 uint8_t out_key[32]) {
     if (!psk || !token16 || !out_key)
         return -1;
@@ -21,9 +20,8 @@ int derive_session_key_from_psk(const uint8_t psk[32],
     return 0;
 }
 
-int derive_session_key_epoch(const uint8_t psk[32], const uint8_t token16[16],
-                             uint32_t conv, uint32_t epoch,
-                             uint8_t out_key[32]) {
+int derive_session_key_epoch(const uint8_t psk[32], const uint8_t token16[16], uint32_t conv,
+                             uint32_t epoch, uint8_t out_key[32]) {
     if (!psk || !token16 || !out_key)
         return -1;
     uint8_t nonce16[16];
@@ -40,9 +38,8 @@ int derive_session_key_epoch(const uint8_t psk[32], const uint8_t token16[16],
     return 0;
 }
 
-void aead_gen_control_packet(unsigned char type, uint32_t seq,
-                             const uint8_t *key, const uint8_t *nonce_base,
-                             uint8_t *ad, uint8_t *out_pkt) {
+void aead_gen_control_packet(unsigned char type, uint32_t seq, const uint8_t *key,
+                             const uint8_t *nonce_base, uint8_t *ad, uint8_t *out_pkt) {
     out_pkt[0] = type;
     out_pkt[1] = (uint8_t)seq;
     out_pkt[2] = (uint8_t)(seq >> 8);
@@ -64,13 +61,12 @@ void aead_gen_control_packet(unsigned char type, uint32_t seq,
     chacha20poly1305_seal(key, nonce, ad, 5, NULL, 0, NULL, out_pkt + 5);
 }
 
-int aead_verify_packet(struct proxy_conn *c, uint8_t *data, int len,
-                       uint32_t *out_seq) {
+int aead_verify_packet(struct proxy_conn *c, uint8_t *data, int len, uint32_t *out_seq) {
     if (len < 1 + 4 + 16)
         return -1;
 
-    uint32_t seq = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
-                   ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
+    uint32_t seq = (uint32_t)data[1] | ((uint32_t)data[2] << 8) | ((uint32_t)data[3] << 16) |
+                   ((uint32_t)data[4] << 24);
     *out_seq = seq;
 
     if (!anti_replay_check_and_update(&c->replay_detector, seq)) {
@@ -94,8 +90,8 @@ int aead_verify_packet(struct proxy_conn *c, uint8_t *data, int len,
     int plen = len - (1 + 4 + 16);
     uint8_t *payload = (plen > 0) ? data + 1 + 4 : NULL;
 
-    if (chacha20poly1305_open(c->session_key, nonce, ad, 5, payload, plen,
-                              data + 1 + 4 + plen, data) != 0) {
+    if (chacha20poly1305_open(c->session_key, nonce, ad, 5, payload, plen, data + 1 + 4 + plen,
+                              data) != 0) {
         return -1;
     }
     return plen;
@@ -105,8 +101,8 @@ int aead_verify_ack_packet(struct proxy_conn *c, uint8_t *data, int len) {
     if (len < 1 + 4 + 16)
         return -1;
 
-    uint32_t seq = (uint32_t)data[1] | ((uint32_t)data[2] << 8) |
-                   ((uint32_t)data[3] << 16) | ((uint32_t)data[4] << 24);
+    uint32_t seq = (uint32_t)data[1] | ((uint32_t)data[2] << 8) | ((uint32_t)data[3] << 16) |
+                   ((uint32_t)data[4] << 24);
 
     uint8_t ad[5];
     ad[0] = data[0];
@@ -122,8 +118,7 @@ int aead_verify_ack_packet(struct proxy_conn *c, uint8_t *data, int len) {
     nonce[10] = (uint8_t)(seq >> 16);
     nonce[11] = (uint8_t)(seq >> 24);
 
-    if (chacha20poly1305_open(c->next_session_key, nonce, ad, 5, NULL, 0,
-                              data + 5, data) != 0) {
+    if (chacha20poly1305_open(c->next_session_key, nonce, ad, 5, NULL, 0, data + 5, data) != 0) {
         return -1;
     }
     return 0;
@@ -136,8 +131,8 @@ void aead_epoch_switch(struct proxy_conn *c) {
     c->rekey_in_progress = false;
 }
 
-void aead_seal_packet(struct proxy_conn *c, uint32_t seq,
-                      const uint8_t *payload, size_t plen, uint8_t *out_pkt) {
+void aead_seal_packet(struct proxy_conn *c, uint32_t seq, const uint8_t *payload, size_t plen,
+                      uint8_t *out_pkt) {
     out_pkt[0] = KTP_EDATA;
     out_pkt[1] = (uint8_t)seq;
     out_pkt[2] = (uint8_t)(seq >> 8);
@@ -158,6 +153,6 @@ void aead_seal_packet(struct proxy_conn *c, uint32_t seq,
     nonce[10] = (uint8_t)(seq >> 16);
     nonce[11] = (uint8_t)(seq >> 24);
 
-    chacha20poly1305_seal(c->session_key, nonce, ad, 5, payload, plen,
-                          out_pkt + 1 + 4, out_pkt + 1 + 4 + plen);
+    chacha20poly1305_seal(c->session_key, nonce, ad, 5, payload, plen, out_pkt + 1 + 4,
+                          out_pkt + 1 + 4 + plen);
 }

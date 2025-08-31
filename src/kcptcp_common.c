@@ -3,7 +3,7 @@
 #include <string.h>
 #include <errno.h>
 #include <sys/socket.h>
-#include <unistd.h> /* getopt */
+#include <unistd.h>
 #include <stdio.h>
 #include <time.h>
 #include <arpa/inet.h>
@@ -52,8 +52,7 @@ bool kcptcp_deterministic_conv_enabled(void) {
     const char *s = getenv("PFWD_DETERMINISTIC_CONV");
     if (!s)
         return true; /* default enabled */
-    return !(s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' ||
-             s[0] == 'F');
+    return !(s[0] == '0' || s[0] == 'n' || s[0] == 'N' || s[0] == 'f' || s[0] == 'F');
 }
 
 /* ---------------- Socket helpers ---------------- */
@@ -64,8 +63,7 @@ void set_sock_buffers_sz(int sockfd, int bytes) {
     (void)setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
 }
 
-void kcptcp_tune_tcp_socket(int fd, int sockbuf_bytes, bool tcp_nodelay,
-                            bool keepalive) {
+void kcptcp_tune_tcp_socket(int fd, int sockbuf_bytes, bool tcp_nodelay, bool keepalive) {
     if (fd < 0)
         return;
     set_nonblock(fd);
@@ -84,8 +82,8 @@ void kcptcp_tune_tcp_socket(int fd, int sockbuf_bytes, bool tcp_nodelay,
 #endif
 }
 
-void kcp_opts_apply_overrides(struct kcp_opts *o, int mtu, int nd, int it,
-                              int rs, int nc, int snd, int rcv) {
+void kcp_opts_apply_overrides(struct kcp_opts *o, int mtu, int nd, int it, int rs, int nc, int snd,
+                              int rcv) {
     if (mtu > 0)
         o->mtu = mtu;
     if (nd >= 0)
@@ -117,8 +115,7 @@ int kcptcp_compute_kcp_timeout_ms(struct list_head *conns, int default_ms) {
     return timeout_ms;
 }
 
-int kcptcp_ep_register(int epfd, int fd, void *ptr, uint32_t base_events,
-                       uint32_t extra_events) {
+int kcptcp_ep_register(int epfd, int fd, void *ptr, uint32_t base_events, uint32_t extra_events) {
     struct epoll_event ev = (struct epoll_event){0};
     ev.events = base_events | extra_events;
     ev.data.ptr = ptr;
@@ -166,8 +163,7 @@ static inline int32_t seq_diff_u32(uint32_t a, uint32_t b) {
     return (int32_t)(a - b);
 }
 
-bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win,
-                                  uint64_t *p_mask) {
+bool aead_replay_check_and_update(uint32_t seq, uint32_t *p_win, uint64_t *p_mask) {
     uint32_t win = *p_win;
     uint64_t mask = *p_mask;
     if (win == UINT32_MAX) {
@@ -205,9 +201,8 @@ bool aead_next_send_seq(struct proxy_conn *c, uint32_t *out_seq) {
 }
 
 /* ---------------- Socket setup helpers ---------------- */
-int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr, bool reuse_addr,
-                              bool reuse_port, bool v6only, int sockbuf_bytes,
-                              int backlog) {
+int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr, bool reuse_addr, bool reuse_port,
+                              bool v6only, int sockbuf_bytes, int backlog) {
     int fd = socket(addr->sa.sa_family, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
@@ -240,8 +235,8 @@ int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr, bool reuse_addr,
     return fd;
 }
 
-int kcptcp_setup_udp_listener(const union sockaddr_inx *addr, bool reuse_addr,
-                              bool reuse_port, bool v6only, int sockbuf_bytes) {
+int kcptcp_setup_udp_listener(const union sockaddr_inx *addr, bool reuse_addr, bool reuse_port,
+                              bool v6only, int sockbuf_bytes) {
     int fd = socket(addr->sa.sa_family, SOCK_DGRAM, 0);
     if (fd < 0)
         return -1;
@@ -288,8 +283,7 @@ int kcptcp_create_tcp_socket(int family, int sockbuf_bytes, bool tcp_nodelay) {
 }
 
 /* ---------------- Common CLI parsing ---------------- */
-int kcptcp_parse_common_opts(int argc, char **argv,
-                             struct kcptcp_common_cli *out, int *pos_start,
+int kcptcp_parse_common_opts(int argc, char **argv, struct kcptcp_common_cli *out, int *pos_start,
                              bool is_server) {
     (void)is_server;
     if (!out)
@@ -318,8 +312,7 @@ int kcptcp_parse_common_opts(int argc, char **argv,
 
     optind = 1;
     int opt;
-    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:g:G:j:P:h")) !=
-           -1) {
+    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:g:G:j:P:h")) != -1) {
         switch (opt) {
         case 'd':
             out->daemonize = true;
@@ -500,11 +493,10 @@ void kcptcp_maybe_log_stats(struct proxy_conn *c, uint64_t now_ms) {
     double tcp_out_mbps = sec > 0 ? (double)d_tcp_tx * 8.0 / (sec * 1e6) : 0.0;
     double kcp_in_mbps = sec > 0 ? (double)d_kcp_rx * 8.0 / (sec * 1e6) : 0.0;
     double kcp_out_mbps = sec > 0 ? (double)d_kcp_tx * 8.0 / (sec * 1e6) : 0.0;
-    P_LOG_INFO(
-        "stats conv=%u: TCP in=%.3f Mbps out=%.3f Mbps | KCP payload in=%.3f "
-        "Mbps out=%.3f Mbps | KCP xmit_delta=%u RTT=%dms | rekey i=%u c=%u",
-        c->conv, tcp_in_mbps, tcp_out_mbps, kcp_in_mbps, kcp_out_mbps, d_xmit,
-        c->kcp->rx_srtt, d_rekey_i, d_rekey_c);
+    P_LOG_INFO("stats conv=%u: TCP in=%.3f Mbps out=%.3f Mbps | KCP payload in=%.3f "
+               "Mbps out=%.3f Mbps | KCP xmit_delta=%u RTT=%dms | rekey i=%u c=%u",
+               c->conv, tcp_in_mbps, tcp_out_mbps, kcp_in_mbps, kcp_out_mbps, d_xmit,
+               c->kcp->rx_srtt, d_rekey_i, d_rekey_c);
     c->last_stat_ms = now_ms;
     c->last_tcp_rx_bytes = c->tcp_rx_bytes;
     c->last_tcp_tx_bytes = c->tcp_tx_bytes;
@@ -520,22 +512,18 @@ void kcptcp_log_total_stats(struct proxy_conn *c) {
         return;
     if (!get_stats_dump_enabled())
         return;
-    P_LOG_INFO(
-        "stats total conv=%u: tcp_rx=%llu tcp_tx=%llu udp_rx=%llu udp_tx=%llu "
-        "kcp_rx_msgs=%llu kcp_tx_msgs=%llu kcp_rx_bytes=%llu kcp_tx_bytes=%llu "
-        "rekeys_i=%u rekeys_c=%u",
-        c->conv, (unsigned long long)c->tcp_rx_bytes,
-        (unsigned long long)c->tcp_tx_bytes,
-        (unsigned long long)c->udp_rx_bytes,
-        (unsigned long long)c->udp_tx_bytes, (unsigned long long)c->kcp_rx_msgs,
-        (unsigned long long)c->kcp_tx_msgs, (unsigned long long)c->kcp_rx_bytes,
-        (unsigned long long)c->kcp_tx_bytes, c->rekeys_initiated,
-        c->rekeys_completed);
+    P_LOG_INFO("stats total conv=%u: tcp_rx=%llu tcp_tx=%llu udp_rx=%llu udp_tx=%llu "
+               "kcp_rx_msgs=%llu kcp_tx_msgs=%llu kcp_rx_bytes=%llu kcp_tx_bytes=%llu "
+               "rekeys_i=%u rekeys_c=%u",
+               c->conv, (unsigned long long)c->tcp_rx_bytes, (unsigned long long)c->tcp_tx_bytes,
+               (unsigned long long)c->udp_rx_bytes, (unsigned long long)c->udp_tx_bytes,
+               (unsigned long long)c->kcp_rx_msgs, (unsigned long long)c->kcp_tx_msgs,
+               (unsigned long long)c->kcp_rx_bytes, (unsigned long long)c->kcp_tx_bytes,
+               c->rekeys_initiated, c->rekeys_completed);
 }
 
 /* ---------------- Shared buffer helper ---------------- */
-int ensure_buffer_capacity(struct buffer_info *buf, size_t needed,
-                           size_t max_size) {
+int ensure_buffer_capacity(struct buffer_info *buf, size_t needed, size_t max_size) {
     if (!buf)
         return -1;
     if (buf->capacity >= needed)
@@ -554,17 +542,16 @@ int ensure_buffer_capacity(struct buffer_info *buf, size_t needed,
 }
 
 /* ---------------- Stealth Handshake Implementation ---------------- */
-int stealth_handshake_create_first_packet(
-    const uint8_t *psk, const uint8_t *token, const uint8_t *initial_data,
-    size_t initial_data_len, uint8_t *out_packet, size_t *out_packet_len) {
+int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *token,
+                                          const uint8_t *initial_data, size_t initial_data_len,
+                                          uint8_t *out_packet, size_t *out_packet_len) {
     if (!psk || !token || !out_packet || !out_packet_len)
         return -1;
     struct stealth_handshake_payload payload;
     payload.magic = htonl(STEALTH_HANDSHAKE_MAGIC);
     payload.timestamp = htonl((uint32_t)time(NULL));
     memcpy(payload.token, token, 16);
-    if (secure_random_bytes((uint8_t *)&payload.nonce, sizeof(payload.nonce)) !=
-        0)
+    if (secure_random_bytes((uint8_t *)&payload.nonce, sizeof(payload.nonce)) != 0)
         return -1;
     if (secure_random_bytes(payload.reserved, sizeof(payload.reserved)) != 0)
         return -1;
@@ -583,8 +570,7 @@ int stealth_handshake_create_first_packet(
     memcpy(plaintext, &payload, sizeof(payload));
     if (initial_data && initial_data_len > 0)
         memcpy(plaintext + sizeof(payload), initial_data, initial_data_len);
-    if (secure_random_bytes(plaintext + sizeof(payload) + initial_data_len,
-                            padding_size) != 0) {
+    if (secure_random_bytes(plaintext + sizeof(payload) + initial_data_len, padding_size) != 0) {
         free(plaintext);
         return -1;
     }
@@ -595,8 +581,7 @@ int stealth_handshake_create_first_packet(
         return -1;
     }
     uint8_t tag[16];
-    chacha20poly1305_seal(psk, nonce, NULL, 0, plaintext, total_size,
-                          out_packet + 12, tag);
+    chacha20poly1305_seal(psk, nonce, NULL, 0, plaintext, total_size, out_packet + 12, tag);
     memcpy(out_packet, nonce, 12);
     memcpy(out_packet + 12 + total_size, tag, 16);
     *out_packet_len = 12 + total_size + 16;
@@ -604,10 +589,10 @@ int stealth_handshake_create_first_packet(
     return 0;
 }
 
-int stealth_handshake_parse_first_packet(
-    const uint8_t *psk, const uint8_t *packet, size_t packet_len,
-    struct stealth_handshake_payload *payload, uint8_t *out_data,
-    size_t *out_data_len) {
+int stealth_handshake_parse_first_packet(const uint8_t *psk, const uint8_t *packet,
+                                         size_t packet_len,
+                                         struct stealth_handshake_payload *payload,
+                                         uint8_t *out_data, size_t *out_data_len) {
     if (!psk || !packet || !payload || packet_len < 28)
         return -1;
     const uint8_t *nonce = packet;
@@ -618,8 +603,8 @@ int stealth_handshake_parse_first_packet(
     uint8_t *plaintext = (uint8_t *)malloc(ciphertext_len);
     if (!plaintext)
         return -1;
-    if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len,
-                              tag, plaintext) != 0) {
+    if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len, tag, plaintext) !=
+        0) {
         free(plaintext);
         return -1;
     }
@@ -639,12 +624,10 @@ int stealth_handshake_parse_first_packet(
         return -1;
     }
 
-    size_t remaining =
-        ciphertext_len - sizeof(struct stealth_handshake_payload);
+    size_t remaining = ciphertext_len - sizeof(struct stealth_handshake_payload);
     if (out_data && out_data_len && remaining > 0) {
         size_t copy = remaining < *out_data_len ? remaining : *out_data_len;
-        memcpy(out_data, plaintext + sizeof(struct stealth_handshake_payload),
-               copy);
+        memcpy(out_data, plaintext + sizeof(struct stealth_handshake_payload), copy);
         *out_data_len = copy;
     } else if (out_data_len) {
         *out_data_len = 0;
@@ -653,9 +636,8 @@ int stealth_handshake_parse_first_packet(
     return 0;
 }
 
-int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv,
-                                      const uint8_t *token, uint8_t *out_packet,
-                                      size_t *out_packet_len) {
+int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const uint8_t *token,
+                                      uint8_t *out_packet, size_t *out_packet_len) {
     if (!psk || !token || !out_packet || !out_packet_len)
         return -1;
     struct stealth_handshake_response response;
@@ -689,8 +671,7 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv,
         return -1;
     }
     uint8_t tag[16];
-    chacha20poly1305_seal(psk, nonce, NULL, 0, plaintext, total_size,
-                          out_packet + 12, tag);
+    chacha20poly1305_seal(psk, nonce, NULL, 0, plaintext, total_size, out_packet + 12, tag);
     memcpy(out_packet, nonce, 12);
     memcpy(out_packet + 12 + total_size, tag, 16);
     *out_packet_len = 12 + total_size + 16;
@@ -698,9 +679,8 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv,
     return 0;
 }
 
-int stealth_handshake_parse_response(
-    const uint8_t *psk, const uint8_t *packet, size_t packet_len,
-    struct stealth_handshake_response *response) {
+int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
+                                     struct stealth_handshake_response *response) {
     if (!psk || !packet || !response || packet_len < 28)
         return -1;
     const uint8_t *nonce = packet;
@@ -711,8 +691,8 @@ int stealth_handshake_parse_response(
     uint8_t *plaintext = (uint8_t *)malloc(ciphertext_len);
     if (!plaintext)
         return -1;
-    if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len,
-                              tag, plaintext) != 0) {
+    if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len, tag, plaintext) !=
+        0) {
         free(plaintext);
         return -1;
     }

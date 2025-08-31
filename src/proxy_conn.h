@@ -2,9 +2,8 @@
 #define __PORTFWD_PROXY_CONN_H__
 
 #define EV_MAGIC_LISTENER ((uintptr_t)0xdeadbeefdeadbeef)
-#define EV_MAGIC_CLIENT   ((uintptr_t)0xcafebabecafebabe)
-#define EV_MAGIC_SERVER   ((uintptr_t)0xfeedfacefeedface)
-
+#define EV_MAGIC_CLIENT ((uintptr_t)0xcafebabecafebabe)
+#define EV_MAGIC_SERVER ((uintptr_t)0xfeedfacefeedface)
 
 #include "list.h"
 #include "anti_replay.h"
@@ -12,7 +11,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <time.h>
-#include "common.h" /* for union sockaddr_inx */
+#include "common.h"
 
 /* Forward declaration to avoid forcing ikcp.h inclusion here */
 struct IKCPCB;
@@ -73,10 +72,10 @@ struct proxy_conn {
     uint32_t conv;
     uint32_t next_conv;
     struct anti_replay_detector replay_detector;
-    int udp_sock; /* UDP socket for KCP transport (per-conn or shared) */
-    union sockaddr_inx peer_addr; /* Remote UDP peer */
-    bool use_kcp;                 /* Marks connection as using KCP path */
-    bool kcp_tx_pending; /* Pending KCP flush due to EAGAIN/backpressure */
+    int udp_sock;                   /* UDP socket for KCP transport (per-conn or shared) */
+    union sockaddr_inx peer_addr;   /* Remote UDP peer */
+    bool use_kcp;                   /* Marks connection as using KCP path */
+    bool kcp_tx_pending;            /* Pending KCP flush due to EAGAIN/backpressure */
     struct buffer_info udp_backlog; /* Pending UDP datagram to retry sendto() */
     /* Handshake */
     unsigned char hs_token[16]; /* 128-bit token echoed by server in ACCEPT */
@@ -101,10 +100,9 @@ struct proxy_conn {
     /* AEAD session key (Phase 2): derived from PSK + token + conv */
     bool has_session_key;
     uint8_t session_key[32];
-    uint8_t
-        nonce_base[12]; /* 12-byte base; per-direction seq fills low 4 bytes */
-    uint32_t send_seq; /* increment per outbound KCP packet carrying DATA/FIN */
-    uint32_t recv_seq; /* legacy counter; not used for anti-replay window */
+    uint8_t nonce_base[12]; /* 12-byte base; per-direction seq fills low 4 bytes */
+    uint32_t send_seq;      /* increment per outbound KCP packet carrying DATA/FIN */
+    uint32_t recv_seq;      /* legacy counter; not used for anti-replay window */
     /* Anti-replay sliding window (Phase 3):
      *  - recv_win tracks the highest validated sequence number received so far
      *  - recv_win_mask is a 64-bit bitmap of recently seen sequences in the
@@ -114,10 +112,9 @@ struct proxy_conn {
     uint64_t recv_win_mask; /* bit i set means (recv_win - i) was seen */
 
     /* Rekeying state (Phase 3.5): key epochs and next-key staging */
-    uint32_t
-        epoch; /* current key epoch; starts at 0 when session key derived */
-    bool rekey_in_progress; /* set after sending/receiving REKEY_INIT until
-                               switch */
+    uint32_t epoch;               /* current key epoch; starts at 0 when session key derived */
+    bool rekey_in_progress;       /* set after sending/receiving REKEY_INIT until
+                                     switch */
     uint8_t next_session_key[32]; /* derived via derive_session_key_epoch(psk,
                                      token, conv, epoch+1) */
     uint8_t next_nonce_base[12];  /* base for next epoch; usually first 12 bytes
@@ -127,10 +124,9 @@ struct proxy_conn {
                                      receive/switch, else close */
 
     /* Runtime statistics (Phase 4): throughput, RTT snapshots, counters */
-    uint64_t tcp_rx_bytes; /* bytes read from TCP (ingress from client or to
-                              server) */
-    uint64_t
-        tcp_tx_bytes; /* bytes written to TCP (egress to client or to server) */
+    uint64_t tcp_rx_bytes;     /* bytes read from TCP (ingress from client or to
+                                  server) */
+    uint64_t tcp_tx_bytes;     /* bytes written to TCP (egress to client or to server) */
     uint64_t udp_rx_bytes;     /* bytes received from UDP peer */
     uint64_t udp_tx_bytes;     /* bytes sent over UDP to peer */
     uint64_t kcp_tx_msgs;      /* number of ikcp_send() messages we attempted */
