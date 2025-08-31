@@ -124,6 +124,8 @@ struct kcptcp_common_cli {
     uint32_t hs_agg_max_bytes;   /* client: max bytes to embed into first packet */
     uint32_t hs_rsp_jitter_min_ms; /* server: min jitter before response */
     uint32_t hs_rsp_jitter_max_ms; /* server: max jitter before response */
+    /* Profile selector (client): "off", "auto", or "csv:22,2222" */
+    const char *hs_profile;
     /* KCP overrides (use -1 if not set; mtu>0) */
     int kcp_mtu;
     int kcp_nd, kcp_it, kcp_rs, kcp_nc, kcp_snd, kcp_rcv;

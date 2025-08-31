@@ -102,6 +102,9 @@ struct cfg_client {
     uint32_t agg_min_ms;
     uint32_t agg_max_ms;
     uint32_t agg_max_bytes;
+    int agg_profile_mode; /* 0=off, 1=auto, 2=list */
+    uint16_t noagg_ports[64];
+    int noagg_count;
 };
 
 struct client_ctx {
@@ -167,6 +170,99 @@ static void client_handle_udp_events(struct client_ctx *ctx,
                                      struct proxy_conn *c, uint32_t evmask);
 static void client_handle_tcp_events(struct client_ctx *ctx,
                                      struct proxy_conn *c, uint32_t evmask);
+
+/* Compute per-port aggregation profile. Returns effective min/max ms and max bytes.
+ * Heuristics:
+ *  - SSH-like (22, 2222): no aggregation, low embed cap (e.g., 256-512)
+ *  - Web-like (80, 8080, 443, 8443): modest aggregation window (30-100ms), larger embed
+ *  - RDP/VNC (3389, 5900): very small aggregation (0-20ms), moderate embed
+ *  - Default: use cfg values
+ */
+static void compute_agg_profile(const struct cfg_client *cfg, uint16_t listen_port,
+                                uint32_t *out_min_ms, uint32_t *out_max_ms,
+                                uint32_t *out_max_bytes) {
+    uint32_t min_ms = cfg->agg_min_ms;
+    uint32_t max_ms = cfg->agg_max_ms;
+    uint32_t max_bytes = cfg->agg_max_bytes;
+
+    /* If profile OFF: use baseline and return */
+    if (cfg->agg_profile_mode == 0) {
+        if (out_min_ms) *out_min_ms = min_ms;
+        if (out_max_ms) *out_max_ms = max_ms;
+        if (out_max_bytes) *out_max_bytes = max_bytes;
+        return;
+    }
+
+    /* If profile LIST: if port listed, disable aggregation (no wait) */
+    if (cfg->agg_profile_mode == 2) {
+        for (int i = 0; i < cfg->noagg_count; ++i) {
+            if (cfg->noagg_ports[i] == listen_port) {
+                min_ms = 0;
+                max_ms = 0;
+                if (max_bytes > 512) max_bytes = 512;
+                if (out_min_ms) *out_min_ms = min_ms;
+                if (out_max_ms) *out_max_ms = max_ms;
+                if (out_max_bytes) *out_max_bytes = max_bytes;
+                return;
+            }
+        }
+        /* Not listed: fall through to auto heuristics */
+    }
+
+    switch (listen_port) {
+    case 22:
+    case 2222:
+        min_ms = 0;
+        max_ms = 0;
+        if (max_bytes > 512) max_bytes = 512;
+        break;
+    case 80:
+    case 8080:
+    case 443:
+    case 8443:
+        if (min_ms < 30) min_ms = 30;
+        if (max_ms < 100) max_ms = 100;
+        if (max_bytes < 1200) {
+            /* keep user's smaller cap */
+        } else {
+            max_bytes = 1200;
+        }
+        break;
+    case 3389: /* RDP */
+    case 5900: /* VNC */
+        if (max_ms > 20) max_ms = 20;
+        if (min_ms > max_ms) min_ms = max_ms;
+        if (max_bytes > 768) max_bytes = 768;
+        break;
+    default:
+        break;
+    }
+    if (out_min_ms) *out_min_ms = min_ms;
+    if (out_max_ms) *out_max_ms = max_ms;
+    if (out_max_bytes) *out_max_bytes = max_bytes;
+}
+
+/* Parse CSV of port numbers into array */
+static int parse_ports_csv(const char *csv, uint16_t *arr, int max, int *outn) {
+    if (!csv || !arr || max <= 0 || !outn) return -1;
+    int n = 0;
+    const char *p = csv;
+    while (*p) {
+        while (*p == ',' || *p == ' ' || *p == '\t') p++;
+        if (!*p) break;
+        char *end = NULL;
+        long v = strtol(p, &end, 10);
+        if (end == p) break;
+        if (v >= 0 && v <= 65535) {
+            if (n < max) {
+                arr[n++] = (uint16_t)v;
+            }
+        }
+        p = (*end == ',') ? end + 1 : end;
+    }
+    *outn = n;
+    return 0;
+}
 
 /* Safe memory management functions */
 static void secure_zero(void *ptr, size_t len) {
@@ -844,6 +940,19 @@ static void client_handle_accept(struct client_ctx *ctx) {
             free(c);
             continue;
         }
+        /* Determine effective aggregation profile for this listen port */
+        uint16_t lport = 0;
+        if (ctx->cfg->laddr.sa.sa_family == AF_INET) {
+            lport = ntohs(ctx->cfg->laddr.sin.sin_port);
+        } else if (ctx->cfg->laddr.sa.sa_family == AF_INET6) {
+            lport = ntohs(ctx->cfg->laddr.sin6.sin6_port);
+        }
+        uint32_t eff_min_ms = ctx->cfg->agg_min_ms;
+        uint32_t eff_max_ms = ctx->cfg->agg_max_ms;
+        uint32_t eff_max_bytes = ctx->cfg->agg_max_bytes;
+        compute_agg_profile(ctx->cfg, lport, &eff_min_ms, &eff_max_ms, &eff_max_bytes);
+        c->hs_agg_max_bytes_eff = eff_max_bytes;
+
         /* Pre-drain any immediately available TCP bytes into buffer */
         bool drop_conn = false;
         {
@@ -863,7 +972,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
                     }
                     memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
                     c->request.dlen += (size_t)rn;
-                    if (c->request.dlen >= ctx->cfg->agg_max_bytes) break;
+                    if (c->request.dlen >= eff_max_bytes) break;
                 } else {
                     break;
                 }
@@ -874,7 +983,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
         }
 
         /* Schedule stealth handshake send with small randomized aggregation window */
-        uint32_t jitter = rand_between(ctx->cfg->agg_min_ms, ctx->cfg->agg_max_ms);
+        uint32_t jitter = rand_between(eff_min_ms, eff_max_ms);
         c->hs_scheduled = true;
         c->hs_send_at_ms = kcp_now_ms() + jitter;
 
@@ -1043,6 +1152,10 @@ static void print_usage(const char *prog) {
     P_LOG_INFO("  -K <hex>           32-byte PSK in hex (ChaCha20-Poly1305) [REQUIRED]");
     P_LOG_INFO("  -g <min-max>       aggregate first TCP bytes for min-max ms before sending first UDP packet");
     P_LOG_INFO("  -G <bytes>         max bytes to embed into first UDP packet (default 1024)");
+    P_LOG_INFO("  -P off|auto|csv:<ports> per-port aggregation profile (client)\n"
+               "                         off: disable per-port heuristics\n"
+               "                         auto: enable built-in profiles\n"
+               "                         csv: comma-separated ports with no aggregation");
     P_LOG_INFO("  -h                 show help");
     P_LOG_INFO(" ");
     P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
@@ -1088,6 +1201,27 @@ int main(int argc, char **argv) {
     cfg.agg_min_ms = opts.hs_agg_min_ms;
     cfg.agg_max_ms = opts.hs_agg_max_ms;
     cfg.agg_max_bytes = opts.hs_agg_max_bytes;
+    /* Per-port profiling mode */
+    cfg.agg_profile_mode = 1; /* default auto */
+    cfg.noagg_count = 0;
+    if (opts.hs_profile) {
+        if (strcmp(opts.hs_profile, "off") == 0) {
+            cfg.agg_profile_mode = 0;
+        } else if (strcmp(opts.hs_profile, "auto") == 0) {
+            cfg.agg_profile_mode = 1;
+        } else if (strncmp(opts.hs_profile, "csv:", 4) == 0) {
+            cfg.agg_profile_mode = 2;
+            (void)parse_ports_csv(opts.hs_profile + 4, cfg.noagg_ports,
+                                  (int)(sizeof(cfg.noagg_ports) / sizeof(cfg.noagg_ports[0])),
+                                  &cfg.noagg_count);
+        } else {
+            /* Treat as CSV directly */
+            cfg.agg_profile_mode = 2;
+            (void)parse_ports_csv(opts.hs_profile, cfg.noagg_ports,
+                                  (int)(sizeof(cfg.noagg_ports) / sizeof(cfg.noagg_ports[0])),
+                                  &cfg.noagg_count);
+        }
+    }
 
     kcp_mtu = opts.kcp_mtu;
     kcp_nd = opts.kcp_nd;
@@ -1229,8 +1363,8 @@ int main(int argc, char **argv) {
                                        ? (pos->request.dlen - pos->request.rpos)
                                        : 0;
                     size_t embed = avail;
-                    if (embed > cctx.cfg->agg_max_bytes)
-                        embed = cctx.cfg->agg_max_bytes;
+                    if (embed > pos->hs_agg_max_bytes_eff)
+                        embed = pos->hs_agg_max_bytes_eff;
                     const uint8_t *idata = (embed > 0)
                                                ? (const uint8_t *)(pos->request.data + pos->request.rpos)
                                                : NULL;

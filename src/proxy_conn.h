@@ -84,6 +84,7 @@ struct proxy_conn {
     uint32_t hs_resp_send_at_ms;
     size_t hs_resp_len;
     unsigned char hs_resp_buf[1536];
+    uint32_t hs_agg_max_bytes_eff; /* effective per-connection embed cap */
 
     /* Epoll tagging (client side): distinguish TCP vs UDP events */
     struct ep_tag *cli_tag; /* tag for client TCP fd */

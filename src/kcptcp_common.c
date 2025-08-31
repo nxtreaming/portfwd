@@ -350,7 +350,7 @@ int kcptcp_parse_common_opts(int argc, char **argv,
        -W <rcvwnd>
        -h (help)
     */
-    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:g:G:j:h")) != -1) {
+    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:g:G:j:P:h")) != -1) {
         switch (opt) {
         case 'd':
             out->daemonize = true;
@@ -478,6 +478,10 @@ int kcptcp_parse_common_opts(int argc, char **argv,
         case 'h':
             out->show_help = true;
             break;
+        case 'P': {
+            out->hs_profile = optarg; /* client-only; ignored by server */
+            break;
+        }
         default:
             return 0;
         }
