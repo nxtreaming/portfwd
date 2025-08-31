@@ -917,16 +917,17 @@ int main(int argc, char **argv) {
                         int peek = ikcp_peeksize(c->kcp);
                         if (peek < 0)
                             break;
-                        if (peek > (int)sizeof(buf))
-                            peek = (int)sizeof(buf);
-                        int got = ikcp_recv(c->kcp, buf, peek);
+                        if (peek > UDP_RECV_BUFFER_SIZE)
+                            peek = UDP_RECV_BUFFER_SIZE;
+                        static char kbuf[UDP_RECV_BUFFER_SIZE];
+                        int got = ikcp_recv(c->kcp, kbuf, peek);
                         if (got <= 0)
                             break;
                         c->kcp_rx_msgs++; /* Stats: KCP RX message */
                         char *payload = NULL;
                         int plen = 0;
                         int res = aead_protocol_handle_incoming_packet(
-                            c, buf, got, cfg.psk, cfg.has_psk, &payload, &plen);
+                            c, kbuf, got, cfg.psk, cfg.has_psk, &payload, &plen);
 
                         if (res < 0) { // Error
                             c->state = S_CLOSING;
