@@ -141,6 +141,49 @@ Notes:
 - Server-side stealth jitter:
   - `-j 5-25` to add small jitter before sending handshake response.
 
+### Generate a secure PSK
+
+Use a cryptographically secure random 32-byte key (64 hex characters).
+
+Linux/macOS:
+
+```sh
+openssl rand -hex 32
+# or
+head -c 32 /dev/urandom | xxd -p -c 64
+# or
+python3 - << 'PY'
+import secrets; print(secrets.token_hex(32))
+PY
+```
+
+Windows PowerShell:
+
+```powershell
+[Convert]::ToHexString([System.Security.Cryptography.RandomNumberGenerator]::GetBytes(32)).ToLower()
+# compatible form:
+$b = New-Object byte[] 32; [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); ($b | ForEach-Object { $_.ToString('x2') }) -join ''
+```
+
+Validate: ensure exactly 64 hex chars (regex `^[0-9a-fA-F]{64}$`).
+
+Use with CLI:
+
+```sh
+kcptcp-server 0.0.0.0:4000 127.0.0.1:22 -K <64-hex-psk>
+kcptcp-client 127.0.0.1:2022 server:4000     -K <64-hex-psk>
+```
+
+Store securely:
+
+```sh
+echo "<64-hex-psk>" > psk.txt && chmod 600 psk.txt
+kcptcp-server ... -K "$(cat psk.txt)"
+kcptcp-client ... -K "$(cat psk.txt)"
+```
+
+Rotate periodically: generate a new PSK and restart client/server with the same new value; existing sessions continue until closed.
+
 ## Signals, PID files, and graceful shutdown
 
 Both `tcpfwd` and `udpfwd` support optional PID files via `-p <pidfile>`. The PID file is created exclusively, checks for stale PIDs, and is automatically removed on clean exit. The following signals trigger graceful shutdown and PID cleanup:
