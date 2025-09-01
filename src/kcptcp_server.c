@@ -23,7 +23,6 @@
 #include "kcp_common.h"
 #include "kcptcp_common.h"
 #include "kcp_map.h"
-#include "aead_protocol.h"
 #include "aead.h"
 #include "anti_replay.h"
 #include "secure_random.h"
@@ -930,7 +929,7 @@ int main(int argc, char **argv) {
                             break;
                         c->kcp_rx_msgs++; /* Stats: KCP RX message */
                         /* No inner AEAD: interpret 0xF1 as FIN, else raw data */
-                        if (got == 1 && (unsigned char)kbuf[0] == 0xF1) {
+                        if (got == 1 && (unsigned char)kbuf[0] == FIN_MARKER) {
                             c->svr_in_eof = true;
                             if (!c->svr2cli_shutdown && c->response.dlen == c->response.rpos && c->svr_sock > 0) {
                                 shutdown(c->svr_sock, SHUT_WR);
@@ -1077,7 +1076,7 @@ int main(int argc, char **argv) {
                          * further reads, allow pending KCP to flush */
                         /* No inner AEAD: send minimal FIN marker over KCP */
                         {
-                            unsigned char fin = 0xF1;
+                            unsigned char fin = FIN_MARKER;
                             if (ikcp_send(c->kcp, (const char *)&fin, 1) < 0) {
                                 c->state = S_CLOSING;
                             } else {

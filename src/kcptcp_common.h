@@ -7,6 +7,9 @@
 #include "common.h"
 #include "kcp_common.h"
 
+/* Minimal control markers over KCP (no inner AEAD) */
+#define FIN_MARKER ((unsigned char)0xF1)
+
 #ifdef __cplusplus
 extern "C" {
 #endif

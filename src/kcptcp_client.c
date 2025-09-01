@@ -22,13 +22,11 @@
 #include "kcptcp_common.h"
 #include "outer_obfs.h"
 #include "kcp_common.h"
-#include "aead_protocol.h"
 #include "anti_replay.h"
 #include "secure_random.h"
 #include "buffer_limits.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
-#include "aead.h"
 #include "fwd_util.h"
 #include <pthread.h>
 
@@ -510,7 +508,7 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
             return -1; /* Safety guard */
         }
         /* Send FIN as zero-length marker or a minimal control byte over KCP */
-        unsigned char fin = 0xF1; /* simple FIN marker */
+        unsigned char fin = FIN_MARKER; /* simple FIN marker */
         if (ikcp_send(c->kcp, (const char *)&fin, 1) < 0) {
             return -1; /* Error: close connection */
         }
@@ -743,7 +741,7 @@ static void client_handle_udp_events(struct client_ctx *ctx, struct proxy_conn *
             g_perf.kcp_packets_processed++;
 
             /* No inner AEAD: interpret 0xF1 as FIN, else raw data */
-            if (got == 1 && (unsigned char)ubuf[0] == 0xF1) {
+            if (got == 1 && (unsigned char)ubuf[0] == FIN_MARKER) {
                 c->svr_in_eof = true;
                 if (!c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
                     shutdown(c->cli_sock, SHUT_WR);
@@ -988,17 +986,20 @@ static void client_handle_tcp_events(struct client_ctx *ctx, struct proxy_conn *
                 memcpy(c->request.data + c->request.dlen, tbuf, (size_t)rn);
                 c->request.dlen += (size_t)rn;
             } else {
-                int sn = aead_protocol_send_data(c, tbuf, rn, ctx->cfg->psk, ctx->cfg->has_psk);
-                if (sn < 0) {
+                if (ikcp_send(c->kcp, tbuf, rn) < 0) {
                     c->state = S_CLOSING;
                     break;
                 }
+                c->kcp_tx_msgs++;
+                c->kcp_tx_bytes += (uint64_t)rn;
             }
         }
         if (rn == 0) {
             /* TCP EOF: on handshake pending, defer FIN until ready */
             if (c->kcp_ready) {
-                (void)aead_protocol_send_fin(c, ctx->cfg->psk, ctx->cfg->has_psk);
+                unsigned char fin = FIN_MARKER;
+                (void)ikcp_send(c->kcp, (const char *)&fin, 1);
+                c->kcp_tx_msgs++;
             }
             c->cli_in_eof = true;
             struct epoll_event cev = (struct epoll_event){0};

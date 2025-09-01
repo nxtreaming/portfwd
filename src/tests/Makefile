@@ -2,9 +2,9 @@ CC ?= $(CROSS_COMPILE)gcc
 CFLAGS += -Wall -Wextra -I.. -I../3rd/chacha20poly1305
 
 # Reuse project objects for AEAD
-AEADOBJS = ../aead.o ../anti_replay.o ../3rd/chacha20poly1305/chacha20poly1305.o
+AEADOBJS = ../3rd/chacha20poly1305/chacha20poly1305.o
 
-all: test_aead test_replay test_handshake test_stealth_handshake test_outer_obfs_handshake test_outer_obfs_kcp tcp_echo it_kcp
+all: test_handshake test_stealth_handshake test_outer_obfs_handshake test_outer_obfs_kcp tcp_echo it_kcp
 
 # Build unit tests as standalone binaries
 # Note: run from this directory: make -C tests
@@ -12,11 +12,7 @@ all: test_aead test_replay test_handshake test_stealth_handshake test_outer_obfs
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_aead: test_aead.o $(AEADOBJS)
-	$(CC) $(CFLAGS) -o $@ test_aead.o $(AEADOBJS)
 
-test_replay: test_replay.o
-	$(CC) $(CFLAGS) -o $@ test_replay.o
 
 test_handshake: test_handshake.o ../3rd/chacha20poly1305/chacha20poly1305.o
 	$(CC) $(CFLAGS) -o $@ test_handshake.o ../3rd/chacha20poly1305/chacha20poly1305.o

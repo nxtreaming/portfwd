@@ -21,11 +21,17 @@ static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *use
     struct proxy_conn *pc = (struct proxy_conn *)user;
     if (!pc)
         return -1;
-    /* Try to send current datagram with outer obfuscation using PSK */
+    /* Try to send current datagram with outer obfuscation using session key if ready */
     uint8_t obuf[2048];
     size_t olen = sizeof(obuf);
-    if (pc->cfg_has_psk) {
-        if (outer_wrap(pc->cfg_psk, (const uint8_t *)buf, (size_t)len, obuf, &olen, 15) == 0) {
+    const uint8_t *okey = NULL;
+    if (pc->has_session_key) {
+        okey = pc->session_key; /* per-session confidentiality */
+    } else if (pc->cfg_has_psk) {
+        okey = pc->cfg_psk; /* pre-handshake */
+    }
+    if (okey) {
+        if (outer_wrap(okey, (const uint8_t *)buf, (size_t)len, obuf, &olen, 15) == 0) {
             buf = (const char *)obuf;
             len = (int)olen;
         }
