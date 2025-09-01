@@ -1260,7 +1260,7 @@ int main(int argc, char **argv) {
                             uint8_t obuf[1600];
                             size_t olen = sizeof(obuf);
                             const uint8_t *key = cctx.cfg->psk; /* PSK for outer layer */
-                            if (outer_wrap(key, hbuf, hlen, obuf, &olen, 31) == 0) {
+                            if (outer_wrap(key, hbuf, hlen, obuf, &olen, 15) == 0) {
                                 ssize_t sent = sendto(pos->udp_sock, obuf, olen, MSG_DONTWAIT,
                                                       &pos->peer_addr.sa,
                                                       (socklen_t)sizeof_sockaddr(&pos->peer_addr));
