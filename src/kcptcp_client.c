@@ -1045,7 +1045,11 @@ static void print_usage(const char *prog) {
                "aggregation");
     P_LOG_INFO("  -h                 show help");
     P_LOG_INFO(" ");
-    P_LOG_INFO("Note: PSK (-K) is required for secure handshake authentication.");
+    P_LOG_INFO("Notes:");
+    P_LOG_INFO("  - PSK (-K) is required for secure handshake authentication.");
+    P_LOG_INFO("  - After handshake, all KCP datagrams are obfuscated with session key.");
+    P_LOG_INFO("  - FIN is signaled as a 1-byte marker (0x%02X) carried inside KCP payload.", (unsigned)FIN_MARKER);
+    P_LOG_INFO("  - Effective KCP MTU is chosen as configured_mtu - 28 (outer overhead).");
 }
 
 int main(int argc, char **argv) {
@@ -1180,6 +1184,9 @@ int main(int argc, char **argv) {
 
     P_LOG_INFO("kcptcp-client running: TCP %s -> UDP %s", sockaddr_to_string(&cfg.laddr),
                sockaddr_to_string(&cfg.raddr));
+    P_LOG_INFO("  effective_kcp_mtu=%d (configured_mtu=%d - %d outer)", (kopts.mtu - OUTER_OVERHEAD_BYTES), kopts.mtu, OUTER_OVERHEAD_BYTES);
+    P_LOG_INFO("  FIN marker is 0x%02X inside KCP payload", (unsigned)FIN_MARKER);
+
 
     struct kcp_opts kopts;
     kcp_opts_set_defaults(&kopts);

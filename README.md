@@ -6,7 +6,7 @@ User-space TCP/UDP port forwarding services
 ## Summary
  This project contains two applications: tcpfwd, udpfwd, which are for TCP and UDP port forwarding literally.
  Written in pure C.
- 
+
 ## Usage
 
 ### tcpfwd (TCP forwarder)
@@ -174,6 +174,21 @@ When disabled, the server uses secure random conv IDs with a uniqueness check.
   - KCP_MTU=1350 → 1239–1270 (default build)
   - KCP_MTU=1480 → 1369–1400
 - The client takes `min(-G, MTU budget)` when embedding early TCP bytes to avoid fragmentation.
+
+### Wire-level overhead, FIN, and MTU budgeting
+
+- Wire shape (outer obfuscation): every UDP datagram on the wire is
+  `[nonce 12B | ciphertext(inner) | tag 16B]`. This is a fixed 28-byte overhead per packet.
+- KCP segment header is ~24 bytes inside the ciphertext. Application payload is carried in the KCP segment body.
+- FIN signaling: there is no inner protocol anymore. A half-close is indicated by a 1-byte marker inside the KCP payload: `0xF1` (aka `FIN_MARKER`).
+- Effective KCP MTU: the project configures KCP to use `effective_mtu = configured_mtu - 28` so that the wire-level UDP payload remains within the configured MTU after adding the outer obfuscation. This avoids IP fragmentation on typical paths.
+- Stealth handshake padding and response padding are both in the range `0..15` bytes to keep overhead low while preserving length variation.
+- First-packet embed budgeting: the client computes a budget from the effective MTU so that the first UDP packet (handshake + optional embedded TCP bytes + padding + outer 28B) does not exceed the MTU.
+
+Implications:
+- For large payloads, the fixed 28B overhead is amortized. For small packets, consider tuning KCP aggregation and MTU to improve payload ratio.
+- If you still observe fragmentation, reduce `-M` on both client and server (e.g., `-M 1200`).
+
 
 ### Generate a secure PSK
 

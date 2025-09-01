@@ -1,5 +1,6 @@
 #include "kcp_common.h"
 #include "common.h"
+#include "kcptcp_common.h"
 #include "3rd/kcp/ikcp.h"
 #include "outer_obfs.h"
 #include <time.h>

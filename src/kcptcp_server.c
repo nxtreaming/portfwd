@@ -129,10 +129,15 @@ static void print_usage(const char *prog) {
     printf("Usage: %s [options] <listen-addr> <target-addr>\n", prog);
     printf("Options:\n");
     printf("  -h, --help                 Show this help message\n");
-    printf("  -K, --psk <key>            Pre-shared key for AEAD encryption (required)\n");
+    printf("  -K, --psk <key>            Pre-shared key (required)\n");
     printf("  --pidfile <path>           Path to PID file\n");
     printf("  --daemonize                Run as a daemon\n");
     printf("  --reuse-addr               Enable SO_REUSEADDR\n");
+    printf("\nNotes:\n");
+    printf("  - FIN is signaled as a 1-byte marker (0x%02X) inside KCP payload.\n", (unsigned)FIN_MARKER);
+    printf("  - Effective KCP MTU is configured_mtu - 28 (outer obfuscation overhead).\n");
+    printf("  - After handshake, outer obfuscation uses per-session key.\n");
+
     printf("  --reuse-port               Enable SO_REUSEPORT\n");
     printf("  --v6only                   Enable IPV6_V6ONLY\n");
     printf("  --sockbuf <bytes>          Set socket buffer size (SO_SNDBUF/SO_RCVBUF)\n");
@@ -584,6 +589,9 @@ int main(int argc, char **argv) {
 
     P_LOG_INFO("kcptcp-server running: UDP %s -> TCP %s", sockaddr_to_string(&cfg.laddr),
                sockaddr_to_string(&cfg.taddr));
+    P_LOG_INFO("  effective_kcp_mtu=%d (configured_mtu=%d - %d outer)", (kopts.mtu - OUTER_OVERHEAD_BYTES), kopts.mtu, OUTER_OVERHEAD_BYTES);
+    P_LOG_INFO("  FIN marker is 0x%02X inside KCP payload", (unsigned)FIN_MARKER);
+
 
     struct kcp_opts kopts;
     kcp_opts_set_defaults(&kopts);
