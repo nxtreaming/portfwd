@@ -494,10 +494,12 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
             return -1; /* Safety guard: should never happen */
         }
         size_t remain = c->request.dlen - c->request.rpos;
-        if (aead_protocol_send_data(c, c->request.data + c->request.rpos, (int)remain,
-                                    ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+        /* Send raw data over KCP (inner AEAD removed) */
+        if (ikcp_send(c->kcp, (const char *)(c->request.data + c->request.rpos), (int)remain) < 0) {
             return -1; /* Error: close connection */
         }
+        c->kcp_tx_msgs++;
+        c->kcp_tx_bytes += (uint64_t)remain;
         c->request.rpos = c->request.dlen; /* consumed */
     }
 
@@ -507,9 +509,12 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
             LOG_CONN_ERR(c, "Missing session key before sending FIN");
             return -1; /* Safety guard */
         }
-        if (aead_protocol_send_fin(c, ctx->cfg->psk, ctx->cfg->has_psk) < 0) {
+        /* Send FIN as zero-length marker or a minimal control byte over KCP */
+        unsigned char fin = 0xF1; /* simple FIN marker */
+        if (ikcp_send(c->kcp, (const char *)&fin, 1) < 0) {
             return -1; /* Error: close connection */
         }
+        c->kcp_tx_msgs++;
     }
 
     return 0; /* signal: handled handshake */
@@ -737,25 +742,17 @@ static void client_handle_udp_events(struct client_ctx *ctx, struct proxy_conn *
             c->kcp_rx_msgs++;
             g_perf.kcp_packets_processed++;
 
-            char *payload = NULL;
-            int plen = 0;
-            int res = aead_protocol_handle_incoming_packet(c, ubuf, got, ctx->cfg->psk,
-                                                           ctx->cfg->has_psk, &payload, &plen);
-
-            if (res < 0) {
-                // Error
-                P_LOG_ERR("AEAD packet handling failed (res=%d)", res);
-                c->state = S_CLOSING;
-                break;
-            }
-            if (res > 0) {
-                // Control packet handled
-                if (c->svr_in_eof && !c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
+            /* No inner AEAD: interpret 0xF1 as FIN, else raw data */
+            if (got == 1 && (unsigned char)ubuf[0] == 0xF1) {
+                c->svr_in_eof = true;
+                if (!c->svr2cli_shutdown && c->response.dlen == c->response.rpos) {
                     shutdown(c->cli_sock, SHUT_WR);
                     c->svr2cli_shutdown = true;
                 }
                 continue;
             }
+            char *payload = ubuf;
+            int plen = got;
 
             /* Handle KCP data forwarding to TCP */
             int forward_result = handle_kcp_to_tcp(ctx, c, payload, plen);

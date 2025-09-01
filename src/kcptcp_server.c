@@ -929,32 +929,20 @@ int main(int argc, char **argv) {
                         if (got <= 0)
                             break;
                         c->kcp_rx_msgs++; /* Stats: KCP RX message */
-                        char *payload = NULL;
-                        int plen = 0;
-                        int res = aead_protocol_handle_incoming_packet(
-                            c, kbuf, got, cfg.psk, cfg.has_psk, &payload, &plen);
-
-                        if (res < 0) { // Error
-                            c->state = S_CLOSING;
-                            break;
-                        }
-                        if (res > 0) { // Control packet handled
-                            if (c->svr_in_eof && !c->svr2cli_shutdown &&
-                                c->response.dlen == c->response.rpos && c->svr_sock > 0) {
+                        /* No inner AEAD: interpret 0xF1 as FIN, else raw data */
+                        if (got == 1 && (unsigned char)kbuf[0] == 0xF1) {
+                            c->svr_in_eof = true;
+                            if (!c->svr2cli_shutdown && c->response.dlen == c->response.rpos && c->svr_sock > 0) {
                                 shutdown(c->svr_sock, SHUT_WR);
                                 c->svr2cli_shutdown = true;
                             }
                             continue;
                         }
+                        char *payload = kbuf;
+                        int plen = got;
 
-                        if (!payload || plen <= 0) {
-                            continue;
-                        }
-
-                        c->kcp_rx_bytes += (uint64_t)plen; /* Stats: accumulate
-                                                   KCP RX payload bytes */
-                        /* If TCP connect not completed, buffer instead of
-                         * sending */
+                        c->kcp_rx_bytes += (uint64_t)plen; /* Stats: accumulate KCP RX payload bytes */
+                        /* If TCP connect not completed, buffer instead of sending */
                         if (c->state != S_FORWARDING) {
                             size_t need = c->request.dlen + (size_t)plen;
                             if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) !=
@@ -1076,16 +1064,25 @@ int main(int argc, char **argv) {
                     ssize_t rn;
                     while ((rn = recv(c->svr_sock, sbuf, sizeof(sbuf), 0)) > 0) {
                         c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
-                        if (aead_protocol_send_data(c, sbuf, rn, cfg.psk, cfg.has_psk) < 0) {
+                        /* No inner AEAD: send raw TCP data over KCP */
+                        if (ikcp_send(c->kcp, sbuf, (int)rn) < 0) {
                             c->state = S_CLOSING;
                             break;
                         }
+                        c->kcp_tx_msgs++;
+                        c->kcp_tx_bytes += (uint64_t)rn;
                     }
                     if (rn == 0) {
                         /* TCP target sent EOF: send FIN/EFIN over KCP, stop
                          * further reads, allow pending KCP to flush */
-                        if (aead_protocol_send_fin(c, cfg.psk, cfg.has_psk) < 0) {
-                            c->state = S_CLOSING;
+                        /* No inner AEAD: send minimal FIN marker over KCP */
+                        {
+                            unsigned char fin = 0xF1;
+                            if (ikcp_send(c->kcp, (const char *)&fin, 1) < 0) {
+                                c->state = S_CLOSING;
+                            } else {
+                                c->kcp_tx_msgs++;
+                            }
                         }
                         c->svr_in_eof = true;
                         struct epoll_event tev2 = (struct epoll_event){0};

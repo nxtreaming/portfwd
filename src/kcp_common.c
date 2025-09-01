@@ -25,7 +25,7 @@ static int kcp_output_cb(const char *buf, int len, struct IKCPCB *kcp, void *use
     uint8_t obuf[2048];
     size_t olen = sizeof(obuf);
     if (pc->cfg_has_psk) {
-        if (outer_wrap(pc->cfg_psk, (const uint8_t *)buf, (size_t)len, obuf, &olen, 31) == 0) {
+        if (outer_wrap(pc->cfg_psk, (const uint8_t *)buf, (size_t)len, obuf, &olen, 15) == 0) {
             buf = (const char *)obuf;
             len = (int)olen;
         }
