@@ -68,6 +68,11 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const u
 int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
                                      struct stealth_handshake_response *response);
 
+
+/* Session key derivation from PSK + token + conv */
+int derive_session_key_from_psk(const uint8_t *psk, const uint8_t token[16], uint32_t conv,
+                                uint8_t out_key[32]);
+
 /* Env-controlled stats helpers */
 uint32_t get_stats_interval_ms(void);
 bool get_stats_dump_enabled(void);

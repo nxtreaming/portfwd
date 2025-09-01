@@ -158,6 +158,35 @@ bool parse_psk_hex32(const char *hex, uint8_t out[32]) {
     return true;
 }
 
+/* ---------------- Session key derivation ---------------- */
+int derive_session_key_from_psk(const uint8_t *psk, const uint8_t token[16], uint32_t conv,
+                                uint8_t out_key[32]) {
+    if (!psk || !token || !out_key) return -1;
+    /* AAD = token(16) || conv(4, network byte order) */
+    uint8_t aad[20];
+    memcpy(aad, token, 16);
+    uint32_t cbe = htonl(conv);
+    memcpy(aad + 16, &cbe, 4);
+
+    /* Two domain-separated nonces to stretch 16B tag -> 32B key */
+    uint8_t nonce1[12] = { 'P','F','W','D','K','D','F',0,0,0,0,1 };
+    uint8_t nonce2[12] = { 'P','F','W','D','K','D','F',0,0,0,0,2 };
+
+    uint8_t tag1[16];
+    uint8_t tag2[16];
+
+    /* AEAD with AAD-only (plaintext len 0) to produce tags */
+    if (chacha20poly1305_seal(psk, nonce1, aad, sizeof(aad), NULL, 0, NULL, tag1), 0) {
+        /* chacha20poly1305_seal has no return; assume success */
+    }
+    if (chacha20poly1305_seal(psk, nonce2, aad, sizeof(aad), NULL, 0, NULL, tag2), 0) {
+    }
+
+    memcpy(out_key, tag1, 16);
+    memcpy(out_key + 16, tag2, 16);
+    return 0;
+}
+
 /* ---------------- AEAD anti-replay helpers ---------------- */
 static inline int32_t seq_diff_u32(uint32_t a, uint32_t b) {
     return (int32_t)(a - b);
