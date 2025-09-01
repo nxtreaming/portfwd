@@ -23,7 +23,7 @@
 #include "kcp_common.h"
 #include "kcptcp_common.h"
 #include "kcp_map.h"
-#include "aead.h"
+
 #include "anti_replay.h"
 #include "secure_random.h"
 #include "buffer_limits.h"
