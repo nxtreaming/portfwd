@@ -589,13 +589,12 @@ int main(int argc, char **argv) {
 
     P_LOG_INFO("kcptcp-server running: UDP %s -> TCP %s", sockaddr_to_string(&cfg.laddr),
                sockaddr_to_string(&cfg.taddr));
-    P_LOG_INFO("  effective_kcp_mtu=%d (configured_mtu=%d - %d outer)", (kopts.mtu - OUTER_OVERHEAD_BYTES), kopts.mtu, OUTER_OVERHEAD_BYTES);
-    P_LOG_INFO("  FIN marker is 0x%02X inside KCP payload", (unsigned)FIN_MARKER);
-
 
     struct kcp_opts kopts;
     kcp_opts_set_defaults(&kopts);
     kcp_opts_apply_overrides(&kopts, kcp_mtu, kcp_nd, kcp_it, kcp_rs, kcp_nc, kcp_snd, kcp_rcv);
+    P_LOG_INFO("  effective_kcp_mtu=%d (configured_mtu=%d - %d outer)", (kopts.mtu - OUTER_OVERHEAD_BYTES), kopts.mtu, OUTER_OVERHEAD_BYTES);
+    P_LOG_INFO("  FIN marker is 0x%02X inside KCP payload", (unsigned)FIN_MARKER);
 
     while (!g_shutdown_requested) {
         /* Compute timeout from all KCP sessions */
