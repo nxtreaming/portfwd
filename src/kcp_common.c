@@ -113,7 +113,12 @@ int kcp_setup_conn(struct proxy_conn *c, int udp_fd, const union sockaddr_inx *p
 
     /* Apply options */
     ikcp_nodelay(c->kcp, opts->nodelay, opts->interval_ms, opts->resend, opts->nc);
-    ikcp_setmtu(c->kcp, opts->mtu);
+    /* Ensure wire UDP payload (including outer 28B) stays within configured MTU:
+     * effective KCP MTU = wire_mtu - OUTER_OVERHEAD_BYTES. */
+    int eff_mtu = opts->mtu - OUTER_OVERHEAD_BYTES;
+    if (eff_mtu < 200)
+        eff_mtu = 200; /* safety floor */
+    ikcp_setmtu(c->kcp, eff_mtu);
     ikcp_wndsize(c->kcp, opts->sndwnd, opts->rcvwnd);
 
     return 0;

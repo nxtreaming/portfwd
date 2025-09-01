@@ -10,6 +10,9 @@
 /* Minimal control markers over KCP (no inner AEAD) */
 #define FIN_MARKER ((unsigned char)0xF1)
 
+/* Outer obfuscation overhead on wire: 12B nonce + 16B tag */
+#define OUTER_OVERHEAD_BYTES 28
+
 #ifdef __cplusplus
 extern "C" {
 #endif
