@@ -588,7 +588,7 @@ int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *tok
     uint8_t pad_rnd = 0;
     if (secure_random_bytes(&pad_rnd, 1) != 0)
         return -1;
-    size_t padding_size = 16 + (size_t)(pad_rnd % 32); /* 16-47 */
+    size_t padding_size = (size_t)(pad_rnd % 16); /* 0..15 to reduce overhead */
     size_t total_size = sizeof(payload) + initial_data_len + padding_size;
     if (total_size + 28 > *out_packet_len)
         return -1; /* +12 nonce +16 tag */
@@ -680,7 +680,7 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const u
     uint8_t pad_rnd = 0;
     if (secure_random_bytes(&pad_rnd, 1) != 0)
         return -1;
-    size_t padding_size = 8 + (size_t)(pad_rnd % 24);
+    size_t padding_size = (size_t)(pad_rnd % 16);
     size_t total_size = sizeof(response) + padding_size;
     if (total_size + 28 > *out_packet_len)
         return -1;
@@ -749,7 +749,7 @@ int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, 
 uint32_t kcptcp_stealth_embed_cap_from_mtu(int mtu) {
     if (mtu <= 0)
         mtu = 1350;
-    size_t min_padding = 16; /* worst case padding is 16..47 */
+    size_t min_padding = 0; /* new outer padding range 0..15 */
     size_t overhead = 12 + 16 + STEALTH_HANDSHAKE_PAYLOAD_SIZE + min_padding;
     if ((size_t)mtu <= overhead)
         return 0;

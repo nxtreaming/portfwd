@@ -814,7 +814,7 @@ int main(int argc, char **argv) {
                                     uint8_t obuf[1500];
                                     size_t olen = sizeof(obuf);
                                     if (outer_wrap(cfg.psk, response_buf, response_len, obuf, &olen,
-                                                   31) == 0) {
+                                                   15) == 0) {
                                         (void)sendto(usock, obuf, olen, MSG_DONTWAIT,
                                                      &nc->peer_addr.sa,
                                                      (socklen_t)sizeof_sockaddr(&nc->peer_addr));
@@ -843,7 +843,7 @@ int main(int argc, char **argv) {
                                         uint8_t obuf[1500];
                                         size_t olen = sizeof(obuf);
                                         if (outer_wrap(cfg.psk, response_buf, response_len, obuf,
-                                                       &olen, 31) == 0) {
+                                                       &olen, 15) == 0) {
                                             (void)sendto(
                                                 usock, obuf, olen, MSG_DONTWAIT, &nc->peer_addr.sa,
                                                 (socklen_t)sizeof_sockaddr(&nc->peer_addr));
@@ -1108,7 +1108,7 @@ int main(int argc, char **argv) {
                         uint8_t obuf[1500];
                         size_t olen = sizeof(obuf);
                         if (outer_wrap(cfg.psk, (const uint8_t *)conn->hs_resp_buf,
-                                       conn->hs_resp_len, obuf, &olen, 31) == 0) {
+                                       conn->hs_resp_len, obuf, &olen, 15) == 0) {
                             (void)sendto(usock, obuf, olen, MSG_DONTWAIT, &conn->peer_addr.sa,
                                          (socklen_t)sizeof_sockaddr(&conn->peer_addr));
                         } else {
