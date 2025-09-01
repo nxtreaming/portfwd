@@ -1,11 +1,11 @@
-portfwd
-=======
+# portfwd
 
 User-space TCP/UDP port forwarding services
 
 ## Summary
- This project contains two applications: tcpfwd, udpfwd, which are for TCP and UDP port forwarding literally.
- Written in pure C.
+
+This project contains four applications: tcpfwd, udpfwd, kcptcp_client and kcptcp_server, providing TCP and UDP port forwarding.
+Written in pure C.
 
 ## Usage
 
@@ -64,13 +64,14 @@ User-space TCP/UDP port forwarding services
                            csv: comma-separated ports with no aggregation
       -h                 show help
 
-  Notes:
-  - Listens on a local TCP address and forwards streams over UDP using KCP.
-  - PSK `-K` is required. Outer obfuscation (ChaCha20-Poly1305) and stealth handshake are always enabled with the PSK; after handshake, a per-session key is used for the outer layer.
-  - Stealth handshake: the first UDP packet looks like encrypted data and can embed the first TCP bytes.
-  - Aggregation (`-g/-G/-P`) adds a small randomized delay to gather initial TCP bytes to mimic normal traffic.
-    - Effective embed cap is MTU-aware: the actual first-packet embed size is bounded by a budget computed from the KCP MTU to avoid fragmentation (i.e., `embed <= min(-G, MTU budget)`).
-    - If no early TCP bytes arrive within the aggregation window, the client still sends a stealth packet with random padding.
+Notes:
+
+- Listens on a local TCP address and forwards streams over UDP using KCP.
+- PSK `-K` is required. Outer obfuscation (ChaCha20-Poly1305) and stealth handshake are always enabled with the PSK; after handshake, a per-session key is used for the outer layer.
+- Stealth handshake: the first UDP packet looks like encrypted data and can embed the first TCP bytes.
+- Aggregation (`-g/-G/-P`) adds a small randomized delay to gather initial TCP bytes to mimic normal traffic.
+  - Effective embed cap is MTU-aware: the actual first-packet embed size is bounded by a budget computed from the KCP MTU to avoid fragmentation (i.e., `embed <= min(-G, MTU budget)`).
+  - If no early TCP bytes arrive within the aggregation window, the client still sends a stealth packet with random padding.
 
 ### kcptcp-server (KCP/UDP to TCP server)
 
@@ -95,30 +96,31 @@ User-space TCP/UDP port forwarding services
       -j <min-max>       jitter response to first packet by min-max ms (stealth)
       -h                 show help
 
-  Notes:
-  - Listens on a UDP address, accepts KCP sessions, and bridges to a target TCP service.
-  - PSK must match the client; stealth handshake response can be jittered with `-j` to mimic normal traffic timing.
-  - Default jitter window is 5–20ms. Set `-j 0-0` to disable jitter.
+Notes:
+
+- Listens on a UDP address, accepts KCP sessions, and bridges to a target TCP service.
+- PSK must match the client; stealth handshake response can be jittered with `-j` to mimic normal traffic timing.
+- Default jitter window is 5–20ms. Set `-j 0-0` to disable jitter.
 
 ## Examples
 
-##### Map local TCP port 1022 to 192.168.1.77:22
+### Map local TCP port 1022 to 192.168.1.77:22
 
     tcpfwd 0.0.0.0:1022 192.168.1.77:22     # allow access from all hosts
     tcpfwd 127.0.0.1:1022 192.168.1.77:22   # only allow localhost
     tcpfwd [::]:1022 192.168.1.77:22        # allow access to port 1022 via both IPv4 and IPv6
 
-##### Map local UDP port 53 to 8.8.8.8:53
+### Map local UDP port 53 to 8.8.8.8:53
 
     udpfwd 0.0.0.0:53 8.8.8.8:53
     udpfwd [::]:53 8.8.8.8:53
 
-##### IPv4-IPv6 transforming
+### IPv4-IPv6 transforming
 
     udpfwd [::]:1701 localhost:1701         # add IPv6 support for a local L2TP service
     tcpfwd 0.0.0.0:80 [2001:db8:3::2]:80    # enable IPv4 access for an IPv6-only web service
 
-##### KCP TCP tunneling (encrypted)
+### KCP TCP tunneling (encrypted)
 
 Server (on host with SSH at 127.0.0.1:22):
 
@@ -163,7 +165,7 @@ When disabled, the server uses secure random conv IDs with a uniqueness check.
 - Server can jitter the handshake response (`-j`) to avoid an immediate request/response signature.
 - Per-port client profiles (`-P`) can turn aggregation off for interactive ports (e.g., `-P csv:22,2222`) or use built-in heuristics (`-P auto`).
 
-##### MTU budget for first‑packet embed
+### MTU budget for first‑packet embed
 
 - Formula (application payload embedded into the first UDP packet):
   - `embed_budget ≈ KCP_MTU - (nonce 12 + tag 16 + payload 36 + padding)`
