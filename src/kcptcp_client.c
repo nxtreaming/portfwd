@@ -472,7 +472,8 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
 
     /* pass PSK to proxy_conn for outer obfs */
     c->cfg_has_psk = ctx->cfg->has_psk;
-    if (c->cfg_has_psk) memcpy(c->cfg_psk, ctx->cfg->psk, 32);
+    if (c->cfg_has_psk)
+        memcpy(c->cfg_psk, ctx->cfg->psk, 32);
     if (kcp_setup_conn(c, c->udp_sock, &c->peer_addr, c->conv, ctx->kopts) != 0) {
         P_LOG_ERR("kcp_setup_conn failed after ACCEPT");
         return -1; /* Error: close connection */
@@ -1264,28 +1265,30 @@ int main(int argc, char **argv) {
                             const uint8_t *key = cctx.cfg->psk; /* PSK for outer layer */
                             if (outer_wrap(key, hbuf, hlen, obuf, &olen, 31) == 0) {
                                 ssize_t sent = sendto(pos->udp_sock, obuf, olen, MSG_DONTWAIT,
-                                                       &pos->peer_addr.sa,
-                                                       (socklen_t)sizeof_sockaddr(&pos->peer_addr));
+                                                      &pos->peer_addr.sa,
+                                                      (socklen_t)sizeof_sockaddr(&pos->peer_addr));
                                 if (sent >= 0) {
                                     g_perf.handshake_attempts++;
                                     P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", olen);
                                     pos->hs_scheduled = false;
                                     pos->request.rpos += embed;
                                 } else {
-                                    P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
+                                    P_LOG_WARN("Failed to send stealth handshake: %s",
+                                               strerror(errno));
                                     pos->hs_send_at_ms = now + 5;
                                 }
                             } else {
-                                ssize_t sent =
-                                    sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT, &pos->peer_addr.sa,
-                                           (socklen_t)sizeof_sockaddr(&pos->peer_addr));
+                                ssize_t sent = sendto(pos->udp_sock, hbuf, hlen, MSG_DONTWAIT,
+                                                      &pos->peer_addr.sa,
+                                                      (socklen_t)sizeof_sockaddr(&pos->peer_addr));
                                 if (sent >= 0) {
                                     g_perf.handshake_attempts++;
                                     P_LOG_DEBUG("Sent stealth handshake packet (%zu bytes)", hlen);
                                     pos->hs_scheduled = false;
                                     pos->request.rpos += embed;
                                 } else {
-                                    P_LOG_WARN("Failed to send stealth handshake: %s", strerror(errno));
+                                    P_LOG_WARN("Failed to send stealth handshake: %s",
+                                               strerror(errno));
                                     pos->hs_send_at_ms = now + 5;
                                 }
                             }

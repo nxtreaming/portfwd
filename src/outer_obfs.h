@@ -12,12 +12,11 @@
  */
 
 /* Max additional padding to add after inner payload (0..pad_max bytes). */
-int outer_wrap(const uint8_t psk[32], const uint8_t *inner, size_t inner_len,
-               uint8_t *out_buf, size_t *out_len, size_t pad_max);
+int outer_wrap(const uint8_t psk[32], const uint8_t *inner, size_t inner_len, uint8_t *out_buf,
+               size_t *out_len, size_t pad_max);
 
 /* Unwrap outer packet. On success, copies inner payload to out_buf. */
-int outer_unwrap(const uint8_t psk[32], const uint8_t *packet, size_t packet_len,
-                 uint8_t *out_buf, size_t *out_len);
+int outer_unwrap(const uint8_t psk[32], const uint8_t *packet, size_t packet_len, uint8_t *out_buf,
+                 size_t *out_len);
 
 #endif /* OUTER_OBFS_H */
-

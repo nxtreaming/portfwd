@@ -1413,11 +1413,9 @@ static void show_help(const char *prog) {
     P_LOG_INFO("  %s 0.0.0.0:10000 10.0.0.1:20000", prog);
     P_LOG_INFO("  %s [::]:10000 [2001:db8::1]:20000", prog);
     P_LOG_INFO("Options:");
-    P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)",
-               DEFAULT_CONN_TIMEOUT_SEC);
-    P_LOG_INFO(
-        "  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d)",
-        UDP_PROXY_SOCKBUF_CAP);
+    P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)", DEFAULT_CONN_TIMEOUT_SEC);
+    P_LOG_INFO("  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d)",
+               UDP_PROXY_SOCKBUF_CAP);
     P_LOG_INFO("  -C <max_conns>   maximum tracked UDP sessions (default: %d)",
                UDP_PROXY_MAX_CONNS);
     P_LOG_INFO("  -B <batch>       Linux recvmmsg/sendmmsg batch size (1..%d, "

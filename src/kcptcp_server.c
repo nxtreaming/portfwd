@@ -641,7 +641,8 @@ int main(int argc, char **argv) {
                     }
                     uint8_t inner[2048];
                     size_t ilen = sizeof(inner);
-                    if (outer_unwrap(cfg.psk, (const uint8_t *)obuf, (size_t)rn, inner, &ilen) != 0) {
+                    if (outer_unwrap(cfg.psk, (const uint8_t *)obuf, (size_t)rn, inner, &ilen) !=
+                        0) {
                         /* Not our traffic; drop */
                         continue;
                     }
@@ -663,8 +664,8 @@ int main(int argc, char **argv) {
                         size_t extracted_data_len = sizeof(extracted_data);
 
                         if (stealth_handshake_parse_first_packet(
-                                cfg.psk, (const uint8_t *)inner, (size_t)ilen, &payload, extracted_data,
-                                &extracted_data_len) == 0) {
+                                cfg.psk, (const uint8_t *)inner, (size_t)ilen, &payload,
+                                extracted_data, &extracted_data_len) == 0) {
                             /* Successfully parsed stealth handshake! */
 
                             /* Apply rate limiting */
@@ -762,7 +763,8 @@ int main(int argc, char **argv) {
 
                             /* pass PSK to proxy_conn for outer obfs */
                             nc->cfg_has_psk = cfg.has_psk;
-                            if (nc->cfg_has_psk) memcpy(nc->cfg_psk, cfg.psk, 32);
+                            if (nc->cfg_has_psk)
+                                memcpy(nc->cfg_psk, cfg.psk, 32);
                             if (kcp_setup_conn(nc, usock, &ra, nc->conv, &kopts) != 0) {
                                 P_LOG_ERR("kcp_setup_conn failed");
                                 close(ts);
@@ -812,13 +814,14 @@ int main(int argc, char **argv) {
                                 {
                                     uint8_t obuf[1500];
                                     size_t olen = sizeof(obuf);
-                                    if (outer_wrap(cfg.psk, response_buf, response_len, obuf, &olen, 31) == 0) {
+                                    if (outer_wrap(cfg.psk, response_buf, response_len, obuf, &olen,
+                                                   31) == 0) {
                                         (void)sendto(usock, obuf, olen, MSG_DONTWAIT,
                                                      &nc->peer_addr.sa,
                                                      (socklen_t)sizeof_sockaddr(&nc->peer_addr));
                                     } else {
-                                        (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
-                                                     &nc->peer_addr.sa,
+                                        (void)sendto(usock, response_buf, response_len,
+                                                     MSG_DONTWAIT, &nc->peer_addr.sa,
                                                      (socklen_t)sizeof_sockaddr(&nc->peer_addr));
                                     }
                                 }
@@ -840,14 +843,16 @@ int main(int argc, char **argv) {
                                     {
                                         uint8_t obuf[1500];
                                         size_t olen = sizeof(obuf);
-                                        if (outer_wrap(cfg.psk, response_buf, response_len, obuf, &olen, 31) == 0) {
-                                            (void)sendto(usock, obuf, olen, MSG_DONTWAIT,
-                                                         &nc->peer_addr.sa,
-                                                         (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                        if (outer_wrap(cfg.psk, response_buf, response_len, obuf,
+                                                       &olen, 31) == 0) {
+                                            (void)sendto(
+                                                usock, obuf, olen, MSG_DONTWAIT, &nc->peer_addr.sa,
+                                                (socklen_t)sizeof_sockaddr(&nc->peer_addr));
                                         } else {
-                                            (void)sendto(usock, response_buf, response_len, MSG_DONTWAIT,
-                                                         &nc->peer_addr.sa,
-                                                         (socklen_t)sizeof_sockaddr(&nc->peer_addr));
+                                            (void)sendto(
+                                                usock, response_buf, response_len, MSG_DONTWAIT,
+                                                &nc->peer_addr.sa,
+                                                (socklen_t)sizeof_sockaddr(&nc->peer_addr));
                                         }
                                     }
                                 }
@@ -1106,12 +1111,14 @@ int main(int argc, char **argv) {
                     {
                         uint8_t obuf[1500];
                         size_t olen = sizeof(obuf);
-                        if (outer_wrap(cfg.psk, (const uint8_t *)conn->hs_resp_buf, conn->hs_resp_len, obuf, &olen, 31) == 0) {
-                            (void)sendto(usock, obuf, olen, MSG_DONTWAIT,
-                                         &conn->peer_addr.sa, (socklen_t)sizeof_sockaddr(&conn->peer_addr));
+                        if (outer_wrap(cfg.psk, (const uint8_t *)conn->hs_resp_buf,
+                                       conn->hs_resp_len, obuf, &olen, 31) == 0) {
+                            (void)sendto(usock, obuf, olen, MSG_DONTWAIT, &conn->peer_addr.sa,
+                                         (socklen_t)sizeof_sockaddr(&conn->peer_addr));
                         } else {
                             (void)sendto(usock, conn->hs_resp_buf, conn->hs_resp_len, MSG_DONTWAIT,
-                                         &conn->peer_addr.sa, (socklen_t)sizeof_sockaddr(&conn->peer_addr));
+                                         &conn->peer_addr.sa,
+                                         (socklen_t)sizeof_sockaddr(&conn->peer_addr));
                         }
                     }
                     conn->hs_resp_pending = false;
