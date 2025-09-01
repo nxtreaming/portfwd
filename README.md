@@ -55,7 +55,7 @@ User-space TCP/UDP port forwarding services
       -w <sndwnd>        KCP send window in packets (default 1024)
       -W <rcvwnd>        KCP recv window in packets (default 1024)
       -N                 enable TCP_NODELAY on client sockets
-      -K <hex>           32-byte PSK in hex (REQUIRED; enables AEAD + stealth handshake)
+      -K <hex>           32-byte PSK in hex (REQUIRED; outer obfuscation + stealth handshake)
       -g <min-max>       aggregate first TCP bytes for min-max ms before first UDP (default 20-80)
       -G <bytes>         max bytes to embed in first UDP packet (default 1024)
       -P off|auto|csv:<ports> per-port aggregation profile
@@ -66,7 +66,7 @@ User-space TCP/UDP port forwarding services
 
   Notes:
   - Listens on a local TCP address and forwards streams over UDP using KCP.
-  - PSK `-K` is required. AEAD (ChaCha20-Poly1305) and stealth handshake are always enabled with the PSK.
+  - PSK `-K` is required. Outer obfuscation (ChaCha20-Poly1305) and stealth handshake are always enabled with the PSK; after handshake, a per-session key is used for the outer layer.
   - Stealth handshake: the first UDP packet looks like encrypted data and can embed the first TCP bytes.
   - Aggregation (`-g/-G/-P`) adds a small randomized delay to gather initial TCP bytes to mimic normal traffic.
     - Effective embed cap is MTU-aware: the actual first-packet embed size is bounded by a budget computed from the KCP MTU to avoid fragmentation (i.e., `embed <= min(-G, MTU budget)`).
@@ -91,7 +91,7 @@ User-space TCP/UDP port forwarding services
       -w <sndwnd>        KCP send window in packets (default 1024)
       -W <rcvwnd>        KCP recv window in packets (default 1024)
       -N                 enable TCP_NODELAY on outbound TCP to target
-      -K <hex>           32-byte PSK in hex (REQUIRED; enables AEAD + stealth handshake)
+      -K <hex>           32-byte PSK in hex (REQUIRED; outer obfuscation + stealth handshake)
       -j <min-max>       jitter response to first packet by min-max ms (stealth)
       -h                 show help
 
@@ -330,69 +330,42 @@ Notes:
 
 On Linux, `tcpfwd` opportunistically uses `splice()` with a non-blocking pipe to reduce copies and syscalls on the hot path. This is automatic when available, with graceful fallback to userspace buffering. No runtime flag is required.
 
-## KCP + AEAD Overview
+## KCP + Outer Obfuscation Overview
 
 - Transport: KCP over UDP (for `kcptcp-client`/`kcptcp-server`).
-- AEAD: ChaCha20-Poly1305.
-- Each session derives a per-epoch 32-byte key and a 12-byte nonce base.
-- Nonces are 96-bit: top 96 bits from nonce base, low 32 bits from `send_seq`.
+- Outer layer: ChaCha20-Poly1305 obfuscation on the entire KCP datagram.
+- Each session derives a 32-byte session key after handshake (PSK is used only before handshake).
 
-## AEAD Rekeying
+## Session key & wire behavior
 
-Rekeying prevents nonce reuse by switching to a new epoch (key/nonce base) before the 32-bit sequence number can wrap.
+- PSK is used only to authenticate and encrypt the stealth handshake and the very first messages.
+- After handshake, a per-session key is used for the outer layer; there is no inner protocol.
+- All UDP datagrams on the wire share the same obfuscated shape: `[nonce 12B | ciphertext | tag 16B]`.
+- To avoid fragmentation, KCP MTU is configured as `effective_mtu = configured_mtu - 28`.
+- FIN is a single byte (0xF1) carried inside KCP payload.
 
-- Preconditions:
-  - PSK must be configured on both sides; a successful handshake establishes the initial session key.
-- Trigger:
-  - When `send_seq >= REKEY_SEQ_THRESHOLD` and no rekey is in progress, the sender initiates rekeying.
-- Protocol:
-  - REKEY_INIT: sent by the initiator under the current epoch key; associated data includes type and the sender’s current `send_seq`.
-  - REKEY_ACK: sent by the peer under the next epoch key with `seq=0` (in the next epoch namespace).
-- Epoch switch (both sides):
-  - After sending REKEY_ACK (responder) or receiving valid REKEY_ACK (initiator):
-    - `next_session_key` → `session_key`
-    - `next_nonce_base` → `nonce_base`
-    - `epoch++`
-    - `send_seq = 0`
-    - Reset anti-replay window
-- Timeout:
-  - If `rekey_in_progress` and `now >= rekey_deadline_ms` (elapsed ≥ `REKEY_TIMEOUT_MS`), close the connection to avoid stalling and potential nonce exhaustion.
-- Wraparound guard:
-  - If `send_seq == UINT32_MAX`, close the connection to prevent nonce reuse.
-- Anti-replay:
-  - 64-bit sliding window on receiver; drops too-old or duplicate sequences.
-
-### Logging (selected)
-
-- Rekey trigger (before encrypted data/FIN): `rekey trigger conv=<id> epoch=<cur>-><next> send_seq=<n> deadline=<ms>`
-- Received REKEY_INIT: `recv REKEY_INIT conv=<id> seq=<n>`
-- Received REKEY_ACK: `recv REKEY_ACK conv=<id>`
-- Epoch switch: `epoch switch conv=<id> -> epoch=<n>`
-- Wraparound guard: `send_seq wraparound guard hit, closing conv=<id>`
-- Timeout: `rekey timeout, closing conv=<id>`
 
 ## Tests
 
 Standalone unit tests live in `src/tests/` (they do not affect the main build):
 
-- `test_aead`: verifies deterministic per-epoch key derivation and that different epochs yield different keys.
-- `test_replay`: verifies the anti-replay sliding window (accept, replay, too-old, window advance, near-wrap).
+- `test_handshake`: validates stealth handshake pack/unpack and token/conv checks.
+- `test_outer_obfs_handshake`: validates outer obfuscation for handshake packets.
+- `test_outer_obfs_kcp`: validates outer obfuscation for KCP-shaped datagrams.
 
 Build example:
 
 ```sh
-# build main objects first (e.g., aead.o) from src/
 make -C src
-
-# then build tests
 make -C src/tests
 ```
 
 Run:
 
 ```sh
-src/tests/test_aead
-src/tests/test_replay
+src/tests/test_handshake
+src/tests/test_outer_obfs_handshake
+src/tests/test_outer_obfs_kcp
 ```
 
 ### Integration test: kcptcp tunnel + AEAD rekeying
