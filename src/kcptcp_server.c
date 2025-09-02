@@ -46,6 +46,18 @@
 #define HASH_TABLE_SIZE 1024
 #define MAX_CONV_GENERATION_ATTEMPTS 100
 
+/* Enhanced error handling */
+#define LOG_CONN_ERR(conn, fmt, ...)                                                               \
+    P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
+/* Enhanced error handling functions */
+
+#define LOG_CONN_WARN(conn, fmt, ...)                                                              \
+    P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
+#define LOG_CONN_INFO(conn, fmt, ...)                                                              \
+    P_LOG_INFO("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
 /* Security structures */
 struct rate_limiter_entry {
     union sockaddr_inx addr;
@@ -104,18 +116,6 @@ static void conn_limit_release(const union sockaddr_inx *addr);
 static size_t addr_hash(const union sockaddr_inx *addr);
 static int safe_epoll_mod_server(int epfd, int fd, struct epoll_event *ev, struct proxy_conn *conn);
 static uint32_t derive_conv_from_psk_token(const uint8_t psk[32], const uint8_t token[16]);
-
-/* Enhanced error handling */
-#define LOG_CONN_ERR(conn, fmt, ...)                                                               \
-    P_LOG_ERR("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
-
-/* Enhanced error handling functions */
-
-#define LOG_CONN_WARN(conn, fmt, ...)                                                              \
-    P_LOG_WARN("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
-
-#define LOG_CONN_INFO(conn, fmt, ...)                                                              \
-    P_LOG_INFO("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
 static void remove_pid_file(const char *pidfile) {
     if (pidfile) {

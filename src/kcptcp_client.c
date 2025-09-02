@@ -48,6 +48,14 @@
 #define LOG_CONN_DEBUG(conn, fmt, ...)                                                             \
     P_LOG_DEBUG("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
 
+/* Enhanced logging macros with context */
+#define LOG_PERF_INFO(fmt, ...) P_LOG_INFO("[PERF] " fmt, ##__VA_ARGS__)
+
+#define LOG_CONN_DEBUG(conn, fmt, ...)                                                             \
+    P_LOG_DEBUG("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+
+#define LOG_STATS_INFO(fmt, ...) P_LOG_INFO("[STATS] " fmt, ##__VA_ARGS__)
+
 /* Rate limiting structure */
 struct rate_limiter {
     time_t window_start;
@@ -55,18 +63,6 @@ struct rate_limiter {
     size_t max_per_window;
     size_t window_size_sec;
 };
-
-/* Forward declarations for basic helper functions */
-static void secure_zero(void *ptr, size_t len);
-static bool rate_limit_check(struct rate_limiter *rl);
-static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
-                                      const uint8_t *initial_data, size_t initial_data_len,
-                                      unsigned char *out_buf, size_t *out_len);
-
-/* Performance monitoring and logging functions */
-static void init_performance_monitoring(void);
-static void dump_performance_stats(void);
-static void update_connection_stats(struct proxy_conn *c, bool connecting);
 
 struct cfg_client {
     union sockaddr_inx laddr; /* TCP listen */
@@ -98,19 +94,6 @@ struct client_ctx {
     struct rate_limiter handshake_limiter; /* Rate limit handshake attempts */
 };
 
-/* Functions that need struct client_ctx */
-static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn);
-static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn,
-                              const char *operation);
-static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf,
-                              size_t ubuf_size, bool *fed_kcp);
-static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen);
-static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss);
-
-/* Global connection pool */
-static struct conn_pool g_conn_pool = {0};
-static const int DEFAULT_CONN_POOL_SIZE = 1024;
-
 /* Performance monitoring counters */
 struct perf_counters {
     uint64_t total_connections;
@@ -134,15 +117,32 @@ struct perf_counters {
     time_t last_stats_dump;
 };
 
+/* Global connection pool */
+static struct conn_pool g_conn_pool = {0};
+static const int DEFAULT_CONN_POOL_SIZE = 1024;
+
 static struct perf_counters g_perf = {0};
 
-/* Enhanced logging macros with context */
-#define LOG_PERF_INFO(fmt, ...) P_LOG_INFO("[PERF] " fmt, ##__VA_ARGS__)
+/* Forward declarations for basic helper functions */
+static void secure_zero(void *ptr, size_t len);
+static bool rate_limit_check(struct rate_limiter *rl);
+static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *psk, bool has_psk,
+                                      const uint8_t *initial_data, size_t initial_data_len,
+                                      unsigned char *out_buf, size_t *out_len);
 
-#define LOG_CONN_DEBUG(conn, fmt, ...)                                                             \
-    P_LOG_DEBUG("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
+/* Performance monitoring and logging functions */
+static void init_performance_monitoring(void);
+static void dump_performance_stats(void);
+static void update_connection_stats(struct proxy_conn *c, bool connecting);
 
-#define LOG_STATS_INFO(fmt, ...) P_LOG_INFO("[STATS] " fmt, ##__VA_ARGS__)
+/* Functions that need struct client_ctx */
+static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn);
+static int handle_epoll_error(struct client_ctx *ctx, struct proxy_conn *conn,
+                              const char *operation);
+static int handle_udp_receive(struct client_ctx *ctx, struct proxy_conn *c, char *ubuf,
+                              size_t ubuf_size, bool *fed_kcp);
+static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char *payload, int plen);
+static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss);
 
 static void client_handle_accept(struct client_ctx *ctx);
 static void client_handle_udp_events(struct client_ctx *ctx, struct proxy_conn *c, uint32_t evmask);
@@ -402,6 +402,7 @@ static int generate_stealth_handshake(struct proxy_conn *conn, const uint8_t *ps
 /* Validate UDP source address matches expected peer */
 static int validate_udp_source(struct proxy_conn *c, const struct sockaddr_storage *rss) {
     union sockaddr_inx ra;
+
     memset(&ra, 0, sizeof(ra));
 
     if (rss->ss_family == AF_INET) {
@@ -1058,6 +1059,7 @@ int main(int argc, char **argv) {
     uint32_t magic_listener = 0xdeadbeefU; /* reuse value style from tcpfwd */
     struct cfg_client cfg;
     struct list_head conns; /* active connections */
+
     INIT_LIST_HEAD(&conns);
 
     memset(&cfg, 0, sizeof(cfg));
