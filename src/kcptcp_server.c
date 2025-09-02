@@ -41,8 +41,8 @@
 #define DEFAULT_IDLE_TIMEOUT_SEC 180
 #define DEFAULT_HANDSHAKE_TIMEOUT_SEC 30
 #define UDP_RECV_BUFFER_SIZE (64 * 1024)
-#define RATE_WINDOW_SEC 1
-#define MAX_REQUESTS_PER_WINDOW 10
+#define DEFAULT_RATE_LIMIT_TOKENS_PER_SEC 20.0
+#define DEFAULT_RATE_LIMIT_BUCKET_CAP     40.0
 #define HASH_TABLE_SIZE 1024
 #define MAX_CONV_GENERATION_ATTEMPTS 100
 
@@ -61,13 +61,15 @@
 /* Security structures */
 struct rate_limiter_entry {
     union sockaddr_inx addr;
-    time_t last_time;
-    size_t count;
+    double tokens;            /* current token count */
+    double last_refill_sec;   /* last refill time (seconds) */
 };
 
 struct rate_limiter {
     struct rate_limiter_entry entries[HASH_TABLE_SIZE];
     size_t num_entries;
+    double rate_per_sec;      /* tokens per second */
+    double bucket_capacity;   /* maximum tokens (burst) */
     pthread_mutex_t lock;
 };
 
@@ -279,38 +281,40 @@ static bool rate_limit_check_addr(const union sockaddr_inx *addr) {
 
     pthread_mutex_lock(&g_rate_limiter.lock);
 
-    time_t now = time(NULL);
+    double now_sec = (double)time(NULL);
     size_t hash = addr_hash(addr) % HASH_TABLE_SIZE;
     struct rate_limiter_entry *entry = &g_rate_limiter.entries[hash];
 
-    /* Check if this is a new address or hash collision */
+    /* Initialize new address or handle hash collision by overwriting (simple policy) */
     if (!is_sockaddr_inx_equal(&entry->addr, addr)) {
-        /* New address or collision, reset entry */
         entry->addr = *addr;
-        entry->last_time = now;
-        entry->count = 1;
-        pthread_mutex_unlock(&g_rate_limiter.lock);
-        return true;
+        entry->tokens = g_rate_limiter.bucket_capacity; /* start full */
+        entry->last_refill_sec = now_sec;
     }
 
-    /* Check time window */
-    if (now - entry->last_time > RATE_WINDOW_SEC) {
-        entry->last_time = now;
-        entry->count = 1;
-        pthread_mutex_unlock(&g_rate_limiter.lock);
-        return true;
+    /* Refill tokens */
+    double elapsed = now_sec - entry->last_refill_sec;
+    if (elapsed > 0) {
+        double add = elapsed * g_rate_limiter.rate_per_sec;
+        entry->tokens += add;
+        if (entry->tokens > g_rate_limiter.bucket_capacity)
+            entry->tokens = g_rate_limiter.bucket_capacity;
+        entry->last_refill_sec = now_sec;
     }
 
-    /* Check rate limit */
-    if (entry->count >= MAX_REQUESTS_PER_WINDOW) {
-        pthread_mutex_unlock(&g_rate_limiter.lock);
-        P_LOG_WARN("Rate limit exceeded for %s", sockaddr_to_string(addr));
-        return false;
+    bool allowed = false;
+    if (entry->tokens >= 1.0) {
+        entry->tokens -= 1.0;
+        allowed = true;
     }
 
-    entry->count++;
     pthread_mutex_unlock(&g_rate_limiter.lock);
-    return true;
+
+    if (!allowed) {
+        P_LOG_WARN("Rate limit exceeded for %s", sockaddr_to_string(addr));
+    }
+
+    return allowed;
 }
 
 /* Connection limiting implementation */
@@ -487,6 +491,10 @@ int main(int argc, char **argv) {
         P_LOG_ERR("Failed to initialize rate limiter mutex");
         return 1;
     }
+    /* Initialize token bucket defaults */
+    g_rate_limiter.rate_per_sec = DEFAULT_RATE_LIMIT_TOKENS_PER_SEC;
+    g_rate_limiter.bucket_capacity = DEFAULT_RATE_LIMIT_BUCKET_CAP;
+
     if (pthread_mutex_init(&g_conn_limiter.lock, NULL) != 0) {
         P_LOG_ERR("Failed to initialize connection limiter mutex");
         pthread_mutex_destroy(&g_rate_limiter.lock);
