@@ -149,6 +149,26 @@ static void client_handle_accept(struct client_ctx *ctx);
 static void client_handle_udp_events(struct client_ctx *ctx, struct proxy_conn *c, uint32_t evmask);
 static void client_handle_tcp_events(struct client_ctx *ctx, struct proxy_conn *c, uint32_t evmask);
 
+/* Unified I/O error helper */
+static int io_fail(struct client_ctx *ctx, struct proxy_conn *conn, const char *operation) {
+    (void)ctx;
+    if (conn && operation) {
+        LOG_CONN_ERR(conn, "%s failed: %s", operation, strerror(errno));
+        conn->state = S_CLOSING;
+    }
+    return -1;
+}
+
+/* Track buffer expansions for perf */
+static int ensure_buffer_capacity_tracked(struct buffer_info *buf, size_t needed, size_t max_size) {
+    size_t before = buf ? buf->capacity : 0;
+    int r = ensure_buffer_capacity(buf, needed, max_size);
+    if (r == 0 && buf && buf->capacity > before) {
+        g_perf.buffer_expansions++;
+    }
+    return r;
+}
+
 /* Compute per-port aggregation profile. Returns effective min/max ms and max
  * bytes. Heuristics:
  *  - SSH-like (22, 2222): no aggregation, low embed cap (e.g., 256-512)
@@ -542,9 +562,9 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
             /* Backpressure: buffer and enable EPOLLOUT */
             size_t need = c->response.dlen + (size_t)plen;
-            if (ensure_buffer_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
+            if (ensure_buffer_capacity_tracked(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
                 P_LOG_WARN("Response buffer size limit exceeded, closing connection");
-                return -1; /* Error: close connection */
+                return io_fail(ctx, c, "buffer growth for send");
             }
             memcpy(c->response.data + c->response.dlen, payload, (size_t)plen);
             c->response.dlen += (size_t)plen;
@@ -553,17 +573,17 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
             cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
             cev.data.ptr = c->cli_tag;
             if (safe_epoll_mod(ctx, c->cli_sock, &cev, c) < 0) {
-                return -1; /* Error: close connection */
+                return io_fail(ctx, c, "epoll_mod tcp");
             }
             return -2; /* Break from processing loop */
         }
-        return -1; /* Error: close connection */
+        return io_fail(ctx, c, "send to tcp");
 
     } else if (wn < plen) {
         /* Short write: buffer remaining and enable EPOLLOUT */
         size_t rem = (size_t)plen - (size_t)wn;
         size_t need = c->response.dlen + rem;
-        if (ensure_buffer_capacity(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
+        if (ensure_buffer_capacity_tracked(&c->response, need, MAX_TCP_BUFFER_SIZE) < 0) {
             P_LOG_WARN("Response buffer size limit exceeded, closing connection");
             return -1; /* Error: close connection */
         }
@@ -574,7 +594,7 @@ static int handle_kcp_to_tcp(struct client_ctx *ctx, struct proxy_conn *c, char 
         cev.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLERR | EPOLLHUP;
         cev.data.ptr = c->cli_tag;
         if (safe_epoll_mod(ctx, c->cli_sock, &cev, c) < 0) {
-            return -1; /* Error: close connection */
+            return io_fail(ctx, c, "epoll_mod tcp");
         }
         return -2; /* Break from processing loop */
     }
@@ -857,7 +877,7 @@ static void client_handle_accept(struct client_ctx *ctx) {
                 if (rn > 0) {
                     c->tcp_rx_bytes += (uint64_t)rn; /* Stats: TCP RX */
                     size_t need = c->request.dlen + (size_t)rn;
-                    if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
+                    if (ensure_buffer_capacity_tracked(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
                         P_LOG_WARN("Request buffer size limit exceeded, "
                                    "closing connection");
                         close(cs);
@@ -990,7 +1010,7 @@ static void client_handle_tcp_events(struct client_ctx *ctx, struct proxy_conn *
             if (!c->kcp_ready) {
                 /* buffer until KCP ready */
                 size_t need = c->request.dlen + (size_t)rn;
-                if (ensure_buffer_capacity(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
+                if (ensure_buffer_capacity_tracked(&c->request, need, MAX_TCP_BUFFER_SIZE) < 0) {
                     P_LOG_WARN("Request buffer size limit exceeded, closing "
                                "connection");
                     c->state = S_CLOSING;
