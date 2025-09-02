@@ -35,6 +35,7 @@
 #define DEFAULT_IDLE_TIMEOUT_SEC 180
 #define DEFAULT_EPOLL_MAX_EVENTS 256
 #define DEFAULT_REKEY_TIMEOUT_MS 10000
+#define DEFAULT_HANDSHAKE_TIMEOUT_MS 8000
 #define MIN_BUFFER_SIZE 4096
 #define UDP_RECV_BUFFER_SIZE (64 * 1024)
 
@@ -326,10 +327,18 @@ static void conn_cleanup(struct client_ctx *ctx, struct proxy_conn *conn) {
     /* Secure cleanup of sensitive data */
     if (conn->has_session_key) {
         secure_zero(conn->session_key, sizeof(conn->session_key));
+        secure_zero(conn->nonce_base, sizeof(conn->nonce_base));
         conn->has_session_key = false;
     }
+    /* Zeroize any staged next-epoch materials */
+    secure_zero(conn->next_session_key, sizeof(conn->next_session_key));
+    secure_zero(conn->next_nonce_base, sizeof(conn->next_nonce_base));
+    /* Zeroize configured PSK copy if present */
+    if (conn->cfg_has_psk) {
+        secure_zero(conn->cfg_psk, sizeof(conn->cfg_psk));
+        conn->cfg_has_psk = false;
+    }
     secure_zero(conn->hs_token, sizeof(conn->hs_token));
-    secure_zero(conn->nonce_base, sizeof(conn->nonce_base));
 
     /* Remove from connection list */
     list_del(&conn->list);
@@ -874,7 +883,10 @@ static void client_handle_accept(struct client_ctx *ctx) {
          * window */
         uint32_t jitter = rand_between(eff_min_ms, eff_max_ms);
         c->hs_scheduled = true;
-        c->hs_send_at_ms = kcp_now_ms() + jitter;
+        uint32_t now_ms = kcp_now_ms();
+        c->hs_send_at_ms = now_ms + jitter;
+        /* Set handshake overall deadline to bound pending state */
+        c->hs_deadline_ms = now_ms + DEFAULT_HANDSHAKE_TIMEOUT_MS;
 
         /* Prepare epoll tags */
         struct ep_tag *ctag = (struct ep_tag *)malloc(sizeof(*ctag));
@@ -1305,6 +1317,15 @@ int main(int argc, char **argv) {
                         pos->state = S_CLOSING;
                     }
                 }
+            /* Handshake overall deadline */
+            if (!pos->kcp_ready && pos->hs_deadline_ms != 0) {
+                if ((int32_t)(now - pos->hs_deadline_ms) >= 0) {
+                    P_LOG_ERR("handshake timeout, closing conv=%u", pos->conv);
+                    g_perf.handshake_failures++;
+                    pos->state = S_CLOSING;
+                }
+            }
+
             }
             if (pos->kcp)
                 (void)kcp_update_flush(pos, now);

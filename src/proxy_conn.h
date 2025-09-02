@@ -87,6 +87,8 @@ struct proxy_conn {
     bool hs_scheduled;
     uint32_t hs_send_at_ms;
     /* Delayed handshake response (server) */
+    uint32_t hs_deadline_ms;    /* client: handshake must complete by this time */
+
     bool hs_resp_pending;
     uint32_t hs_resp_send_at_ms;
     size_t hs_resp_len;

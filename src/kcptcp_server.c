@@ -238,7 +238,18 @@ static void conn_cleanup_server(struct proxy_conn *conn, int epfd, struct kcp_ma
         secure_zero(conn->nonce_base, sizeof(conn->nonce_base));
         conn->has_session_key = false;
     }
+    /* Zeroize any staged next-epoch materials */
+    secure_zero(conn->next_session_key, sizeof(conn->next_session_key));
+    secure_zero(conn->next_nonce_base, sizeof(conn->next_nonce_base));
+    /* Zeroize configured PSK copy if present */
+    if (conn->cfg_has_psk) {
+        secure_zero(conn->cfg_psk, sizeof(conn->cfg_psk));
+        conn->cfg_has_psk = false;
+    }
+    /* Zeroize handshake buffers */
     secure_zero(conn->hs_token, sizeof(conn->hs_token));
+    secure_zero(conn->hs_resp_buf, sizeof(conn->hs_resp_buf));
+    conn->hs_resp_len = 0;
 
     /* Release connection limit for this address */
     conn_limit_release(&conn->peer_addr);
