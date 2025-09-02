@@ -96,11 +96,12 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
 
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family = AF_UNSPEC;
-    hints.ai_flags |= AI_NUMERICHOST;
+    /* Allow both numeric addresses and hostnames.
+     * If host is NULL, use AI_PASSIVE for wildcard bind. */
     hints.ai_socktype = is_udp ? SOCK_DGRAM : SOCK_STREAM;
     hints.ai_protocol = 0;
     if (!host) {
-        hints.ai_flags = AI_PASSIVE;
+        hints.ai_flags |= AI_PASSIVE;
     }
 
     rc = getaddrinfo(host, port, &hints, &result);

@@ -52,9 +52,6 @@
 /* Enhanced logging macros with context */
 #define LOG_PERF_INFO(fmt, ...) P_LOG_INFO("[PERF] " fmt, ##__VA_ARGS__)
 
-#define LOG_CONN_DEBUG(conn, fmt, ...)                                                             \
-    P_LOG_DEBUG("conv=%u state=%d: " fmt, (conn)->conv, (conn)->state, ##__VA_ARGS__)
-
 #define LOG_STATS_INFO(fmt, ...) P_LOG_INFO("[STATS] " fmt, ##__VA_ARGS__)
 
 /* Rate limiting structure */
@@ -527,6 +524,7 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
         size_t remain = c->request.dlen - c->request.rpos;
         /* Send raw data over KCP (inner AEAD removed) */
         if (ikcp_send(c->kcp, (const char *)(c->request.data + c->request.rpos), (int)remain) < 0) {
+            LOG_CONN_ERR(c, "ikcp_send buffered data failed: %s", strerror(errno));
             return -1; /* Error: close connection */
         }
         c->kcp_tx_msgs++;
@@ -543,6 +541,7 @@ static int handle_stealth_handshake_response(struct client_ctx *ctx, struct prox
         /* Send FIN as zero-length marker or a minimal control byte over KCP */
         unsigned char fin = FIN_MARKER; /* simple FIN marker */
         if (ikcp_send(c->kcp, (const char *)&fin, 1) < 0) {
+            LOG_CONN_ERR(c, "ikcp_send FIN failed: %s", strerror(errno));
             return -1; /* Error: close connection */
         }
         c->kcp_tx_msgs++;
@@ -1023,6 +1022,7 @@ static void client_handle_tcp_events(struct client_ctx *ctx, struct proxy_conn *
                 c->request.dlen += (size_t)rn;
             } else {
                 if (ikcp_send(c->kcp, tbuf, rn) < 0) {
+                    LOG_CONN_ERR(c, "ikcp_send data failed: %s", strerror(errno));
                     c->state = S_CLOSING;
                     break;
                 }

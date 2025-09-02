@@ -175,12 +175,9 @@ int derive_session_key_from_psk(const uint8_t *psk, const uint8_t token[16], uin
     uint8_t tag1[16];
     uint8_t tag2[16];
 
-    /* AEAD with AAD-only (plaintext len 0) to produce tags */
-    if (chacha20poly1305_seal(psk, nonce1, aad, sizeof(aad), NULL, 0, NULL, tag1), 0) {
-        /* chacha20poly1305_seal has no return; assume success */
-    }
-    if (chacha20poly1305_seal(psk, nonce2, aad, sizeof(aad), NULL, 0, NULL, tag2), 0) {
-    }
+    /* AEAD with AAD-only (plaintext len 0) to produce tags (API returns void) */
+    chacha20poly1305_seal(psk, nonce1, aad, sizeof(aad), NULL, 0, NULL, tag1);
+    chacha20poly1305_seal(psk, nonce2, aad, sizeof(aad), NULL, 0, NULL, tag2);
 
     memcpy(out_key, tag1, 16);
     memcpy(out_key + 16, tag2, 16);
