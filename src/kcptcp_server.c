@@ -153,6 +153,10 @@ static void print_usage(const char *prog) {
     printf("  --kcp-resend <0|1|2>       Set KCP resend mode\n");
     printf("  --kcp-nc <0|1>             Set KCP congestion control\n");
     printf("  --kcp-sndwnd <wnd>         Set KCP send window size\n");
+    printf("Env:\n");
+    printf("  PORTFWD_RL_RATE       Token bucket rate (tokens/sec), default %.0f\n", (double)DEFAULT_RATE_LIMIT_TOKENS_PER_SEC);
+    printf("  PORTFWD_RL_BURST      Token bucket capacity (burst size), default %.0f\n", (double)DEFAULT_RATE_LIMIT_BUCKET_CAP);
+
     printf("  --kcp-rcvwnd <wnd>         Set KCP receive window size\n");
 }
 
@@ -494,6 +498,19 @@ int main(int argc, char **argv) {
     /* Initialize token bucket defaults */
     g_rate_limiter.rate_per_sec = DEFAULT_RATE_LIMIT_TOKENS_PER_SEC;
     g_rate_limiter.bucket_capacity = DEFAULT_RATE_LIMIT_BUCKET_CAP;
+    /* Optional overrides via environment variables */
+    const char *rl_rate_env = getenv("PORTFWD_RL_RATE");
+    if (rl_rate_env && *rl_rate_env) {
+        double v = atof(rl_rate_env);
+        if (v > 0 && v < 1000000) g_rate_limiter.rate_per_sec = v;
+    }
+    const char *rl_burst_env = getenv("PORTFWD_RL_BURST");
+    if (rl_burst_env && *rl_burst_env) {
+        double v = atof(rl_burst_env);
+        if (v > 0 && v < 1000000) g_rate_limiter.bucket_capacity = v;
+    }
+    P_LOG_INFO("Rate limiter: rate=%.1f tokens/s, burst=%.1f",
+               g_rate_limiter.rate_per_sec, g_rate_limiter.bucket_capacity);
 
     if (pthread_mutex_init(&g_conn_limiter.lock, NULL) != 0) {
         P_LOG_ERR("Failed to initialize connection limiter mutex");

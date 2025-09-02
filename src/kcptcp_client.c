@@ -121,6 +121,9 @@ struct perf_counters {
 /* Global connection pool */
 static struct conn_pool g_conn_pool = {0};
 static const int DEFAULT_CONN_POOL_SIZE = 1024;
+/* Note: g_perf is updated from the single-threaded event loop in kcptcp-client.
+ * If threading is introduced in the future, convert increments to atomics or
+ * guard with a mutex to maintain correctness. */
 
 static struct perf_counters g_perf = {0};
 
