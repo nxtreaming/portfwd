@@ -370,20 +370,14 @@ src/tests/test_outer_obfs_handshake
 src/tests/test_outer_obfs_kcp
 ```
 
-### Integration test: kcptcp tunnel + AEAD rekeying
+### Integration test: kcptcp tunnel
 
-`src/tests/it_kcp` is a small C harness that launches `tcp_echo` (TCP echo on 127.0.0.1:2323), `kcptcp-server`, and `kcptcp-client`, then sends data through the tunnel to validate normal operation and rekey lifecycle. It asserts log lines like `rekey trigger`, `recv REKEY_INIT/ACK`, `epoch switch`, and in timeout mode `rekey timeout, closing`.
+`src/tests/it_kcp` is a small C harness that launches `tcp_echo` (TCP echo on 127.0.0.1:2323), `kcptcp-server`, and `kcptcp-client`, then sends data through the tunnel to validate normal operation (connectivity, throughput baseline, FIN half‑close).
 
 Usage (run after building `src` and `src/tests`):
 
 ```sh
-# Normal rekey path, send 16MB (adjust as needed)
-IT_PSK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-src/tests/it_kcp normal 16
-
-# Timeout scenario: send 16MB, pause server 5000ms at ~8MB to induce rekey timeout
-IT_PSK=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-src/tests/it_kcp timeout 16 5000 8
+src/tests/it_kcp
 ```
 
 Parameters:
