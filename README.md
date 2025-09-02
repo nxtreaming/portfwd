@@ -9,7 +9,7 @@ Written in pure C.
 
 ## Usage
 
-### tcpfwd (TCP forwarder)
+### tcpfwd
 
     tcpfwd [options] <local_addr:local_port> <dest_addr:dest_port>
 
@@ -22,7 +22,7 @@ Written in pure C.
       -6                 for IPv6 listener, set IPV6_V6ONLY
       -h                 show help
 
-### udpfwd (UDP forwarder)
+### udpfwd
 
     udpfwd <local_addr:local_port> <dest_addr:dest_port> [options]
 
@@ -36,7 +36,7 @@ Written in pure C.
       -p <pidfile>       write PID to file
       -h                 show help
 
-### kcptcp-client (TCP over KCP/UDP client)
+### kcptcp-client
 
     kcptcp-client [options] <local_tcp_addr:port> <remote_udp_addr:port>
 
@@ -73,7 +73,7 @@ Notes:
   - Effective embed cap is MTU-aware: the actual first-packet embed size is bounded by a budget computed from the KCP MTU to avoid fragmentation (i.e., `embed <= min(-G, MTU budget)`).
   - If no early TCP bytes arrive within the aggregation window, the client still sends a stealth packet with random padding.
 
-### kcptcp-server (KCP/UDP to TCP server)
+### kcptcp-server
 
     kcptcp-server [options] <local_udp_addr:port> <target_tcp_addr:port>
 
