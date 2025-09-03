@@ -838,16 +838,6 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         warned_high_water = true;
     }
 
-    /* High-water one-time warning at ~90% capacity */
-    static bool warned_high_water = false;
-    if (!warned_high_water && g_conn_pool.capacity > 0 &&
-        conn_tbl_len >= (unsigned)((g_conn_pool.capacity * 9) / 10)) {
-        P_LOG_WARN("UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or "
-                   "reducing -t.",
-                   conn_tbl_len, (unsigned)g_conn_pool.capacity,
-                   (int)((conn_tbl_len * 100) / (unsigned)g_conn_pool.capacity));
-        warned_high_water = true;
-    }
 
     /* ------------------------------------------ */
     /* Establish the server-side connection */
