@@ -21,6 +21,7 @@ static int is_valid_pool_item(const struct conn_pool *pool, const void *item) {
 
 int conn_pool_init(struct conn_pool *pool, size_t capacity, size_t item_size) {
     if (!pool || capacity == 0 || item_size == 0) {
+        errno = EINVAL;
         return -1; /* Invalid arguments */
     }
 
@@ -32,6 +33,7 @@ int conn_pool_init(struct conn_pool *pool, size_t capacity, size_t item_size) {
     pool->pool_mem = malloc(capacity * item_size);
     if (!pool->pool_mem) {
         P_LOG_ERR("Failed to allocate memory for object pool: %s", strerror(errno));
+        errno = ENOMEM;
         return -1;
     }
 
@@ -41,6 +43,7 @@ int conn_pool_init(struct conn_pool *pool, size_t capacity, size_t item_size) {
         P_LOG_ERR("Failed to allocate memory for freelist: %s", strerror(errno));
         free(pool->pool_mem);
         pool->pool_mem = NULL;
+        errno = ENOMEM;
         return -1;
     }
 
@@ -56,6 +59,7 @@ int conn_pool_init(struct conn_pool *pool, size_t capacity, size_t item_size) {
         P_LOG_ERR("Failed to initialize connection pool mutex: %s", strerror(errno));
         free(pool->pool_mem);
         free(pool->freelist);
+        errno = EBUSY;
         return -1;
     }
 
@@ -74,6 +78,7 @@ void conn_pool_destroy(struct conn_pool *pool) {
 
 void *conn_pool_alloc(struct conn_pool *pool) {
     if (!pool) {
+        errno = EINVAL;
         return NULL;
     }
 
@@ -81,7 +86,8 @@ void *conn_pool_alloc(struct conn_pool *pool) {
 
     if (pool->used_count >= pool->capacity) {
         pthread_mutex_unlock(&pool->lock);
-        return NULL; /* Pool is full */
+        errno = ENOSPC; /* Pool is full */
+        return NULL;
     }
 
     /* Get an item from the top of the freelist stack */
@@ -100,12 +106,14 @@ void *conn_pool_alloc(struct conn_pool *pool) {
 void conn_pool_release(struct conn_pool *pool, void *item) {
     if (!pool || !item) {
         P_LOG_WARN("Invalid pool or item in conn_pool_release");
+        errno = EINVAL;
         return;
     }
 
     /* Validate that item is from this pool */
     if (!is_valid_pool_item(pool, item)) {
         P_LOG_ERR("Attempt to release item not from this pool");
+        errno = EFAULT;
         return;
     }
 
@@ -115,6 +123,7 @@ void conn_pool_release(struct conn_pool *pool, void *item) {
         /* Underflow detected: nothing to release */
         P_LOG_WARN("Pool underflow in release");
         pthread_mutex_unlock(&pool->lock);
+        errno = EOVERFLOW;
         return;
     }
 

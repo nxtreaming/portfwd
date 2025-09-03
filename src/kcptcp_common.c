@@ -593,18 +593,15 @@ void kcptcp_log_total_stats(struct proxy_conn *c) {
 
 /* ---------------- Shared buffer helper ---------------- */
 int ensure_buffer_capacity(struct buffer_info *buf, size_t needed, size_t max_size) {
-    if (!buf)
-        return -1;
+    if (!buf) { errno = EINVAL; return -1; }
     if (buf->capacity >= needed)
         return 0;
     size_t new_cap = buf->capacity ? buf->capacity * 2 : INITIAL_BUFFER_SIZE;
     if (new_cap < needed)
         new_cap = needed;
-    if (new_cap > max_size)
-        return -1;
+    if (new_cap > max_size) { errno = ENOSPC; return -1; }
     char *np = (char *)realloc(buf->data, new_cap);
-    if (!np)
-        return -1;
+    if (!np) { errno = ENOMEM; return -1; }
     buf->data = np;
     buf->capacity = new_cap;
     return 0;
