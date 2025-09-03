@@ -63,19 +63,14 @@ static inline int ep_add_or_mod(int epfd, int sock, struct epoll_event *ev) {
     return -1;
 }
 
-/* Standardized logging macros */
-#define LOG_MSG(level, fmt, ...)                                                                   \
-    do {                                                                                           \
-        if (g_state.daemonized)                                                                    \
-            syslog(level, fmt, ##__VA_ARGS__);                                                     \
-        else                                                                                       \
-            fprintf(stderr, fmt "\n", ##__VA_ARGS__);                                              \
-    } while (0)
+/* Centralized sanitized logging function */
+void log_msg(int level, const char *fmt, ...);
 
-#define P_LOG_ERR(fmt, ...) LOG_MSG(LOG_ERR, "ERROR: " fmt, ##__VA_ARGS__)
-#define P_LOG_WARN(fmt, ...) LOG_MSG(LOG_WARNING, "WARN: " fmt, ##__VA_ARGS__)
-#define P_LOG_INFO(fmt, ...) LOG_MSG(LOG_INFO, fmt, ##__VA_ARGS__)
-#define P_LOG_DEBUG(fmt, ...) LOG_MSG(LOG_DEBUG, "DEBUG: " fmt, ##__VA_ARGS__)
-#define P_LOG_CRIT(fmt, ...) LOG_MSG(LOG_CRIT, "CRITICAL: " fmt, ##__VA_ARGS__)
+/* Standardized logging macros using sanitized logger */
+#define P_LOG_ERR(fmt, ...)  log_msg(LOG_ERR, "ERROR: " fmt, ##__VA_ARGS__)
+#define P_LOG_WARN(fmt, ...) log_msg(LOG_WARNING, "WARN: " fmt, ##__VA_ARGS__)
+#define P_LOG_INFO(fmt, ...) log_msg(LOG_INFO, fmt, ##__VA_ARGS__)
+#define P_LOG_DEBUG(fmt, ...) log_msg(LOG_DEBUG, "DEBUG: " fmt, ##__VA_ARGS__)
+#define P_LOG_CRIT(fmt, ...) log_msg(LOG_CRIT, "CRITICAL: " fmt, ##__VA_ARGS__)
 
 #endif /* __PORTFWD_COMMON_H__ */

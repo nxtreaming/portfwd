@@ -2,8 +2,51 @@
 #include <syslog.h>
 #include <assert.h>
 #include <sys/file.h>
-
+#include <stdarg.h>
 struct app_state g_state = {.daemonized = false};
+
+/* Simple sanitizer: mask long hex-like sequences (potential keys) */
+static void sanitize_message(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) return;
+    size_t di = 0;
+    for (size_t i = 0; src && src[i] && di + 1 < dst_sz; ) {
+        /* Detect sequences of >= 32 hex chars (likely sensitive) */
+        size_t j = i;
+        size_t hex_run = 0;
+        while (src[j]) {
+            char c = src[j];
+            bool is_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+            if (!is_hex) break;
+            hex_run++; j++;
+        }
+        if (hex_run >= 32) {
+            const char *mask = "[REDACTED_HEX]";
+            for (size_t k = 0; mask[k] && di + 1 < dst_sz; ++k) dst[di++] = mask[k];
+            i += hex_run;
+            continue;
+        }
+        dst[di++] = src[i++];
+    }
+    dst[di] = '\0';
+}
+
+void log_msg(int level, const char *fmt, ...) {
+    char buf[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    char s_buf[1200];
+    sanitize_message(s_buf, sizeof(s_buf), buf);
+
+    if (g_state.daemonized) {
+        syslog(level, "%s", s_buf);
+    } else {
+        fprintf(stderr, "%s\n", s_buf);
+    }
+}
+
 
 void set_nonblock(int sockfd) {
     int flags;

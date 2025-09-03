@@ -145,17 +145,33 @@ static int hex2nibble(char c) {
     return -1;
 }
 
+/* Secure memory zero to avoid compiler optimizing it away */
+static void secure_zero(void *ptr, size_t len) {
+    if (!ptr || len == 0) return;
+    volatile unsigned char *p = (volatile unsigned char *)ptr;
+    for (size_t i = 0; i < len; ++i) {
+        p[i] = 0;
+    }
+}
+
 bool parse_psk_hex32(const char *hex, uint8_t out[32]) {
+    if (!hex || !out) return false;
     size_t n = strlen(hex);
     if (n != 64)
         return false;
+    /* Parse into a temporary buffer to reduce exposure window */
+    uint8_t tmp[32];
     for (size_t i = 0; i < 32; ++i) {
         int hi = hex2nibble(hex[2 * i]);
         int lo = hex2nibble(hex[2 * i + 1]);
-        if (hi < 0 || lo < 0)
+        if (hi < 0 || lo < 0) {
+            secure_zero(tmp, sizeof(tmp));
             return false;
-        out[i] = (uint8_t)((hi << 4) | lo);
+        }
+        tmp[i] = (uint8_t)((hi << 4) | lo);
     }
+    memcpy(out, tmp, 32);
+    secure_zero(tmp, sizeof(tmp));
     return true;
 }
 
@@ -613,8 +629,12 @@ int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *tok
     if (secure_random_bytes(&pad_rnd, 1) != 0)
         return -1;
     size_t padding_size = (size_t)(pad_rnd % 16); /* 0..15 to reduce overhead */
+    /* Prevent overflow in total_size calculation: padding_size max is 15 */
+    if (initial_data_len > SIZE_MAX - sizeof(payload) - 15)
+        return -1;
     size_t total_size = sizeof(payload) + initial_data_len + padding_size;
-    if (total_size + 28 > *out_packet_len)
+    /* Check for overflow when adding outer overhead and provided buffer cap */
+    if (total_size > SIZE_MAX - OUTER_OVERHEAD_BYTES || total_size + OUTER_OVERHEAD_BYTES > *out_packet_len)
         return -1; /* +12 nonce +16 tag */
 
     uint8_t *plaintext = (uint8_t *)malloc(total_size);
@@ -705,8 +725,11 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const u
     if (secure_random_bytes(&pad_rnd, 1) != 0)
         return -1;
     size_t padding_size = (size_t)(pad_rnd % 16);
+    /* Overflow checks for total_size and outer overhead addition */
+    if (sizeof(response) > SIZE_MAX - 15)
+        return -1;
     size_t total_size = sizeof(response) + padding_size;
-    if (total_size + 28 > *out_packet_len)
+    if (total_size > SIZE_MAX - OUTER_OVERHEAD_BYTES || total_size + OUTER_OVERHEAD_BYTES > *out_packet_len)
         return -1;
 
     uint8_t *plaintext = (uint8_t *)malloc(total_size);

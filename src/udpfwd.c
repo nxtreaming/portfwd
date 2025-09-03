@@ -797,26 +797,45 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         return NULL;
     }
 
-    /* Enforce connection capacity - use atomic load for thread safety */
-    unsigned current_conn_count = atomic_load(&conn_tbl_len);
-    if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-        /* First, try to recycle any timed-out connections */
-        proxy_conn_walk_continue(current_conn_count, epfd);
-
-        /* Reload count after cleanup */
+    /* Reserve a connection slot atomically to avoid races under contention */
+    bool reserved_slot = false;
+    unsigned current_conn_count;
+    for (;;) {
         current_conn_count = atomic_load(&conn_tbl_len);
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-            proxy_conn_evict_one(epfd);
+            /* Try to make room first */
+            proxy_conn_walk_continue(current_conn_count, epfd);
+            current_conn_count = atomic_load(&conn_tbl_len);
+            if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
+                proxy_conn_evict_one(epfd);
+            }
+            /* Re-check after eviction */
+            current_conn_count = atomic_load(&conn_tbl_len);
+            if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
+                inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
+                P_LOG_WARN("Conn table full (%u), dropping %s:%d", current_conn_count, s_addr,
+                           ntohs(*port_of_sockaddr(cli_addr)));
+                goto err;
+            }
+            /* Loop to attempt reservation after cleanup */
+            continue;
         }
+        unsigned expected = current_conn_count;
+        if (atomic_compare_exchange_weak(&conn_tbl_len, &expected, current_conn_count + 1)) {
+            reserved_slot = true;
+            break; /* reserved successfully */
+        }
+        /* CAS failed due to concurrent change; retry */
+    }
 
-        /* Final check after eviction */
-        current_conn_count = atomic_load(&conn_tbl_len);
-        if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-            inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
-            P_LOG_WARN("Conn table full (%u), dropping %s:%d", current_conn_count, s_addr,
-                       ntohs(*port_of_sockaddr(cli_addr)));
-            goto err;
-        }
+    /* High-water one-time warning at ~90% capacity */
+    static bool warned_high_water = false;
+    if (!warned_high_water && g_conn_pool.capacity > 0 &&
+        atomic_load(&conn_tbl_len) >= (unsigned)((g_conn_pool.capacity * 9) / 10)) {
+        P_LOG_WARN("UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or reducing -t.",
+                   atomic_load(&conn_tbl_len), (unsigned)g_conn_pool.capacity,
+                   (int)((atomic_load(&conn_tbl_len) * 100) / (unsigned)g_conn_pool.capacity));
+        warned_high_water = true;
     }
 
     /* High-water one-time warning at ~90% capacity */
@@ -881,8 +900,8 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     pthread_mutex_unlock(&g_lru_lock);
 #endif
 
-    /* Update connection count atomically */
-    unsigned new_count = atomic_fetch_add(&conn_tbl_len, 1) + 1;
+    /* We already reserved the connection count via CAS earlier; read it for logging */
+    unsigned new_count = atomic_load(&conn_tbl_len);
 
     /* Log new connections at DEBUG level to reduce overhead in high-connection
      * scenarios */
@@ -905,6 +924,10 @@ err_unlock:
         }
     }
 err:
+    /* Roll back reserved connection slot on failure */
+    if (reserved_slot) {
+        atomic_fetch_sub(&conn_tbl_len, 1);
+    }
     if (conn)
         conn_pool_release(&g_conn_pool, conn);
     return NULL;
