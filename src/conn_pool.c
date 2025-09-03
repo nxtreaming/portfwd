@@ -3,6 +3,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <stdint.h>
+
+/* Validate that the item pointer belongs to this pool and is properly aligned */
+static int is_valid_pool_item(const struct conn_pool *pool, const void *item) {
+    if (!pool || !item || !pool->pool_mem || pool->item_size == 0 || pool->capacity == 0)
+        return 0;
+    uintptr_t addr = (uintptr_t)item;
+    uintptr_t start = (uintptr_t)pool->pool_mem;
+    uintptr_t end = start + pool->capacity * pool->item_size;
+    if (addr < start || addr >= end)
+        return 0;
+    if (((addr - start) % pool->item_size) != 0)
+        return 0;
+    return 1;
+}
 
 int conn_pool_init(struct conn_pool *pool, size_t capacity, size_t item_size) {
     if (!pool || capacity == 0 || item_size == 0) {
@@ -84,16 +99,27 @@ void *conn_pool_alloc(struct conn_pool *pool) {
 
 void conn_pool_release(struct conn_pool *pool, void *item) {
     if (!pool || !item) {
+        P_LOG_WARN("Invalid pool or item in conn_pool_release");
+        return;
+    }
+
+    /* Validate that item is from this pool */
+    if (!is_valid_pool_item(pool, item)) {
+        P_LOG_ERR("Attempt to release item not from this pool");
         return;
     }
 
     pthread_mutex_lock(&pool->lock);
 
     if (pool->used_count == 0) {
-        /* Should not happen in normal operation */
+        /* Underflow detected: nothing to release */
+        P_LOG_WARN("Pool underflow in release");
         pthread_mutex_unlock(&pool->lock);
         return;
     }
+
+    /* Clear the memory before returning to freelist to avoid data leakage */
+    memset(item, 0, pool->item_size);
 
     /* Add the released item back to the top of the freelist stack */
     pool->used_count--;
