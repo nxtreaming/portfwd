@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <arpa/inet.h>
+#include <getopt.h>
 #if defined(__linux__) || defined(__APPLE__) || defined(__unix__)
 #include <netinet/tcp.h>
 #endif
@@ -334,11 +335,20 @@ int kcptcp_parse_common_opts(int argc, char **argv, struct kcptcp_common_cli *ou
     out->hs_rsp_jitter_min_ms = 5;
     out->hs_rsp_jitter_max_ms = 20;
     out->hs_profile = NULL;
+    out->disable_rate_limit = false;
+    out->rl_rate_per_sec = 0.0;
+    out->rl_bucket_cap = 0.0;
     out->show_help = false;
 
     optind = 1;
     int opt;
-    while ((opt = getopt(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:g:G:j:P:h")) != -1) {
+    static const struct option long_opts[] = {
+        {"no-rate-limit", no_argument, 0, 'L'},
+        {"rl-rate", required_argument, 0, 'Y'},
+        {"rl-burst", required_argument, 0, 'Z'},
+        {0, 0, 0, 0}
+    };
+    while ((opt = getopt_long(argc, argv, "dp:rR6b:NK:M:n:I:X:C:w:W:g:G:j:P:Y:Z:Lh", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'd':
             out->daemonize = true;
@@ -474,6 +484,23 @@ int kcptcp_parse_common_opts(int argc, char **argv, struct kcptcp_common_cli *ou
         }
         case 'P':
             out->hs_profile = optarg;
+            break;
+        case 'Y': {
+            if (!is_server) break; /* only server */
+            double v = atof(optarg);
+            if (v <= 0 || v > 1000000) return 0;
+            out->rl_rate_per_sec = v;
+            break;
+        }
+        case 'Z': {
+            if (!is_server) break; /* only server */
+            double v = atof(optarg);
+            if (v <= 0 || v > 1000000) return 0;
+            out->rl_bucket_cap = v;
+            break;
+        }
+        case 'L':
+            if (is_server) out->disable_rate_limit = true;
             break;
         case 'h':
             out->show_help = true;

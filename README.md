@@ -94,6 +94,10 @@ Notes:
       -N                 enable TCP_NODELAY on outbound TCP to target
       -K <hex>           32-byte PSK in hex (REQUIRED; outer obfuscation + stealth handshake)
       -j <min-max>       jitter response to first packet by min-max ms (stealth)
+      -L, --no-rate-limit  Disable server-side handshake rate limiting
+      -Y, --rl-rate <rate> Token bucket rate (tokens/sec)
+      -Z, --rl-burst <n>   Token bucket capacity (burst)
+
       -h                 show help
 
 Notes:
@@ -129,6 +133,26 @@ kcptcp-server 0.0.0.0:4000 127.0.0.1:22 -K 0123456789abcdef0123456789abcdef01234
 ```
 
 Client (on your local machine):
+
+#### Server rate limiting examples
+
+- Disable server-side rate limiting (maximize acceptance speed):
+
+```sh
+kcptcp-server 0.0.0.0:4000 127.0.0.1:22 -K 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef -L
+```
+
+- Tune token bucket parameters (keep limiting but allow higher throughput):
+
+```sh
+kcptcp-server 0.0.0.0:4000 127.0.0.1:22 -K 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef --rl-rate 80 --rl-burst 160
+```
+
+- Combine with jitter for stealth (server response):
+
+```sh
+kcptcp-server 0.0.0.0:4000 127.0.0.1:22 -K 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef -Y 60 -Z 120 -j 5-25
+```
 
 ```sh
 kcptcp-client 127.0.0.1:2022 server.example.com:4000 -K 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef

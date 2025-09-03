@@ -151,6 +151,10 @@ struct kcptcp_common_cli {
     /* KCP overrides (use -1 if not set; mtu>0) */
     int kcp_mtu;
     int kcp_nd, kcp_it, kcp_rs, kcp_nc, kcp_snd, kcp_rcv;
+    /* server-specific */
+    bool disable_rate_limit;  /* -L: disable server-side rate limiting */
+    double rl_rate_per_sec;   /* -Y: tokens per second (server) */
+    double rl_bucket_cap;     /* -Z: bucket capacity (server) */
     /* flow */
     bool show_help;
 };

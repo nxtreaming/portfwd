@@ -70,6 +70,7 @@ struct rate_limiter {
     size_t num_entries;
     double rate_per_sec;      /* tokens per second */
     double bucket_capacity;   /* maximum tokens (burst) */
+    bool disabled;            /* if true, allow all */
     pthread_mutex_t lock;
 };
 
@@ -135,6 +136,10 @@ static void print_usage(const char *prog) {
     printf("  --pidfile <path>           Path to PID file\n");
     printf("  --daemonize                Run as a daemon\n");
     printf("  --reuse-addr               Enable SO_REUSEADDR\n");
+    printf("  -L, --no-rate-limit       Disable server-side handshake rate limiting\n");
+    printf("  -Y, --rl-rate <rate>      Token bucket rate (tokens/sec) [server]\n");
+    printf("  -Z, --rl-burst <burst>    Token bucket capacity (burst) [server]\n");
+
     printf("\nNotes:\n");
     printf("  - FIN is signaled as a 1-byte marker (0x%02X) inside KCP payload.\n", (unsigned)FIN_MARKER);
     printf("  - Effective KCP MTU is configured_mtu - 28 (outer obfuscation overhead).\n");
@@ -153,10 +158,6 @@ static void print_usage(const char *prog) {
     printf("  --kcp-resend <0|1|2>       Set KCP resend mode\n");
     printf("  --kcp-nc <0|1>             Set KCP congestion control\n");
     printf("  --kcp-sndwnd <wnd>         Set KCP send window size\n");
-    printf("Env:\n");
-    printf("  PORTFWD_RL_RATE       Token bucket rate (tokens/sec), default %.0f\n", (double)DEFAULT_RATE_LIMIT_TOKENS_PER_SEC);
-    printf("  PORTFWD_RL_BURST      Token bucket capacity (burst size), default %.0f\n", (double)DEFAULT_RATE_LIMIT_BUCKET_CAP);
-
     printf("  --kcp-rcvwnd <wnd>         Set KCP receive window size\n");
 }
 
@@ -282,6 +283,10 @@ static size_t addr_hash(const union sockaddr_inx *addr) {
 static bool rate_limit_check_addr(const union sockaddr_inx *addr) {
     if (!addr)
         return false;
+
+    if (g_rate_limiter.disabled) {
+        return true;
+    }
 
     pthread_mutex_lock(&g_rate_limiter.lock);
 
@@ -498,17 +503,7 @@ int main(int argc, char **argv) {
     /* Initialize token bucket defaults */
     g_rate_limiter.rate_per_sec = DEFAULT_RATE_LIMIT_TOKENS_PER_SEC;
     g_rate_limiter.bucket_capacity = DEFAULT_RATE_LIMIT_BUCKET_CAP;
-    /* Optional overrides via environment variables */
-    const char *rl_rate_env = getenv("PORTFWD_RL_RATE");
-    if (rl_rate_env && *rl_rate_env) {
-        double v = atof(rl_rate_env);
-        if (v > 0 && v < 1000000) g_rate_limiter.rate_per_sec = v;
-    }
-    const char *rl_burst_env = getenv("PORTFWD_RL_BURST");
-    if (rl_burst_env && *rl_burst_env) {
-        double v = atof(rl_burst_env);
-        if (v > 0 && v < 1000000) g_rate_limiter.bucket_capacity = v;
-    }
+    P_LOG_INFO("Rate limiter: %s", g_rate_limiter.disabled ? "DISABLED" : "ENABLED");
     P_LOG_INFO("Rate limiter: rate=%.1f tokens/s, burst=%.1f",
                g_rate_limiter.rate_per_sec, g_rate_limiter.bucket_capacity);
 
@@ -551,6 +546,10 @@ int main(int argc, char **argv) {
         memcpy(cfg.psk, opts.psk, 32);
     cfg.hs_rsp_jitter_min_ms = opts.hs_rsp_jitter_min_ms;
     cfg.hs_rsp_jitter_max_ms = opts.hs_rsp_jitter_max_ms;
+    /* Server CLI: disable rate limiting */
+    if (opts.disable_rate_limit) {
+        g_rate_limiter.disabled = true;
+    }
 
     kcp_mtu = opts.kcp_mtu;
     kcp_nd = opts.kcp_nd;
@@ -569,6 +568,14 @@ int main(int argc, char **argv) {
         P_LOG_ERR("invalid local udp addr: %s", argv[pos]);
         return 2;
     }
+    /* Server CLI: rate limiter parameters */
+    if (opts.rl_rate_per_sec > 0.0) {
+        g_rate_limiter.rate_per_sec = opts.rl_rate_per_sec;
+    }
+    if (opts.rl_bucket_cap > 0.0) {
+        g_rate_limiter.bucket_capacity = opts.rl_bucket_cap;
+    }
+
     if (get_sockaddr_inx_pair(argv[pos + 1], &cfg.taddr, false) < 0) {
         P_LOG_ERR("invalid target tcp addr: %s", argv[pos + 1]);
         return 2;
