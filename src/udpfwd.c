@@ -1262,29 +1262,41 @@ static void handle_client_data(int lsn_sock, int epfd) {
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) {
 #ifdef __linux__
     /* Use recvmmsg() to batch receive from server and sendmmsg() to client */
-    struct mmsghdr msgs[UDP_PROXY_BATCH_SZ];
-    struct iovec iovs[UDP_PROXY_BATCH_SZ];
+    static __thread struct mmsghdr tls_msgs[UDP_PROXY_BATCH_SZ];
+    static __thread struct iovec tls_iovs[UDP_PROXY_BATCH_SZ];
     /* Use thread-local storage to avoid static buffer race conditions */
     static __thread char tls_bufs[UDP_PROXY_BATCH_SZ][UDP_PROXY_DGRAM_CAP];
+    static __thread bool tls_inited;
+    struct mmsghdr *msgs = tls_msgs;
+    struct iovec *iovs = tls_iovs;
     char (*bufs)[UDP_PROXY_DGRAM_CAP] = tls_bufs;
+
+    /* One-time initialization of constant mmsghdr fields */
+    if (!tls_inited) {
+        for (int i = 0; i < UDP_PROXY_BATCH_SZ; i++) {
+            iovs[i].iov_base = bufs[i];
+            iovs[i].iov_len = UDP_PROXY_DGRAM_CAP;
+            msgs[i].msg_hdr.msg_iov = &iovs[i];
+            msgs[i].msg_hdr.msg_iovlen = 1;
+            msgs[i].msg_hdr.msg_name = NULL;
+            msgs[i].msg_hdr.msg_namelen = 0;
+            msgs[i].msg_hdr.msg_control = NULL;
+            msgs[i].msg_hdr.msg_controllen = 0;
+            msgs[i].msg_hdr.msg_flags = 0;
+        }
+        tls_inited = true;
+    }
 
     int iterations = 0;
     const int max_iterations = 64; /* fairness cap per event */
     const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
 
     for (; iterations < max_iterations; iterations++) {
-        /* Only initialize what we need instead of expensive full memset */
+        /* Reset per-call mutable fields */
         for (int i = 0; i < ncap; i++) {
-            iovs[i].iov_base = bufs[i];
             iovs[i].iov_len = UDP_PROXY_DGRAM_CAP;
-            msgs[i].msg_hdr.msg_iov = &iovs[i];
-            msgs[i].msg_hdr.msg_iovlen = 1;
-            /* For recvmmsg on connected UDP, msg_name must be NULL */
             msgs[i].msg_hdr.msg_name = NULL;
             msgs[i].msg_hdr.msg_namelen = 0;
-            msgs[i].msg_hdr.msg_control = NULL;
-            msgs[i].msg_hdr.msg_controllen = 0;
-            msgs[i].msg_hdr.msg_flags = 0;
         }
 
         int n = recvmmsg(conn->svr_sock, msgs, ncap, 0, NULL);
