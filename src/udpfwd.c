@@ -954,7 +954,10 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
 #if ENABLE_LRU_LOCKS
     pthread_mutex_lock(&g_lru_lock);
 #endif
-    list_del(&conn->lru);
+    /* Check if the entry is actually in a list before deleting */
+    if (!list_empty(&conn->lru)) {
+        list_del(&conn->lru);
+    }
 #if ENABLE_LRU_LOCKS
     pthread_mutex_unlock(&g_lru_lock);
 #endif
