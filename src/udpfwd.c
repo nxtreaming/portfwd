@@ -992,7 +992,8 @@ static void proxy_conn_walk_continue(int epfd) {
         long diff = (long)(now - oldest->last_active);
         if (diff < 0)
             diff = 0;
-        if ((unsigned)diff <= g_cfg.proxy_conn_timeo) {
+        /* If timeout is disabled (0), never expire. */
+        if (g_cfg.proxy_conn_timeo == 0 || (unsigned)diff <= g_cfg.proxy_conn_timeo) {
             break; /* oldest not expired -> none later are expired */
         }
 
@@ -1467,8 +1468,7 @@ int main(int argc, char *argv[]) {
                 P_LOG_WARN("invalid -t value '%s', keeping default %u", optarg,
                            g_cfg.proxy_conn_timeo);
             } else {
-                if (v == 0)
-                    v = 1;
+                /* A value of 0 means infinite timeout */
                 if (v > 86400UL)
                     v = 86400UL;
                 g_cfg.proxy_conn_timeo = (unsigned)v;
