@@ -53,7 +53,7 @@
 /* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Performance and security constants */
-#define DEFAULT_CONN_TIMEOUT_SEC 60
+#define DEFAULT_CONN_TIMEOUT_SEC 300
 #define DEFAULT_HASH_TABLE_SIZE 65537 /* Larger prime number for better distribution */
 #define MIN_BATCH_SIZE 64             /* Increased from 4 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
@@ -804,7 +804,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         current_conn_count = atomic_load(&conn_tbl_len);
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
             /* Try to make room first */
-            proxy_conn_walk_continue(current_conn_count, epfd);
+            proxy_conn_walk_continue(epfd);
             current_conn_count = atomic_load(&conn_tbl_len);
             if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
                 proxy_conn_evict_one(epfd);
@@ -867,6 +867,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     ev.events = EPOLLIN;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
         P_LOG_ERR("epoll_ctl(ADD, svr_sock): %s", strerror(errno));
+        conn_pool_release(&g_conn_pool, conn);
         goto err;
     }
     /* ------------------------------------------ */
@@ -973,8 +974,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     conn_pool_release(&g_conn_pool, conn);
 }
 
-static void proxy_conn_walk_continue(unsigned walk_max, int epfd) {
-    unsigned walked = 0;
+static void proxy_conn_walk_continue(int epfd) {
     time_t now = atomic_load(&g_now_ts);
     if (now == 0) {
         now = monotonic_seconds();
@@ -986,7 +986,7 @@ static void proxy_conn_walk_continue(unsigned walk_max, int epfd) {
         return;
     }
 
-    while (walked < walk_max && !list_empty(&g_lru_list)) {
+    while (!list_empty(&g_lru_list)) {
         struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
 
         long diff = (long)(now - oldest->last_active);
@@ -1007,8 +1007,6 @@ static void proxy_conn_walk_continue(unsigned walk_max, int epfd) {
         inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
         P_LOG_INFO("Recycled %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
                    atomic_load(&conn_tbl_len));
-
-        walked++;
 
         /* Re-acquire lock for next iteration */
         pthread_mutex_lock(&g_lru_lock);
@@ -1727,7 +1725,7 @@ int main(int argc, char *argv[]) {
 
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= 2) {
-            proxy_conn_walk_continue(200, epfd);
+            proxy_conn_walk_continue(epfd);
             /* Segmented LRU update to reduce per-packet overhead */
             segmented_update_lru();
             /* Process any queued backpressure packets */
