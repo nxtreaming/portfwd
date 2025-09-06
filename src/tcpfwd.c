@@ -45,10 +45,6 @@
 #include <linux/netfilter_ipv4.h>
 #endif
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Constants and Tunables */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 #define TCP_PROXY_USERBUF_CAP (64 * 1024)
 #define TCP_PROXY_SOCKBUF_CAP (256 * 1024)
 #define TCP_PROXY_BACKPRESSURE_WM (TCP_PROXY_USERBUF_CAP * 3 / 4)
@@ -71,10 +67,6 @@
 
 #define MIN_VALID_POINTER 4096
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Global Variables */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 static struct fwd_config g_cfg;
 static struct conn_pool g_conn_pool;
 static struct conn_limiter g_conn_limiter;
@@ -85,10 +77,6 @@ static int g_ka_idle = TCP_PROXY_KEEPALIVE_IDLE;
 static int g_ka_intvl = TCP_PROXY_KEEPALIVE_INTVL;
 static int g_ka_cnt = TCP_PROXY_KEEPALIVE_CNT;
 static int g_backpressure_wm = TCP_PROXY_BACKPRESSURE_WM;
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Function Declarations */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Core event handling */
 static void proxy_loop(int listen_sock, int epfd, const struct fwd_config *cfg);
@@ -123,10 +111,6 @@ static void release_connection_limit(const union sockaddr_inx *addr);
 void usage(const char *prog);
 int parse_opts(int argc, char **argv, struct fwd_config *cfg);
 int resolve_address(union sockaddr_inx *addr, const char *host, const char *port);
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Utility Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static uint32_t addr_hash(const union sockaddr_inx *addr) {
     if (addr->sa.sa_family == AF_INET) {
@@ -242,10 +226,6 @@ static int safe_close(int fd) {
     }
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Statistics Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 /* Initialize statistics system */
 static int init_stats(void) {
     memset(&g_stats, 0, sizeof(g_stats));
@@ -296,10 +276,6 @@ static void update_traffic_stats(uint64_t bytes_in, uint64_t bytes_out) {
         __sync_fetch_and_add(&g_stats.bytes_sent, bytes_out);
     }
 }
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Connection Limiting */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Initialize connection limiter */
 static int init_conn_limiter(int max_total, int max_per_ip) {
@@ -406,10 +382,6 @@ static void release_connection_limit(const union sockaddr_inx *addr) {
 
     pthread_mutex_unlock(&g_conn_limiter.lock);
 }
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Connection Management */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *events, int *nfds,
                                int epfd) {
@@ -768,10 +740,6 @@ static void print_stats_summary(void) {
 static void report_stats_if_needed(void) {
     // Implementation can be added here
 }
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Main and Command Line Parsing */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 void usage(const char *prog) {
     fprintf(stderr, "Usage: %s [options] <listen_addr> <listen_port> <dest_addr> <dest_port>\n",

@@ -47,10 +47,6 @@
 #include "no-epoll.h"
 #endif
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Constants and Tunables */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
 #define DEFAULT_HASH_TABLE_SIZE 65537 /* Larger prime number for better distribution */
@@ -141,10 +137,6 @@
 #define UDP_PROXY_MAX_CONNS 4096
 #endif
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Data Structures */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 /**
  * @brief Rate limiting structure for DoS protection
  */
@@ -164,10 +156,6 @@ struct rate_limiter {
     unsigned max_bps;
     unsigned max_per_ip;
 };
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Global Variables */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 /* Connection hash table - protected by fine-grained locks */
 static struct list_head *conn_tbl_hbase;
@@ -284,10 +272,6 @@ static void handle_client_data(int listen_sock, int epfd, struct mmsghdr *c_msgs
 static void handle_client_data(int listen_sock, int epfd);
 #endif
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Utility Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 /* Simple monotonic-seconds helper (Linux) with portable fallback */
 static inline time_t monotonic_seconds(void) {
 #ifdef __linux__
@@ -318,10 +302,6 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr **s_msgs,
                                     struct iovec **s_iovs);
 #endif
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Rate Limiting and Security Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #if ENABLE_RATE_LIMITING
 /* Simple hash function for IP addresses */
@@ -439,10 +419,6 @@ static bool validate_packet(const char *data, size_t len, const union sockaddr_i
 #endif
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Backpressure Queue Management */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 #if ENABLE_BACKPRESSURE_QUEUE
 /* Initialize backpressure queue */
 static int init_backpressure_queue(void) {
@@ -521,10 +497,6 @@ static void process_backpressure_queue(void) {
     pthread_mutex_unlock(&g_backpressure_queue.lock);
 }
 #endif /* ENABLE_BACKPRESSURE_QUEUE */
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Performance Optimization Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 #ifdef __linux__
 #if ENABLE_ADAPTIVE_BATCHING
@@ -639,10 +611,6 @@ static inline bool is_power_of_two(unsigned v) {
     return v && ((v & (v - 1)) == 0);
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Connection Pool Management */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 /**
  * @brief Initializes a newly allocated proxy connection.
  * @param conn A pointer to the connection object from the pool.
@@ -672,18 +640,10 @@ static unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
     return h % g_conn_tbl_hash_size;
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Hash Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 static uint32_t hash_addr(const union sockaddr_inx *a) {
     /* Use the improved hash function for better distribution */
     return improved_hash_addr(a);
 }
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Connection Management */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Update timestamp */
@@ -1043,10 +1003,6 @@ static bool proxy_conn_evict_one(int epfd) {
     return true;
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Data Handling Functions */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 #ifdef __linux__
 static void handle_client_data(int lsn_sock, int epfd, struct mmsghdr *c_msgs,
                                struct mmsghdr *s_msgs, struct iovec *s_iovs,
@@ -1384,10 +1340,6 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
 #endif
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Linux Batching Support */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 #ifdef __linux__
 static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
                                     struct sockaddr_storage **c_addrs,
@@ -1445,10 +1397,6 @@ static void destroy_batching_resources(struct mmsghdr *c_msgs, struct iovec *c_i
     free(s_iovs);
 }
 #endif
-
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* Help and Main Function */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
 
 static void show_help(const char *prog) {
     P_LOG_INFO("Userspace UDP proxy.");

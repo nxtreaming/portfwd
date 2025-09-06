@@ -17,7 +17,6 @@
 extern "C" {
 #endif
 
-/* ---------------- Stealth Handshake Protocol ---------------- */
 /*
  * Stealth handshake protocol inspired by Shadowsocks:
  * - No obvious handshake phase
@@ -128,7 +127,6 @@ void kcp_opts_apply_overrides(struct kcp_opts *o, int mtu, int nd, int it, int r
 /* Compute epoll timeout from KCP timers across connections */
 int kcptcp_compute_kcp_timeout_ms(struct list_head *conns, int default_ms);
 
-/* ---------------- Common CLI parsing (shared) ---------------- */
 struct kcptcp_common_cli {
     /* generic */
     const char *pidfile;
@@ -169,7 +167,6 @@ int kcptcp_parse_common_opts(int argc, char **argv, struct kcptcp_common_cli *ou
  */
 uint32_t rand_between(uint32_t min, uint32_t max);
 
-/* ---------------- Epoll helpers (shared) ---------------- */
 /* Generic register or modify */
 int kcptcp_ep_register(int epfd, int fd, void *ptr, uint32_t base_events, uint32_t extra_events);
 /* Listener: EPOLLIN|EPOLLERR|EPOLLHUP */

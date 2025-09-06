@@ -13,9 +13,6 @@
 #include <time.h>
 #include "common.h"
 
-/* Forward declaration to avoid forcing ikcp.h inclusion here */
-struct IKCPCB;
-
 /* Shared buffer structure */
 struct buffer_info {
     char *data;
