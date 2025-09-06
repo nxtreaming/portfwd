@@ -17,7 +17,6 @@
 #include "conn_pool.h"
 #include "fwd_util.h"
 #include "proxy_conn.h"
-#include "fwd_util.h"
 #include "list.h"
 
 #include <stdio.h>

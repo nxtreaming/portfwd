@@ -30,7 +30,6 @@
 #include "outer_obfs.h"
 #include "3rd/chacha20poly1305/chacha20poly1305.h"
 #include "3rd/kcp/ikcp.h"
-#include "fwd_util.h"
 #include <pthread.h>
 
 /* Configuration constants */
