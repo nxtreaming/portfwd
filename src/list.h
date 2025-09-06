@@ -40,6 +40,16 @@ static inline void list_add_tail(struct list_head *new, struct list_head *head) 
     __list_add(new, head->prev, head);
 }
 
+/**
+ * list_move_tail - delete from one list and add as another's tail
+ * @list: the entry to move
+ * @head: the head that will follow our entry
+ */
+static inline void list_move_tail(struct list_head *list, struct list_head *head) {
+    __list_del_entry(list);
+    list_add_tail(list, head);
+}
+
 static inline void __list_del(struct list_head *prev, struct list_head *next) {
     next->prev = prev;
     prev->next = next;
