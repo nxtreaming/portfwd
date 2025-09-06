@@ -986,33 +986,36 @@ static void proxy_conn_walk_continue(int epfd) {
         return;
     }
 
-    while (!list_empty(&g_lru_list)) {
-        struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
+    LIST_HEAD(reap_list);
+    struct proxy_conn *conn, *tmp;
 
-        long diff = (long)(now - oldest->last_active);
-        if (diff < 0)
-            diff = 0;
-        /* If timeout is disabled (0), never expire. */
-        if (g_cfg.proxy_conn_timeo == 0 || (unsigned)diff <= g_cfg.proxy_conn_timeo) {
-            break; /* oldest not expired -> none later are expired */
+    /* Collect all expired connections into a temporary reap_list */
+    list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
+        long diff = (long)(now - conn->last_active);
+        if (diff < 0) diff = 0;
+
+        if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
+            /* Move from LRU to our local reap list */
+            list_move_tail(&conn->lru, &reap_list);
+        } else {
+            /* List is ordered, so we can stop at the first non-expired conn */
+            break;
         }
+    }
 
-        /* Save address info before releasing */
-        union sockaddr_inx addr = oldest->cli_addr;
+    /* Now that we're done touching the global list, we can unlock it */
+    pthread_mutex_unlock(&g_lru_lock);
+
+    /* Reap the collected connections without holding the global LRU lock */
+    list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
         char s_addr[50] = "";
+        union sockaddr_inx addr = conn->cli_addr;
 
-        /* Unlock before calling release_proxy_conn to avoid deadlock */
-        pthread_mutex_unlock(&g_lru_lock);
-
-        release_proxy_conn(oldest, epfd);
+        release_proxy_conn(conn, epfd);
         inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
         P_LOG_INFO("Recycled %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
                    atomic_load(&conn_tbl_len));
-
-        /* Re-acquire lock for next iteration */
-        pthread_mutex_lock(&g_lru_lock);
     }
-    pthread_mutex_unlock(&g_lru_lock);
 }
 
 /* Evict the least recently active connection (LRU-ish across all buckets) */
@@ -1135,10 +1138,24 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 }
                 if (batches[batch_idx].count >= get_optimal_batch_size()) {
                     atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
-                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
-                    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                        P_LOG_WARN("send(server, batch_full): %s", strerror(errno));
+
+                    /* Batch is full, flush it now to make space */
+                    struct send_batch *b = &batches[batch_idx];
+                    for (int k = 0; k < b->count; k++) {
+                        int msg_idx = b->msg_indices[k];
+                        s_iovs[k].iov_base = c_bufs[msg_idx];
+                        s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
                     }
+                    if (sendmmsg(b->sock, s_msgs, b->count, 0) < 0) {
+                        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+                            P_LOG_WARN("sendmmsg(server, batch_full): %s", strerror(errno));
+                        }
+                    }
+
+                    /* Reset batch and add current packet */
+                    b->count = 0;
+                    batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+
                 } else {
                     batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
                 }
@@ -1284,12 +1301,14 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         }
 
         /* Prepare destination (original client) for each message */
+        /* All packets are for the same connection, so touch it only once per batch. */
+        touch_proxy_conn(conn);
+
         for (int i = 0; i < n; i++) {
             msgs[i].msg_hdr.msg_name = &conn->cli_addr;
             msgs[i].msg_hdr.msg_namelen = (socklen_t)sizeof_sockaddr(&conn->cli_addr);
             /* Ensure iov_len matches actual datagram size */
             iovs[i].iov_len = msgs[i].msg_len;
-            touch_proxy_conn(conn);
         }
 
         /* Send out the batch to client, retry on partial */
