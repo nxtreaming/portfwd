@@ -272,7 +272,7 @@ static struct backpressure_queue g_backpressure_queue;
 static uint32_t hash_addr(const union sockaddr_inx *a);
 
 /* Connection management */
-static void proxy_conn_walk_continue(unsigned walk_max, int epfd);
+static void proxy_conn_walk_continue(int epfd);
 static bool proxy_conn_evict_one(int epfd);
 
 /* Data handling */
