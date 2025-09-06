@@ -246,6 +246,10 @@ bool aead_next_send_seq(struct proxy_conn *c, uint32_t *out_seq) {
 /* ---------------- Socket setup helpers ---------------- */
 int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr, bool reuse_addr, bool reuse_port,
                               bool v6only, int sockbuf_bytes, int backlog) {
+    if (!addr) {
+        errno = EINVAL;
+        return -1;
+    }
     int fd = socket(addr->sa.sa_family, SOCK_STREAM, 0);
     if (fd < 0)
         return -1;
@@ -268,11 +272,15 @@ int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr, bool reuse_addr, b
     set_nonblock(fd);
     set_sock_buffers_sz(fd, sockbuf_bytes);
     if (bind(fd, &addr->sa, (socklen_t)sizeof_sockaddr(addr)) < 0) {
+        int saved = errno;
         close(fd);
+        errno = saved;
         return -1;
     }
     if (listen(fd, backlog) < 0) {
+        int saved = errno;
         close(fd);
+        errno = saved;
         return -1;
     }
     return fd;
@@ -280,6 +288,10 @@ int kcptcp_setup_tcp_listener(const union sockaddr_inx *addr, bool reuse_addr, b
 
 int kcptcp_setup_udp_listener(const union sockaddr_inx *addr, bool reuse_addr, bool reuse_port,
                               bool v6only, int sockbuf_bytes) {
+    if (!addr) {
+        errno = EINVAL;
+        return -1;
+    }
     int fd = socket(addr->sa.sa_family, SOCK_DGRAM, 0);
     if (fd < 0)
         return -1;
@@ -302,7 +314,9 @@ int kcptcp_setup_udp_listener(const union sockaddr_inx *addr, bool reuse_addr, b
     set_nonblock(fd);
     set_sock_buffers_sz(fd, sockbuf_bytes);
     if (bind(fd, &addr->sa, (socklen_t)sizeof_sockaddr(addr)) < 0) {
+        int saved = errno;
         close(fd);
+        errno = saved;
         return -1;
     }
     return fd;
@@ -611,32 +625,50 @@ int ensure_buffer_capacity(struct buffer_info *buf, size_t needed, size_t max_si
 int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *token,
                                           const uint8_t *initial_data, size_t initial_data_len,
                                           uint8_t *out_packet, size_t *out_packet_len) {
-    if (!psk || !token || !out_packet || !out_packet_len)
+    if (!psk || !token || !out_packet || !out_packet_len) {
+        errno = EINVAL;
         return -1;
+    }
     struct stealth_handshake_payload payload;
     payload.magic = htonl(STEALTH_HANDSHAKE_MAGIC);
     payload.timestamp = htonl((uint32_t)time(NULL));
     memcpy(payload.token, token, 16);
-    if (secure_random_bytes((uint8_t *)&payload.nonce, sizeof(payload.nonce)) != 0)
+    if (secure_random_bytes((uint8_t *)&payload.nonce, sizeof(payload.nonce)) != 0) {
+        errno = EIO;
         return -1;
-    if (secure_random_bytes(payload.reserved, sizeof(payload.reserved)) != 0)
+    }
+    if (secure_random_bytes(payload.reserved, sizeof(payload.reserved)) != 0) {
+        errno = EIO;
         return -1;
+    }
 
     uint8_t pad_rnd = 0;
-    if (secure_random_bytes(&pad_rnd, 1) != 0)
+    if (secure_random_bytes(&pad_rnd, 1) != 0) {
+        errno = EIO;
         return -1;
+    }
     size_t padding_size = (size_t)(pad_rnd % 16); /* 0..15 to reduce overhead */
     /* Prevent overflow in total_size calculation: padding_size max is 15 */
-    if (initial_data_len > SIZE_MAX - sizeof(payload) - 15)
+    if (initial_data_len > SIZE_MAX - sizeof(payload) - 15) {
+        errno = EOVERFLOW;
         return -1;
+    }
     size_t total_size = sizeof(payload) + initial_data_len + padding_size;
     /* Check for overflow when adding outer overhead and provided buffer cap */
-    if (total_size > SIZE_MAX - OUTER_OVERHEAD_BYTES || total_size + OUTER_OVERHEAD_BYTES > *out_packet_len)
+    if (total_size > SIZE_MAX - OUTER_OVERHEAD_BYTES) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    if (total_size + OUTER_OVERHEAD_BYTES > *out_packet_len) {
+        errno = EMSGSIZE; /* output buffer too small */
         return -1; /* +12 nonce +16 tag */
+    }
 
     uint8_t *plaintext = (uint8_t *)malloc(total_size);
-    if (!plaintext)
+    if (!plaintext) {
+        errno = ENOMEM;
         return -1;
+    }
     memcpy(plaintext, &payload, sizeof(payload));
     if (initial_data && initial_data_len > 0)
         memcpy(plaintext + sizeof(payload), initial_data, initial_data_len);
@@ -648,6 +680,7 @@ int stealth_handshake_create_first_packet(const uint8_t *psk, const uint8_t *tok
     uint8_t nonce[12];
     if (secure_random_bytes(nonce, sizeof(nonce)) != 0) {
         free(plaintext);
+        errno = EIO;
         return -1;
     }
     uint8_t tag[16];
@@ -663,34 +696,39 @@ int stealth_handshake_parse_first_packet(const uint8_t *psk, const uint8_t *pack
                                          size_t packet_len,
                                          struct stealth_handshake_payload *payload,
                                          uint8_t *out_data, size_t *out_data_len) {
-    if (!psk || !packet || !payload || packet_len < 28)
+    if (!psk || !packet || !payload || packet_len < 28) {
+        errno = EINVAL;
         return -1;
+    }
     const uint8_t *nonce = packet;
     const uint8_t *ciphertext = packet + 12;
     size_t ciphertext_len = packet_len - 28;
     const uint8_t *tag = packet + 12 + ciphertext_len;
 
     uint8_t *plaintext = (uint8_t *)malloc(ciphertext_len);
-    if (!plaintext)
-        return -1;
+    if (!plaintext) { errno = ENOMEM; return -1; }
     if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len, tag, plaintext) !=
         0) {
         free(plaintext);
+        errno = EPROTO;
         return -1;
     }
     if (ciphertext_len < sizeof(struct stealth_handshake_payload)) {
         free(plaintext);
+        errno = EMSGSIZE;
         return -1;
     }
     memcpy(payload, plaintext, sizeof(struct stealth_handshake_payload));
     if (ntohl(payload->magic) != STEALTH_HANDSHAKE_MAGIC) {
         free(plaintext);
+        errno = EPROTO;
         return -1;
     }
     time_t now = time(NULL);
     time_t msg_time = (time_t)ntohl(payload->timestamp);
     if (msg_time < now - 300 || msg_time > now + 300) {
         free(plaintext);
+        errno = ETIMEDOUT;
         return -1;
     }
 
@@ -708,39 +746,52 @@ int stealth_handshake_parse_first_packet(const uint8_t *psk, const uint8_t *pack
 
 int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const uint8_t *token,
                                       uint8_t *out_packet, size_t *out_packet_len) {
-    if (!psk || !token || !out_packet || !out_packet_len)
+    if (!psk || !token || !out_packet || !out_packet_len) {
+        errno = EINVAL;
         return -1;
+    }
     struct stealth_handshake_response response;
     response.magic = htonl(STEALTH_RESPONSE_MAGIC);
     response.conv = htonl(conv);
     memcpy(response.token, token, 16);
     response.timestamp = htonl((uint32_t)time(NULL));
-    if (secure_random_bytes(response.reserved, sizeof(response.reserved)) != 0)
+    if (secure_random_bytes(response.reserved, sizeof(response.reserved)) != 0) {
+        errno = EIO;
         return -1;
+    }
 
     uint8_t pad_rnd = 0;
-    if (secure_random_bytes(&pad_rnd, 1) != 0)
+    if (secure_random_bytes(&pad_rnd, 1) != 0) {
+        errno = EIO;
         return -1;
+    }
     size_t padding_size = (size_t)(pad_rnd % 16);
     /* Overflow checks for total_size and outer overhead addition */
     if (sizeof(response) > SIZE_MAX - 15)
         return -1;
     size_t total_size = sizeof(response) + padding_size;
-    if (total_size > SIZE_MAX - OUTER_OVERHEAD_BYTES || total_size + OUTER_OVERHEAD_BYTES > *out_packet_len)
+    if (total_size > SIZE_MAX - OUTER_OVERHEAD_BYTES) {
+        errno = EOVERFLOW;
         return -1;
+    }
+    if (total_size + OUTER_OVERHEAD_BYTES > *out_packet_len) {
+        errno = EMSGSIZE;
+        return -1;
+    }
 
     uint8_t *plaintext = (uint8_t *)malloc(total_size);
-    if (!plaintext)
-        return -1;
+    if (!plaintext) { errno = ENOMEM; return -1; }
     memcpy(plaintext, &response, sizeof(response));
     if (secure_random_bytes(plaintext + sizeof(response), padding_size) != 0) {
         free(plaintext);
+        errno = EIO;
         return -1;
     }
 
     uint8_t nonce[12];
     if (secure_random_bytes(nonce, sizeof(nonce)) != 0) {
         free(plaintext);
+        errno = EIO;
         return -1;
     }
     uint8_t tag[16];
@@ -754,29 +805,33 @@ int stealth_handshake_create_response(const uint8_t *psk, uint32_t conv, const u
 
 int stealth_handshake_parse_response(const uint8_t *psk, const uint8_t *packet, size_t packet_len,
                                      struct stealth_handshake_response *response) {
-    if (!psk || !packet || !response || packet_len < 28)
+    if (!psk || !packet || !response || packet_len < 28) {
+        errno = EINVAL;
         return -1;
+    }
     const uint8_t *nonce = packet;
     const uint8_t *ciphertext = packet + 12;
     size_t ciphertext_len = packet_len - 28;
     const uint8_t *tag = packet + 12 + ciphertext_len;
 
     uint8_t *plaintext = (uint8_t *)malloc(ciphertext_len);
-    if (!plaintext)
-        return -1;
+    if (!plaintext) { errno = ENOMEM; return -1; }
     if (chacha20poly1305_open(psk, nonce, NULL, 0, ciphertext, ciphertext_len, tag, plaintext) !=
         0) {
         free(plaintext);
+        errno = EPROTO;
         return -1;
     }
     if (ciphertext_len < sizeof(struct stealth_handshake_response)) {
         free(plaintext);
+        errno = EMSGSIZE;
         return -1;
     }
 
     memcpy(response, plaintext, sizeof(struct stealth_handshake_response));
     if (ntohl(response->magic) != STEALTH_RESPONSE_MAGIC) {
         free(plaintext);
+        errno = EPROTO;
         return -1;
     }
     time_t now = time(NULL);
