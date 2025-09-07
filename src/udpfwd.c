@@ -79,6 +79,12 @@
 #define ENABLE_RATE_LIMITING 0
 #endif
 
+/* Stats atomics control: default off (0) to reduce overhead in single-threaded mode */
+#ifndef ENABLE_STATS_ATOMICS
+#define ENABLE_STATS_ATOMICS 1
+#endif
+
+
 #ifndef DISABLE_PACKET_VALIDATION
 #define ENABLE_PACKET_VALIDATION 1
 #else
@@ -610,8 +616,13 @@ static void adjust_batch_size(void) {
     }
 
     /* Reset counters */
+    #if ENABLE_STATS_ATOMICS
     atomic_store(&g_adaptive_batch.total_packets, 0);
     atomic_store(&g_adaptive_batch.total_batches, 0);
+    #else
+    g_adaptive_batch.total_packets = 0;
+    g_adaptive_batch.total_batches = 0;
+    #endif
     g_adaptive_batch.last_adjust = now;
 
     pthread_mutex_unlock(&g_adaptive_batch.lock);
@@ -631,8 +642,13 @@ static int get_optimal_batch_size(void) {
 /* Record batch statistics */
 static void record_batch_stats(int packets_in_batch) {
 #if ENABLE_ADAPTIVE_BATCHING
+    #if ENABLE_STATS_ATOMICS
     atomic_fetch_add(&g_adaptive_batch.total_packets, packets_in_batch);
     atomic_fetch_add(&g_adaptive_batch.total_batches, 1);
+    #else
+    g_adaptive_batch.total_packets += packets_in_batch;
+    g_adaptive_batch.total_batches += 1;
+    #endif
 #else
     (void)packets_in_batch; /* Suppress unused parameter warning */
 #endif
@@ -725,36 +741,11 @@ static uint32_t hash_addr(const union sockaddr_inx *a) {
 }
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
-    /* Update timestamp */
+    /* Update timestamp only; defer LRU updates to periodic maintenance */
     time_t snap = atomic_load(&g_now_ts);
     time_t new_time = snap ? snap : monotonic_seconds();
     conn->last_active = new_time;
-
-    /* Try immediate LRU update with trylock to avoid blocking hot path */
 #if ENABLE_LRU_LOCKS
-    static __thread time_t last_lru_attempt = 0;
-
-    /* Throttle LRU updates per connection - at most once every 5 seconds */
-    if (new_time - last_lru_attempt >= 5) {
-        if (pthread_mutex_trylock(&g_lru_lock) == 0) {
-            /* Successfully got lock - do immediate LRU update */
-            if (!conn->needs_lru_update) {
-                list_del(&conn->lru);
-                list_add_tail(&conn->lru, &g_lru_list);
-                atomic_fetch_add(&g_stat_lru_immediate_updates, 1);
-            }
-            pthread_mutex_unlock(&g_lru_lock);
-            last_lru_attempt = new_time;
-        } else {
-            /* Lock contention - mark for batch update */
-            conn->needs_lru_update = true;
-            atomic_fetch_add(&g_stat_lru_deferred_updates, 1);
-        }
-    } else {
-        /* Throttled - mark for batch update */
-        conn->needs_lru_update = true;
-    }
-#else
     conn->needs_lru_update = true;
 #endif
 }
@@ -1171,14 +1162,18 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
                 /* Track hash collision statistics */
                 if (probe_count > 0) {
+                #if ENABLE_STATS_ATOMICS
                     atomic_fetch_add(&g_stat_hash_collisions, probe_count);
+                #endif
                 }
 
                 /* If we found a matching socket or an empty slot */
                 if (batch_idx == -1) {
                     /* Check if we can create a new batch */
                     if (num_batches >= MAX_CONCURRENT_BATCHES) {
+                        #if ENABLE_STATS_ATOMICS
                         atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
+                        #endif
                         ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                         if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                             P_LOG_WARN("send(server, overflow): %s", strerror(errno));
@@ -1192,7 +1187,9 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     batch_hash[hash_key] = batch_idx;
                 }
                 if (batches[batch_idx].count >= get_optimal_batch_size()) {
+                    #if ENABLE_STATS_ATOMICS
                     atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
+                    #endif
 
                     /* Batch is full, flush it now to make space */
                     struct send_batch *b = &batches[batch_idx];
@@ -1238,7 +1235,9 @@ static void handle_client_data(int lsn_sock, int epfd) {
                              * don't queue in userspace */
                             /* This is more efficient than copying data to
                              * userspace queues */
+                            #if ENABLE_STATS_ATOMICS
                             atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, remaining);
+                            #endif
                             break;
                         }
                         P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, "
@@ -1443,23 +1442,18 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr **s_msgs,
                                     struct iovec **s_iovs) {
     int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
-    *c_msgs = calloc(ncap, sizeof(**c_msgs));
-    *c_iov = calloc(ncap, sizeof(**c_iov));
-    *c_addrs = calloc(ncap, sizeof(**c_addrs));
-    *c_bufs = calloc(ncap, sizeof(**c_bufs));
-    *s_msgs = calloc(ncap, sizeof(**s_msgs));
-    *s_iovs = calloc(ncap, sizeof(**s_iovs));
 
-    if (!*c_msgs || !*c_iov || !*c_addrs || !*c_bufs || !*s_msgs || !*s_iovs) {
-        P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding "
-                   "without batching.");
-        free(*c_msgs);
-        free(*c_iov);
-        free(*c_addrs);
-        free(*c_bufs);
-        free(*s_msgs);
-        free(*s_iovs);
+    size_t size_c_msgs = (size_t)ncap * sizeof(**c_msgs);
+    size_t size_c_iov  = (size_t)ncap * sizeof(**c_iov);
+    size_t size_c_addrs= (size_t)ncap * sizeof(**c_addrs);
+    size_t size_c_bufs = (size_t)ncap * sizeof(**c_bufs);
+    size_t size_s_msgs = (size_t)ncap * sizeof(**s_msgs);
+    size_t size_s_iovs = (size_t)ncap * sizeof(**s_iovs);
+    size_t total = size_c_msgs + size_c_iov + size_c_addrs + size_c_bufs + size_s_msgs + size_s_iovs;
 
+    void *block = aligned_alloc(64, total);
+    if (!block) {
+        P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
         *c_msgs = NULL;
         *c_iov = NULL;
         *c_addrs = NULL;
@@ -1469,6 +1463,26 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
         return;
     }
 
+    char *p = (char *)block;
+    *c_msgs = (struct mmsghdr *)p;
+
+    p += size_c_msgs;
+    *c_iov  = (struct iovec *)p;
+
+    p += size_c_iov;
+    *c_addrs= (struct sockaddr_storage *)p;
+
+    p += size_c_addrs;
+    *c_bufs = (char (*)[UDP_PROXY_DGRAM_CAP])p;
+
+    p += size_c_bufs;
+    *s_msgs = (struct mmsghdr *)p;
+
+    p += size_s_msgs;
+    *s_iovs = (struct iovec *)p;
+    p += size_s_iovs;
+
+    /* Initialize mmsghdr/iovec structures */
     for (int i = 0; i < ncap; i++) {
         (*c_iov)[i].iov_base = (*c_bufs)[i];
         (*c_iov)[i].iov_len = UDP_PROXY_DGRAM_CAP;
@@ -1480,18 +1494,22 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
         (*s_msgs)[i].msg_hdr.msg_iov = &(*s_iovs)[i];
         (*s_msgs)[i].msg_hdr.msg_iovlen = 1;
     }
+
+    /* Store the base pointer for single-free at destroy time by stashing it in c_msgs[-1].msg_hdr.msg_iov */
+    /* We can't portably store it there; instead, rely on contiguous block: free(c_msgs) frees all */
 }
 
 static void destroy_batching_resources(struct mmsghdr *c_msgs, struct iovec *c_iov,
                                        struct sockaddr_storage *c_addrs,
                                        char (*c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr *s_msgs,
                                        struct iovec *s_iovs) {
+    /* Single block allocation: freeing c_msgs frees all the contiguous arrays */
+    (void)c_iov;
+    (void)c_addrs;
+    (void)c_bufs;
+    (void)s_msgs;
+    (void)s_iovs;
     free(c_msgs);
-    free(c_iov);
-    free(c_addrs);
-    free(c_bufs);
-    free(s_msgs);
-    free(s_iovs);
 }
 #endif
 
