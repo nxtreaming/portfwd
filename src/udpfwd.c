@@ -38,6 +38,7 @@
 #include <stdbool.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <sched.h> /* For sched_getcpu() */
 
 #ifdef __linux__
 #include <sys/epoll.h>
@@ -203,9 +204,13 @@ static struct adaptive_batch g_adaptive_batch = {
 #endif /* ENABLE_ADAPTIVE_BATCHING */
 #endif
 
-/* Global LRU list for O(1) oldest selection - protected by mutex */
-static LIST_HEAD(g_lru_list);
-static pthread_mutex_t g_lru_lock = PTHREAD_MUTEX_INITIALIZER;
+/* Segmented LRU cache to reduce lock contention */
+#define NUM_LRU_SEGMENTS 256 /* Power of 2 for fast modulo */
+struct lru_cache {
+    struct list_head list;
+    pthread_mutex_t lock;
+};
+static struct lru_cache *g_lru_caches;
 
 #if ENABLE_LRU_LOCKS
 /* Segmented LRU update state to avoid O(N) scans */
@@ -222,20 +227,23 @@ static atomic_long g_now_ts; /**< Atomic timestamp cache */
 /* Function pointer to compute bucket index from a 32-bit hash */
 static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 
-/* Stats: batch overflow immediate-sends (client->server) - atomic counters */
-static _Atomic uint64_t g_stat_c2s_batch_socket_overflow;
-static _Atomic uint64_t g_stat_c2s_batch_entry_overflow;
+/* Per-CPU statistics to avoid cache line contention */
+struct per_cpu_stats {
+    uint64_t c2s_batch_socket_overflow;
+    uint64_t c2s_batch_entry_overflow;
+    uint64_t hash_collisions;
+    uint64_t lru_immediate_updates;
+    uint64_t lru_deferred_updates;
+} __attribute__((__aligned__(64))); /* Align to cache line size */
 
-/* Additional performance statistics */
-static _Atomic uint64_t g_stat_hash_collisions;
-static _Atomic uint64_t g_stat_lru_immediate_updates;
-static _Atomic uint64_t g_stat_lru_deferred_updates;
+static struct per_cpu_stats *g_per_cpu_stats;
 
 /* Global config */
 static struct fwd_config g_cfg;
 
-/* Global rate limiter for security */
-static struct rate_limiter g_rate_limiter;
+/* Per-CPU rate limiters for security */
+static struct rate_limiter *g_rate_limiters;
+static int g_num_cpus;
 
 #if ENABLE_BACKPRESSURE_QUEUE
 /* Simple backpressure queue for handling EAGAIN */
@@ -326,21 +334,46 @@ static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
 
 /* Initialize rate limiter */
 static int init_rate_limiter(unsigned max_per_ip, unsigned max_pps, unsigned max_bps) {
-    memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
-    if (pthread_mutex_init(&g_rate_limiter.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize rate limiter mutex");
+    g_num_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (g_num_cpus <= 0) {
+        g_num_cpus = 1;
+    }
+
+    g_rate_limiters = calloc(g_num_cpus, sizeof(struct rate_limiter));
+    if (!g_rate_limiters) {
+        P_LOG_ERR("Failed to allocate memory for per-CPU rate limiters");
         return -1;
     }
-    g_rate_limiter.max_per_ip = max_per_ip;
-    g_rate_limiter.max_pps = max_pps;
-    g_rate_limiter.max_bps = max_bps;
+
+    for (int i = 0; i < g_num_cpus; i++) {
+        if (pthread_mutex_init(&g_rate_limiters[i].lock, NULL) != 0) {
+            P_LOG_ERR("Failed to initialize rate limiter mutex for CPU %d", i);
+            /* Cleanup previously initialized mutexes */
+            for (int j = 0; j < i; j++) {
+                pthread_mutex_destroy(&g_rate_limiters[j].lock);
+            }
+            free(g_rate_limiters);
+            g_rate_limiters = NULL;
+            return -1;
+        }
+        g_rate_limiters[i].max_per_ip = max_per_ip;
+        g_rate_limiters[i].max_pps = max_pps;
+        g_rate_limiters[i].max_bps = max_bps;
+    }
+
+    P_LOG_INFO("Initialized %d per-CPU rate limiters.", g_num_cpus);
     return 0;
 }
 
 /* Destroy rate limiter */
 static void destroy_rate_limiter(void) {
-    pthread_mutex_destroy(&g_rate_limiter.lock);
-    memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
+    if (g_rate_limiters) {
+        for (int i = 0; i < g_num_cpus; i++) {
+            pthread_mutex_destroy(&g_rate_limiters[i].lock);
+        }
+        free(g_rate_limiters);
+        g_rate_limiters = NULL;
+    }
 }
 
 /* Check if packet is allowed by rate limiter */
@@ -350,15 +383,24 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
     (void)packet_size;
     return true; /* Rate limiting disabled at compile time */
 #else
-    if (g_rate_limiter.max_pps == 0 && g_rate_limiter.max_bps == 0 &&
-        g_rate_limiter.max_per_ip == 0) {
-        return true; /* No limits configured */
+    if (!g_rate_limiters) {
+        return true; /* Not initialized, allow all */
     }
 
-    pthread_mutex_lock(&g_rate_limiter.lock);
+    int cpu = sched_getcpu();
+    if (cpu < 0) {
+        cpu = 0; /* Fallback in case of error */
+    }
+    struct rate_limiter *limiter = &g_rate_limiters[cpu % g_num_cpus];
+
+    if (limiter->max_pps == 0 && limiter->max_bps == 0 && limiter->max_per_ip == 0) {
+        return true; /* No limits configured for this CPU's limiter */
+    }
+
+    pthread_mutex_lock(&limiter->lock);
 
     uint32_t hash = addr_hash_for_rate_limit(addr);
-    struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
+    struct rate_limit_entry *entry = &limiter->entries[hash];
     /* Use cached timestamp to avoid frequent time() syscalls */
     time_t now = atomic_load(&g_now_ts);
     if (now == 0) {
@@ -377,29 +419,29 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
         entry->packet_count = 1;
         entry->byte_count = packet_size;
         entry->window_start = now;
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+        pthread_mutex_unlock(&limiter->lock);
         return true;
     }
 
     /* Check packet rate limit */
-    if (g_rate_limiter.max_pps > 0 && entry->packet_count >= g_rate_limiter.max_pps) {
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+    if (limiter->max_pps > 0 && entry->packet_count >= limiter->max_pps) {
+        pthread_mutex_unlock(&limiter->lock);
         P_LOG_WARN("Packet rate limit exceeded for %s (%lu pps)", sockaddr_to_string(addr),
                    entry->packet_count);
         return false;
     }
 
     /* Check byte rate limit */
-    if (g_rate_limiter.max_bps > 0 && entry->byte_count + packet_size > g_rate_limiter.max_bps) {
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+    if (limiter->max_bps > 0 && entry->byte_count + packet_size > limiter->max_bps) {
+        pthread_mutex_unlock(&limiter->lock);
         P_LOG_WARN("Byte rate limit exceeded for %s (%lu bps)", sockaddr_to_string(addr),
                    entry->byte_count);
         return false;
     }
 
     /* Check per-IP connection limit */
-    if (g_rate_limiter.max_per_ip > 0 && entry->connection_count >= g_rate_limiter.max_per_ip) {
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+    if (limiter->max_per_ip > 0 && entry->connection_count >= limiter->max_per_ip) {
+        pthread_mutex_unlock(&limiter->lock);
         P_LOG_WARN("Per-IP connection limit exceeded for %s (%u connections)",
                    sockaddr_to_string(addr), entry->connection_count);
         return false;
@@ -409,7 +451,7 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
     entry->packet_count++;
     entry->byte_count += packet_size;
 
-    pthread_mutex_unlock(&g_rate_limiter.lock);
+    pthread_mutex_unlock(&limiter->lock);
     return true;
 #endif
 }
@@ -678,6 +720,12 @@ static uint32_t hash_addr(const union sockaddr_inx *a) {
     return improved_hash_addr(a);
 }
 
+/* Selects the appropriate LRU segment for a given connection */
+static inline struct lru_cache *get_lru_cache_for_conn(const struct proxy_conn *conn) {
+    uint32_t hash = hash_addr(&conn->cli_addr);
+    return &g_lru_caches[hash & (NUM_LRU_SEGMENTS - 1)];
+}
+
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Update timestamp */
     time_t snap = atomic_load(&g_now_ts);
@@ -686,27 +734,16 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 
     /* Try immediate LRU update with trylock to avoid blocking hot path */
 #if ENABLE_LRU_LOCKS
-    static __thread time_t last_lru_attempt = 0;
-
-    /* Throttle LRU updates per connection - at most once every 5 seconds */
-    if (new_time - last_lru_attempt >= 5) {
-        if (pthread_mutex_trylock(&g_lru_lock) == 0) {
-            /* Successfully got lock - do immediate LRU update */
-            if (!conn->needs_lru_update) {
-                list_del(&conn->lru);
-                list_add_tail(&conn->lru, &g_lru_list);
-                atomic_fetch_add(&g_stat_lru_immediate_updates, 1);
-            }
-            pthread_mutex_unlock(&g_lru_lock);
-            last_lru_attempt = new_time;
-        } else {
-            /* Lock contention - mark for batch update */
-            conn->needs_lru_update = true;
-            atomic_fetch_add(&g_stat_lru_deferred_updates, 1);
-        }
+    struct lru_cache *cache = get_lru_cache_for_conn(conn);
+    if (pthread_mutex_trylock(&cache->lock) == 0) {
+        /* Successfully got lock - do immediate LRU update */
+        list_move_tail(&conn->lru, &cache->list);
+        pthread_mutex_unlock(&cache->lock);
+        g_per_cpu_stats[sched_getcpu()].lru_immediate_updates++;
     } else {
-        /* Throttled - mark for batch update */
+        /* Lock contention - mark for batch update */
         conn->needs_lru_update = true;
+        g_per_cpu_stats[sched_getcpu()].lru_deferred_updates++;
     }
 #else
     conn->needs_lru_update = true;
@@ -831,7 +868,6 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         warned_high_water = true;
     }
 
-
     /* ------------------------------------------ */
     /* Establish the server-side connection */
     if ((svr_sock = socket(g_cfg.dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
@@ -875,13 +911,12 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     pthread_spin_unlock(&conn_tbl_locks[bucket]);
 #endif
 
-    /* Add to LRU list with global lock */
+    /* Add to the appropriate LRU segment */
 #if ENABLE_LRU_LOCKS
-    pthread_mutex_lock(&g_lru_lock);
-#endif
-    list_add_tail(&conn->lru, &g_lru_list);
-#if ENABLE_LRU_LOCKS
-    pthread_mutex_unlock(&g_lru_lock);
+    struct lru_cache *cache = get_lru_cache_for_conn(conn);
+    pthread_mutex_lock(&cache->lock);
+    list_add_tail(&conn->lru, &cache->list);
+    pthread_mutex_unlock(&cache->lock);
 #endif
 
     /* We already reserved the connection count via CAS earlier; read it for logging */
@@ -954,16 +989,15 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     /* Update global connection count atomically */
     atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
 
-    /* Remove from LRU list with global LRU lock */
+    /* Remove from LRU list with segmented lock */
 #if ENABLE_LRU_LOCKS
-    pthread_mutex_lock(&g_lru_lock);
-#endif
+    struct lru_cache *cache = get_lru_cache_for_conn(conn);
+    pthread_mutex_lock(&cache->lock);
     /* Check if the entry is actually in a list before deleting */
     if (!list_empty(&conn->lru)) {
         list_del(&conn->lru);
     }
-#if ENABLE_LRU_LOCKS
-    pthread_mutex_unlock(&g_lru_lock);
+    pthread_mutex_unlock(&cache->lock);
 #endif
 
     /* Remove from epoll and close socket */
@@ -987,65 +1021,94 @@ static void proxy_conn_walk_continue(int epfd) {
         now = monotonic_seconds();
     }
 
-    pthread_mutex_lock(&g_lru_lock);
-    if (list_empty(&g_lru_list)) {
-        pthread_mutex_unlock(&g_lru_lock);
-        return;
-    }
-
     LIST_HEAD(reap_list);
     struct proxy_conn *conn, *tmp;
 
-    /* Collect all expired connections into a temporary reap_list */
-    list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
-        long diff = (long)(now - conn->last_active);
-        if (diff < 0) diff = 0;
+    /* Iterate over all LRU segments */
+    for (int i = 0; i < NUM_LRU_SEGMENTS; i++) {
+        struct lru_cache *cache = &g_lru_caches[i];
 
-        if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
-            /* Move from LRU to our local reap list */
-            list_move_tail(&conn->lru, &reap_list);
-        } else {
-            /* List is ordered, so we can stop at the first non-expired conn */
-            break;
+        pthread_mutex_lock(&cache->lock);
+        if (list_empty(&cache->list)) {
+            pthread_mutex_unlock(&cache->lock);
+            continue;
         }
+
+        /* Collect all expired connections from this segment into a temporary reap_list */
+        list_for_each_entry_safe(conn, tmp, &cache->list, lru) {
+            long diff = (long)(now - conn->last_active);
+            if (diff < 0) diff = 0;
+
+            if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
+                /* Move from LRU to our local reap list */
+                list_move_tail(&conn->lru, &reap_list);
+            } else {
+                /* List is ordered, so we can stop at the first non-expired conn */
+                break;
+            }
+        }
+        pthread_mutex_unlock(&cache->lock);
     }
 
-    /* Now that we're done touching the global list, we can unlock it */
-    pthread_mutex_unlock(&g_lru_lock);
+    /* Reap the collected connections without holding any LRU locks */
+    if (!list_empty(&reap_list)) {
+        list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
+            char s_addr[INET6_ADDRSTRLEN] = "";
+            union sockaddr_inx addr = conn->cli_addr;
 
-    /* Reap the collected connections without holding the global LRU lock */
-    list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
-        char s_addr[INET6_ADDRSTRLEN] = "";
-        union sockaddr_inx addr = conn->cli_addr;
-
-        proxy_conn_put(conn, epfd);
-        inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
-        P_LOG_INFO("Recycled %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
-                   atomic_load(&conn_tbl_len));
+            proxy_conn_put(conn, epfd);
+            inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
+            P_LOG_INFO("Recycled %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
+                       atomic_load(&conn_tbl_len));
+        }
     }
 }
 
-/* Evict the least recently active connection (LRU-ish across all buckets) */
+/* Evict the least recently active connection from a randomly chosen segment */
 static bool proxy_conn_evict_one(int epfd) {
-    pthread_mutex_lock(&g_lru_lock);
-    if (list_empty(&g_lru_list)) {
-        pthread_mutex_unlock(&g_lru_lock);
-        return false;
+    /* Choose a random segment to start search, to distribute eviction load */
+    int start_idx = rand() % NUM_LRU_SEGMENTS;
+    struct proxy_conn *oldest = NULL;
+
+    for (int i = 0; i < NUM_LRU_SEGMENTS; i++) {
+        int idx = (start_idx + i) % NUM_LRU_SEGMENTS;
+        struct lru_cache *cache = &g_lru_caches[idx];
+
+        pthread_mutex_lock(&cache->lock);
+        if (!list_empty(&cache->list)) {
+            oldest = list_first_entry(&cache->list, struct proxy_conn, lru);
+            /* Move to a temporary list to release lock quickly */
+            list_del_init(&oldest->lru);
+            pthread_mutex_unlock(&cache->lock);
+            break; /* Found a victim */
+        }
+        pthread_mutex_unlock(&cache->lock);
     }
 
-    struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
-    union sockaddr_inx addr = oldest->cli_addr;
-    char s_addr[INET6_ADDRSTRLEN] = "";
+    if (oldest) {
+        union sockaddr_inx addr = oldest->cli_addr;
+        char s_addr[INET6_ADDRSTRLEN] = "";
 
-    /* Unlock before calling release_proxy_conn to avoid deadlock */
-    pthread_mutex_unlock(&g_lru_lock);
+        proxy_conn_put(oldest, epfd);
+        inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
+        P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
+                   atomic_load(&conn_tbl_len));
+        return true;
+    }
 
-    proxy_conn_put(oldest, epfd);
-    inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
-    P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
-               atomic_load(&conn_tbl_len));
+    return false; /* No connections to evict */
+}
 
-    return true;
+/* A simple integer hash function for file descriptors */
+static inline uint32_t hash_fd(int fd) {
+    uint32_t key = fd;
+    key = ~key + (key << 15); // key = (key << 15) - key - 1;
+    key = key ^ (key >> 12);
+    key = key + (key << 2);
+    key = key ^ (key >> 4);
+    key = key * 2057; // key = (key + (key << 3)) + (key << 11);
+    key = key ^ (key >> 16);
+    return key;
 }
 
 #ifdef __linux__
@@ -1105,7 +1168,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
                 /* O(1) batch lookup using hash table with linear probing for
                  * collision resolution */
-                int hash_key = conn->svr_sock % BATCH_HASH_SIZE;
+                int hash_key = hash_fd(conn->svr_sock) % BATCH_HASH_SIZE;
                 int batch_idx = batch_hash[hash_key];
                 int probe_count = 0;
 
@@ -1119,14 +1182,14 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
                 /* Track hash collision statistics */
                 if (probe_count > 0) {
-                    atomic_fetch_add(&g_stat_hash_collisions, probe_count);
+                    g_per_cpu_stats[sched_getcpu()].hash_collisions += probe_count;
                 }
 
                 /* If we found a matching socket or an empty slot */
                 if (batch_idx == -1) {
                     /* Check if we can create a new batch */
                     if (num_batches >= MAX_CONCURRENT_BATCHES) {
-                        atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
+                        g_per_cpu_stats[sched_getcpu()].c2s_batch_socket_overflow++;
                         ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                         if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
                             P_LOG_WARN("send(server, overflow): %s", strerror(errno));
@@ -1140,7 +1203,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     batch_hash[hash_key] = batch_idx;
                 }
                 if (batches[batch_idx].count >= get_optimal_batch_size()) {
-                    atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
+                    g_per_cpu_stats[sched_getcpu()].c2s_batch_entry_overflow++;
 
                     /* Batch is full, flush it now to make space */
                     struct send_batch *b = &batches[batch_idx];
@@ -1611,7 +1674,6 @@ int main(int argc, char *argv[]) {
     if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0)
         return 1;
 
-
     openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
     if (g_cfg.daemonize) {
@@ -1622,6 +1684,27 @@ int main(int argc, char *argv[]) {
     if (g_cfg.pidfile) {
         if (create_pid_file(g_cfg.pidfile) != 0)
             return 1;
+    }
+
+    /* Initialize Per-CPU Stats */
+    g_per_cpu_stats = calloc(g_num_cpus, sizeof(struct per_cpu_stats));
+    if (!g_per_cpu_stats) {
+        P_LOG_ERR("Failed to allocate per-CPU stats");
+        goto cleanup;
+    }
+
+    /* Initialize LRU caches */
+    g_lru_caches = calloc(NUM_LRU_SEGMENTS, sizeof(struct lru_cache));
+    if (!g_lru_caches) {
+        P_LOG_ERR("Failed to allocate LRU caches");
+        goto cleanup;
+    }
+    for (i = 0; i < NUM_LRU_SEGMENTS; i++) {
+        INIT_LIST_HEAD(&g_lru_caches[i].list);
+        if (pthread_mutex_init(&g_lru_caches[i].lock, NULL) != 0) {
+            P_LOG_ERR("Failed to initialize LRU cache lock %d", i);
+            goto cleanup;
+        }
     }
 
     if (conn_pool_init(&g_conn_pool, g_conn_pool_capacity, sizeof(struct proxy_conn)) < 0) {
@@ -1723,6 +1806,8 @@ int main(int argc, char *argv[]) {
             for (int j = 0; j < i; j++) {
                 pthread_spin_destroy(&conn_tbl_locks[j]);
             }
+            free(conn_tbl_locks);
+            conn_tbl_locks = NULL;
             rc = 1;
             goto cleanup;
         }
@@ -1742,8 +1827,9 @@ int main(int argc, char *argv[]) {
         rc = 1;
         goto cleanup;
     }
+    atexit(destroy_rate_limiter);
 
-    /* epoll loop */
+    /* Main event loop */
     ev.data.ptr = &magic_listener;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
 #ifdef EPOLLEXCLUSIVE
