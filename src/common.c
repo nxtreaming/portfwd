@@ -137,6 +137,15 @@ int get_sockaddr_inx_pair(const char *pair, union sockaddr_inx *sa, bool is_udp)
         port = s_addr;
     }
 
+    if (port && *port) {
+        char *end;
+        long p = strtol(port, &end, 10);
+        if (end == port || *end != '\0' || p < 1 || p > 65535) {
+            P_LOG_ERR("Invalid port number '%s'. Must be between 1 and 65535.", port);
+            return -EINVAL;
+        }
+    }
+
     memset(&hints, 0, sizeof(struct addrinfo));
     hints.ai_family = AF_UNSPEC;
     /* Allow both numeric addresses and hostnames.

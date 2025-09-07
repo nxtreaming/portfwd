@@ -282,6 +282,16 @@ int get_sockaddr_inx(const char *str, union sockaddr_inx *addr, bool is_source) 
         }
     }
 
+    if (port_str && *port_str) {
+        char *end;
+        long p = strtol(port_str, &end, 10);
+        if (end == port_str || *end != '\0' || p < 1 || p > 65535) {
+            P_LOG_ERR("Invalid port number '%s'. Must be between 1 and 65535.", port_str);
+            free(dup);
+            return -1;
+        }
+    }
+
     if (strlen(host) == 0) {
         if (is_source) {
             host = "0.0.0.0";

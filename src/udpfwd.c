@@ -1611,11 +1611,6 @@ int main(int argc, char *argv[]) {
     if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0)
         return 1;
 
-    uint16_t dst_port = ntohs(*port_of_sockaddr(&g_cfg.dst_addr));
-    if (dst_port == 0) {
-        P_LOG_ERR("Destination port cannot be 0.");
-        return 1;
-    }
 
     openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
