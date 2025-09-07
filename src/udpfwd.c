@@ -726,6 +726,33 @@ static inline struct lru_cache *get_lru_cache_for_conn(const struct proxy_conn *
     return &g_lru_caches[hash & (NUM_LRU_SEGMENTS - 1)];
 }
 
+/* Aggregate stats from all per-CPU counters */
+static void aggregate_stats(struct per_cpu_stats *total) {
+    memset(total, 0, sizeof(*total));
+    for (int i = 0; i < g_num_cpus; i++) {
+        total->c2s_batch_socket_overflow += g_per_cpu_stats[i].c2s_batch_socket_overflow;
+        total->c2s_batch_entry_overflow += g_per_cpu_stats[i].c2s_batch_entry_overflow;
+        total->hash_collisions += g_per_cpu_stats[i].hash_collisions;
+        total->lru_immediate_updates += g_per_cpu_stats[i].lru_immediate_updates;
+        total->lru_deferred_updates += g_per_cpu_stats[i].lru_deferred_updates;
+    }
+}
+
+static void print_final_stats(void) {
+    P_LOG_INFO("Shutting down...");
+    if (g_per_cpu_stats) {
+        struct per_cpu_stats total_stats;
+        aggregate_stats(&total_stats);
+
+        P_LOG_INFO("Final Stats:");
+        P_LOG_INFO("  Batch Socket Overflows: %lu", (unsigned long)total_stats.c2s_batch_socket_overflow);
+        P_LOG_INFO("  Batch Entry Overflows:  %lu", (unsigned long)total_stats.c2s_batch_entry_overflow);
+        P_LOG_INFO("  Hash Collisions:        %lu", (unsigned long)total_stats.hash_collisions);
+        P_LOG_INFO("  LRU Immediate Updates:  %lu", (unsigned long)total_stats.lru_immediate_updates);
+        P_LOG_INFO("  LRU Deferred Updates:   %lu", (unsigned long)total_stats.lru_deferred_updates);
+    }
+}
+
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Update timestamp */
     time_t snap = atomic_load(&g_now_ts);
@@ -750,211 +777,6 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 #endif
 }
 
-/* Segmented LRU update to avoid O(N) scans - process only a subset of buckets
- * each time */
-static void segmented_update_lru(void) {
-#if ENABLE_LRU_LOCKS
-    time_t now = time(NULL);
-
-    /* Only update segments every 1 second to reduce overhead */
-    if (now - g_lru_segment_state.last_segment_update < 1) {
-        return;
-    }
-    g_lru_segment_state.last_segment_update = now;
-
-    /* Adjust buckets per segment based on total hash table size */
-    if (g_lru_segment_state.buckets_per_segment == 0) {
-        g_lru_segment_state.buckets_per_segment = (g_conn_tbl_hash_size / 32) + 1;
-        if (g_lru_segment_state.buckets_per_segment > 256) {
-            g_lru_segment_state.buckets_per_segment = 256;
-        }
-    }
-
-    pthread_mutex_lock(&g_lru_lock);
-
-    /* Process only a segment of buckets to spread the work over time */
-    unsigned start_bucket = g_lru_segment_state.next_bucket;
-    unsigned end_bucket = start_bucket + g_lru_segment_state.buckets_per_segment;
-    if (end_bucket > g_conn_tbl_hash_size) {
-        end_bucket = g_conn_tbl_hash_size;
-    }
-
-    for (unsigned i = start_bucket; i < end_bucket; i++) {
-        struct proxy_conn *conn, *tmp;
-#if ENABLE_FINE_GRAINED_LOCKS
-        pthread_spin_lock(&conn_tbl_locks[i]);
-#endif
-        list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
-            if (conn->needs_lru_update) {
-                list_del(&conn->lru);
-                list_add_tail(&conn->lru, &g_lru_list);
-                conn->needs_lru_update = false;
-            }
-        }
-#if ENABLE_FINE_GRAINED_LOCKS
-        pthread_spin_unlock(&conn_tbl_locks[i]);
-#endif
-    }
-
-    /* Update next segment start position */
-    g_lru_segment_state.next_bucket = end_bucket;
-    if (g_lru_segment_state.next_bucket >= g_conn_tbl_hash_size) {
-        g_lru_segment_state.next_bucket = 0; /* Wrap around */
-    }
-
-    pthread_mutex_unlock(&g_lru_lock);
-#endif
-}
-
-static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
-    struct list_head *chain = &conn_tbl_hbase[bucket_index_fun(cli_addr)];
-    struct proxy_conn *conn = NULL;
-    int svr_sock = -1;
-    struct epoll_event ev;
-    char s_addr[INET6_ADDRSTRLEN] = "";
-
-    list_for_each_entry(conn, chain, list) {
-        if (is_sockaddr_inx_equal(cli_addr, &conn->cli_addr)) {
-            proxy_conn_hold(conn);
-            touch_proxy_conn(conn);
-            return conn;
-        }
-    }
-
-    /* Check rate limits before creating new connection */
-    if (!check_rate_limit(cli_addr, 0)) {
-        /* Rate limit exceeded - drop the connection request */
-        return NULL;
-    }
-
-    /* Reserve a connection slot atomically to avoid races under contention */
-    bool reserved_slot = false;
-    unsigned current_conn_count;
-    for (;;) {
-        current_conn_count = atomic_load(&conn_tbl_len);
-        if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-            /* Try to make room first */
-            proxy_conn_walk_continue(epfd);
-            current_conn_count = atomic_load(&conn_tbl_len);
-            if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-                proxy_conn_evict_one(epfd);
-            }
-            /* Re-check after eviction */
-            current_conn_count = atomic_load(&conn_tbl_len);
-            if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-                inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
-                P_LOG_WARN("Conn table full (%u), dropping %s:%d", current_conn_count, s_addr,
-                           ntohs(*port_of_sockaddr(cli_addr)));
-                goto err;
-            }
-            /* Loop to attempt reservation after cleanup */
-            continue;
-        }
-        unsigned expected = current_conn_count;
-        if (atomic_compare_exchange_weak_explicit(&conn_tbl_len, &expected, current_conn_count + 1, memory_order_acq_rel, memory_order_acquire)) {
-            reserved_slot = true;
-            break; /* reserved successfully */
-        }
-        /* CAS failed due to concurrent change; retry */
-    }
-
-    /* High-water one-time warning at ~90% capacity */
-    static bool warned_high_water = false;
-    if (!warned_high_water && g_conn_pool.capacity > 0 &&
-        atomic_load(&conn_tbl_len) >= (unsigned)((g_conn_pool.capacity * 9) / 10)) {
-        P_LOG_WARN("UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or reducing -t.",
-                   atomic_load(&conn_tbl_len), (unsigned)g_conn_pool.capacity,
-                   (int)((atomic_load(&conn_tbl_len) * 100) / (unsigned)g_conn_pool.capacity));
-        warned_high_water = true;
-    }
-
-    /* ------------------------------------------ */
-    /* Establish the server-side connection */
-    if ((svr_sock = socket(g_cfg.dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
-        P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
-        goto err;
-    }
-    /* Connect to real server. */
-    if (connect(svr_sock, (struct sockaddr *)&g_cfg.dst_addr, sizeof_sockaddr(&g_cfg.dst_addr)) !=
-        0) {
-        /* Error occurs, drop the session. */
-        P_LOG_WARN("Connection failed: %s", strerror(errno));
-        goto err;
-    }
-    set_nonblock(svr_sock);
-
-    /* Allocate session data for the connection */
-    if (!(conn = init_proxy_conn(conn_pool_alloc(&g_conn_pool)))) {
-        P_LOG_ERR("conn_pool_alloc: failed");
-        goto err_unlock;
-    }
-    conn->svr_sock = svr_sock;
-    conn->cli_addr = *cli_addr;
-    INIT_LIST_HEAD(&conn->lru);
-
-    ev.data.ptr = conn;
-    ev.events = EPOLLIN;
-    if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
-        P_LOG_ERR("epoll_ctl(ADD, svr_sock): %s", strerror(errno));
-        /* conn_pool_release will be handled by the cleanup path */
-        goto err_unlock;
-    }
-    /* ------------------------------------------ */
-
-    /* Add to hash table with bucket lock */
-#if ENABLE_FINE_GRAINED_LOCKS
-    unsigned bucket = bucket_index_fun(cli_addr);
-    pthread_spin_lock(&conn_tbl_locks[bucket]);
-#endif
-    list_add_tail(&conn->list, chain);
-#if ENABLE_FINE_GRAINED_LOCKS
-    pthread_spin_unlock(&conn_tbl_locks[bucket]);
-#endif
-
-    /* Add to the appropriate LRU segment */
-#if ENABLE_LRU_LOCKS
-    struct lru_cache *cache = get_lru_cache_for_conn(conn);
-    pthread_mutex_lock(&cache->lock);
-    list_add_tail(&conn->lru, &cache->list);
-    pthread_mutex_unlock(&cache->lock);
-#endif
-
-    /* We already reserved the connection count via CAS earlier; read it for logging */
-    unsigned new_count = atomic_load(&conn_tbl_len);
-
-    /* Log new connections at DEBUG level to reduce overhead in high-connection
-     * scenarios */
-    /* Only log every 100th connection to avoid spam */
-    static _Atomic unsigned log_counter = 0;
-    unsigned current_count = atomic_fetch_add(&log_counter, 1);
-    if ((current_count % 100) == 0) {
-        inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
-        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every 100th)", s_addr,
-                   ntohs(*port_of_sockaddr(cli_addr)), new_count);
-    }
-
-    conn->last_active = monotonic_seconds();
-    return conn;
-
-err_unlock:
-    /* Centralized cleanup for new connection failures */
-    if (conn) {
-        conn_pool_release(&g_conn_pool, conn);
-        conn = NULL; /* Avoid double-free */
-    }
-    if (svr_sock >= 0) {
-        if (safe_close(svr_sock) < 0) {
-            P_LOG_WARN("close(svr_sock=%d): %s", svr_sock, strerror(errno));
-        }
-    }
-err:
-    /* Roll back reserved connection slot on failure */
-    if (reserved_slot) {
-        atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
-    }
-    return NULL;
-}
-
 /**
  * @brief Releases a proxy connection.
  *
@@ -962,14 +784,6 @@ err:
  * deregisters its socket from epoll, closes the server-side socket, and
  * returns the connection object to the memory pool.
  */
-static void release_proxy_conn(struct proxy_conn *conn, int epfd);
-
-static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
-    if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) == 1) {
-        release_proxy_conn(conn, epfd);
-    }
-}
-
 static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     if (!conn) {
         P_LOG_WARN("Attempted to release NULL connection");
@@ -1249,7 +1063,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                              * don't queue in userspace */
                             /* This is more efficient than copying data to
                              * userspace queues */
-                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, remaining);
+                            g_per_cpu_stats[sched_getcpu()].c2s_batch_socket_overflow++;
                             break;
                         }
                         P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, "
@@ -1264,8 +1078,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     }
                     if (sent < remaining) {
                         /* Partial send - log for debugging */
-                        P_LOG_INFO("sendmmsg(server) partial: sent=%d, remaining=%d", sent,
-                                   remaining);
+                        P_LOG_INFO("sendmmsg(server) partial: sent=%d, remaining=%d", sent, remaining);
                     }
                     remaining -= sent;
                     msgp += sent;
@@ -1849,8 +1662,6 @@ int main(int argc, char *argv[]) {
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= 2) {
             proxy_conn_walk_continue(epfd);
-            /* Segmented LRU update to reduce per-packet overhead */
-            segmented_update_lru();
             /* Process any queued backpressure packets */
 #if ENABLE_BACKPRESSURE_QUEUE
             process_backpressure_queue();
@@ -1929,7 +1740,6 @@ cleanup:
     free(conn_tbl_hbase);
     conn_tbl_hbase = NULL;
     conn_pool_destroy(&g_conn_pool);
-    destroy_rate_limiter();
 #if ENABLE_BACKPRESSURE_QUEUE
     destroy_backpressure_queue();
 #endif
@@ -1937,28 +1747,8 @@ cleanup:
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
 #endif
 
-    /* Print performance statistics */
-    uint64_t socket_overflows = atomic_load(&g_stat_c2s_batch_socket_overflow);
-    uint64_t entry_overflows = atomic_load(&g_stat_c2s_batch_entry_overflow);
-    uint64_t hash_collisions = atomic_load(&g_stat_hash_collisions);
-    uint64_t lru_immediate = atomic_load(&g_stat_lru_immediate_updates);
-    uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates);
+    print_final_stats();
 
-    P_LOG_INFO("Performance statistics:");
-    P_LOG_INFO("  Batch overflows: sockets=%" PRIu64 ", entries=%" PRIu64, socket_overflows,
-               entry_overflows);
-    P_LOG_INFO("  Hash collisions: %" PRIu64, hash_collisions);
-    P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64, lru_immediate,
-               lru_deferred);
-
-    if (socket_overflows > 0) {
-        P_LOG_WARN("Consider increasing -B (batch size) or -C (max "
-                   "connections) if overflows are high");
-    }
-    if (hash_collisions > socket_overflows * 10) {
-        P_LOG_WARN("High hash collision rate detected, consider adjusting hash "
-                   "table size");
-    }
     closelog();
 
     return rc;
