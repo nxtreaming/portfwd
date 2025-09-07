@@ -542,13 +542,10 @@ static void adjust_batch_size(void) {
             /* High utilization - increase batch size */
             if (g_adaptive_batch.current_size < g_adaptive_batch.max_size) {
                 unsigned long new_size = (unsigned long)g_adaptive_batch.current_size * 12 / 10; /* BATCH_INCREASE_FACTOR 1.2 */
-                if (new_size > g_adaptive_batch.max_size) {
+                if (new_size > (unsigned long)g_adaptive_batch.max_size) {
                     new_size = g_adaptive_batch.max_size;
                 }
                 g_adaptive_batch.current_size = (int)new_size;
-                if (g_adaptive_batch.current_size > g_adaptive_batch.max_size) {
-                    g_adaptive_batch.current_size = g_adaptive_batch.max_size;
-                }
                 P_LOG_INFO("Increased batch size to %d (avg=%.1f)", g_adaptive_batch.current_size,
                            avg_batch_size);
             }
@@ -556,13 +553,10 @@ static void adjust_batch_size(void) {
             /* Low utilization - decrease batch size */
             if (g_adaptive_batch.current_size > g_adaptive_batch.min_size) {
                 unsigned long new_size = (unsigned long)g_adaptive_batch.current_size * 8 / 10; /* BATCH_DECREASE_FACTOR 0.8 */
-                if (new_size < g_adaptive_batch.min_size) {
+                if (new_size < (unsigned long)g_adaptive_batch.min_size) {
                     new_size = g_adaptive_batch.min_size;
                 }
                 g_adaptive_batch.current_size = (int)new_size;
-                if (g_adaptive_batch.current_size < g_adaptive_batch.min_size) {
-                    g_adaptive_batch.current_size = g_adaptive_batch.min_size;
-                }
                 P_LOG_INFO("Decreased batch size to %d (avg=%.1f)", g_adaptive_batch.current_size,
                            avg_batch_size);
             }
