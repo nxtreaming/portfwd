@@ -770,8 +770,6 @@ static void segmented_update_lru(void) {
         }
     }
 
-    pthread_mutex_lock(&g_lru_lock);
-
     /* Process only a segment of buckets to spread the work over time */
     unsigned start_bucket = g_lru_segment_state.next_bucket;
     unsigned end_bucket = start_bucket + g_lru_segment_state.buckets_per_segment;
@@ -781,15 +779,24 @@ static void segmented_update_lru(void) {
 
     for (unsigned i = start_bucket; i < end_bucket; i++) {
         struct proxy_conn *conn, *tmp;
+        bool took_lru_lock = false;
 #if ENABLE_FINE_GRAINED_LOCKS
         pthread_spin_lock(&conn_tbl_locks[i]);
 #endif
         list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
             if (conn->needs_lru_update) {
+                if (!took_lru_lock) {
+                    /* lock order: bucket -> LRU to avoid deadlock with release path */
+                    pthread_mutex_lock(&g_lru_lock);
+                    took_lru_lock = true;
+                }
                 list_del(&conn->lru);
                 list_add_tail(&conn->lru, &g_lru_list);
                 conn->needs_lru_update = false;
             }
+        }
+        if (took_lru_lock) {
+            pthread_mutex_unlock(&g_lru_lock);
         }
 #if ENABLE_FINE_GRAINED_LOCKS
         pthread_spin_unlock(&conn_tbl_locks[i]);
@@ -801,8 +808,6 @@ static void segmented_update_lru(void) {
     if (g_lru_segment_state.next_bucket >= g_conn_tbl_hash_size) {
         g_lru_segment_state.next_bucket = 0; /* Wrap around */
     }
-
-    pthread_mutex_unlock(&g_lru_lock);
 #endif
 }
 
