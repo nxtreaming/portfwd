@@ -63,8 +63,6 @@
 /* Adaptive batch sizing thresholds - less aggressive */
 #define BATCH_HIGH_UTILIZATION_RATIO 0.9 /* Increased from 0.8 */
 #define BATCH_LOW_UTILIZATION_RATIO 0.1  /* Decreased from 0.3 */
-#define BATCH_INCREASE_FACTOR 1.2        /* Reduced from 1.5 */
-#define BATCH_DECREASE_FACTOR 0.8        /* Reduced from 0.67 */
 
 #define BATCH_HASH_SIZE 4096
 
@@ -130,6 +128,12 @@
 /* Max safe UDP payload size: 65535 - 8 (UDP header) - 20 (IPv4 header) */
 #define UDP_PROXY_DGRAM_CAP 65507
 #endif
+
+/* Compile-time validation of UDP_PROXY_DGRAM_CAP */
+#if (UDP_PROXY_DGRAM_CAP <= 0) || (UDP_PROXY_DGRAM_CAP > 65507)
+#error "UDP_PROXY_DGRAM_CAP must be between 1 and 65507."
+#endif
+
 #endif
 
 /* Connection pool size */
@@ -306,6 +310,10 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
 #if ENABLE_RATE_LIMITING
 /* Simple hash function for IP addresses */
 static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
+    if (addr->sa.sa_family != AF_INET && addr->sa.sa_family != AF_INET6) {
+        P_LOG_WARN("Unsupported address family: %d", addr->sa.sa_family);
+        return 0;
+    }
     if (addr->sa.sa_family == AF_INET) {
         return ntohl(addr->sin.sin_addr.s_addr) % RATE_LIMIT_HASH_SIZE;
     } else if (addr->sa.sa_family == AF_INET6) {
@@ -315,6 +323,19 @@ static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
     return 0;
 }
 #endif
+
+/* Initialize rate limiter */
+static int init_rate_limiter(unsigned max_per_ip, unsigned max_pps, unsigned max_bps) {
+    memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
+    if (pthread_mutex_init(&g_rate_limiter.lock, NULL) != 0) {
+        P_LOG_ERR("Failed to initialize rate limiter mutex");
+        return -1;
+    }
+    g_rate_limiter.max_per_ip = max_per_ip;
+    g_rate_limiter.max_pps = max_pps;
+    g_rate_limiter.max_bps = max_bps;
+    return 0;
+}
 
 /* Destroy rate limiter */
 static void destroy_rate_limiter(void) {
@@ -520,8 +541,11 @@ static void adjust_batch_size(void) {
         if (avg_batch_size > g_adaptive_batch.current_size * BATCH_HIGH_UTILIZATION_RATIO) {
             /* High utilization - increase batch size */
             if (g_adaptive_batch.current_size < g_adaptive_batch.max_size) {
-                g_adaptive_batch.current_size =
-                    (int)(g_adaptive_batch.current_size * BATCH_INCREASE_FACTOR);
+                unsigned long new_size = (unsigned long)g_adaptive_batch.current_size * 12 / 10; /* BATCH_INCREASE_FACTOR 1.2 */
+                if (new_size > g_adaptive_batch.max_size) {
+                    new_size = g_adaptive_batch.max_size;
+                }
+                g_adaptive_batch.current_size = (int)new_size;
                 if (g_adaptive_batch.current_size > g_adaptive_batch.max_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.max_size;
                 }
@@ -531,8 +555,11 @@ static void adjust_batch_size(void) {
         } else if (avg_batch_size < g_adaptive_batch.current_size * BATCH_LOW_UTILIZATION_RATIO) {
             /* Low utilization - decrease batch size */
             if (g_adaptive_batch.current_size > g_adaptive_batch.min_size) {
-                g_adaptive_batch.current_size =
-                    (int)(g_adaptive_batch.current_size * BATCH_DECREASE_FACTOR);
+                unsigned long new_size = (unsigned long)g_adaptive_batch.current_size * 8 / 10; /* BATCH_DECREASE_FACTOR 0.8 */
+                if (new_size < g_adaptive_batch.min_size) {
+                    new_size = g_adaptive_batch.min_size;
+                }
+                g_adaptive_batch.current_size = (int)new_size;
                 if (g_adaptive_batch.current_size < g_adaptive_batch.min_size) {
                     g_adaptive_batch.current_size = g_adaptive_batch.min_size;
                 }
@@ -576,6 +603,11 @@ static void record_batch_stats(int packets_in_batch) {
 static uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
     uint32_t hash = 0;
 
+    if (sa->sa.sa_family != AF_INET && sa->sa.sa_family != AF_INET6) {
+        P_LOG_WARN("Unsupported address family: %d", sa->sa.sa_family);
+        return 0;
+    }
+
     if (sa->sa.sa_family == AF_INET) {
         /* Use FNV-1a hash for better distribution */
         const uint32_t FNV_PRIME = FNV_PRIME_32;
@@ -616,6 +648,12 @@ static inline bool is_power_of_two(unsigned v) {
  * @param conn A pointer to the connection object from the pool.
  * @return The initialized connection object, or NULL on failure.
  */
+static inline void proxy_conn_hold(struct proxy_conn *conn) {
+    atomic_fetch_add_explicit(&conn->ref_count, 1, memory_order_relaxed);
+}
+
+static void proxy_conn_put(struct proxy_conn *conn, int epfd);
+
 static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
     if (!conn) {
         return NULL;
@@ -623,6 +661,7 @@ static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
 
     /* Zero out the memory and set default values */
     memset(conn, 0, sizeof(*conn));
+    atomic_init(&conn->ref_count, 1);
     conn->svr_sock = -1;
     /* Initialize other fields as needed */
 
@@ -741,10 +780,11 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     struct proxy_conn *conn = NULL;
     int svr_sock = -1;
     struct epoll_event ev;
-    char s_addr[50] = "";
+    char s_addr[INET6_ADDRSTRLEN] = "";
 
     list_for_each_entry(conn, chain, list) {
         if (is_sockaddr_inx_equal(cli_addr, &conn->cli_addr)) {
+            proxy_conn_hold(conn);
             touch_proxy_conn(conn);
             return conn;
         }
@@ -780,7 +820,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
             continue;
         }
         unsigned expected = current_conn_count;
-        if (atomic_compare_exchange_weak(&conn_tbl_len, &expected, current_conn_count + 1)) {
+        if (atomic_compare_exchange_weak_explicit(&conn_tbl_len, &expected, current_conn_count + 1, memory_order_acq_rel, memory_order_acquire)) {
             reserved_slot = true;
             break; /* reserved successfully */
         }
@@ -826,8 +866,8 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     ev.events = EPOLLIN;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
         P_LOG_ERR("epoll_ctl(ADD, svr_sock): %s", strerror(errno));
-        conn_pool_release(&g_conn_pool, conn);
-        goto err;
+        /* conn_pool_release will be handled by the cleanup path */
+        goto err_unlock;
     }
     /* ------------------------------------------ */
 
@@ -868,6 +908,11 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     return conn;
 
 err_unlock:
+    /* Centralized cleanup for new connection failures */
+    if (conn) {
+        conn_pool_release(&g_conn_pool, conn);
+        conn = NULL; /* Avoid double-free */
+    }
     if (svr_sock >= 0) {
         if (safe_close(svr_sock) < 0) {
             P_LOG_WARN("close(svr_sock=%d): %s", svr_sock, strerror(errno));
@@ -876,10 +921,8 @@ err_unlock:
 err:
     /* Roll back reserved connection slot on failure */
     if (reserved_slot) {
-        atomic_fetch_sub(&conn_tbl_len, 1);
+        atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
     }
-    if (conn)
-        conn_pool_release(&g_conn_pool, conn);
     return NULL;
 }
 
@@ -890,6 +933,14 @@ err:
  * deregisters its socket from epoll, closes the server-side socket, and
  * returns the connection object to the memory pool.
  */
+static void release_proxy_conn(struct proxy_conn *conn, int epfd);
+
+static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
+    if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) == 1) {
+        release_proxy_conn(conn, epfd);
+    }
+}
+
 static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     if (!conn) {
         P_LOG_WARN("Attempted to release NULL connection");
@@ -907,7 +958,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
 #endif
 
     /* Update global connection count atomically */
-    atomic_fetch_sub(&conn_tbl_len, 1);
+    atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
 
     /* Remove from LRU list with global LRU lock */
 #if ENABLE_LRU_LOCKS
@@ -970,10 +1021,10 @@ static void proxy_conn_walk_continue(int epfd) {
 
     /* Reap the collected connections without holding the global LRU lock */
     list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
-        char s_addr[50] = "";
+        char s_addr[INET6_ADDRSTRLEN] = "";
         union sockaddr_inx addr = conn->cli_addr;
 
-        release_proxy_conn(conn, epfd);
+        proxy_conn_put(conn, epfd);
         inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
         P_LOG_INFO("Recycled %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
                    atomic_load(&conn_tbl_len));
@@ -990,12 +1041,12 @@ static bool proxy_conn_evict_one(int epfd) {
 
     struct proxy_conn *oldest = list_first_entry(&g_lru_list, struct proxy_conn, lru);
     union sockaddr_inx addr = oldest->cli_addr;
-    char s_addr[50] = "";
+    char s_addr[INET6_ADDRSTRLEN] = "";
 
     /* Unlock before calling release_proxy_conn to avoid deadlock */
     pthread_mutex_unlock(&g_lru_lock);
 
-    release_proxy_conn(oldest, epfd);
+    proxy_conn_put(oldest, epfd);
     inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
     P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
                atomic_load(&conn_tbl_len));
@@ -1265,7 +1316,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
                 }
                 P_LOG_WARN("recvmmsg(server): %s", strerror(errno));
                 /* fatal error on server socket: close session */
-                release_proxy_conn(conn, epfd);
+                proxy_conn_put(conn, epfd);
             }
             return;
         }
@@ -1320,7 +1371,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
                 break; /* drained */
             P_LOG_WARN("recv(server): %s", strerror(errno));
             /* fatal error on server socket: close session */
-            release_proxy_conn(conn, epfd);
+            proxy_conn_put(conn, epfd);
             break;
         }
 
@@ -1566,6 +1617,12 @@ int main(int argc, char *argv[]) {
     if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0)
         return 1;
 
+    uint16_t dst_port = ntohs(*port_of_sockaddr(&g_cfg.dst_addr));
+    if (dst_port == 0) {
+        P_LOG_ERR("Destination port cannot be 0.");
+        return 1;
+    }
+
     openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
     if (g_cfg.daemonize) {
@@ -1673,6 +1730,10 @@ int main(int argc, char *argv[]) {
     for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
         if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) != 0) {
             P_LOG_ERR("pthread_spin_init(lock %d): failed", i);
+            /* Clean up already initialized spinlocks */
+            for (int j = 0; j < i; j++) {
+                pthread_spin_destroy(&conn_tbl_locks[j]);
+            }
             rc = 1;
             goto cleanup;
         }
@@ -1686,6 +1747,12 @@ int main(int argc, char *argv[]) {
 #ifdef __linux__
     init_batching_resources(&c_msgs, &c_iov, &c_addrs, &c_bufs, &s_msgs, &s_iovs);
 #endif
+
+    if (init_rate_limiter(g_cfg.max_per_ip_connections, 0, 0) != 0) {
+        P_LOG_ERR("Failed to initialize rate limiter");
+        rc = 1;
+        goto cleanup;
+    }
 
     /* epoll loop */
     ev.data.ptr = &magic_listener;
@@ -1756,7 +1823,7 @@ int main(int argc, char *argv[]) {
                 conn = evp->data.ptr;
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
                     /* fatal on this flow: release session */
-                    release_proxy_conn(conn, epfd);
+                    proxy_conn_put(conn, epfd);
                     continue;
                 }
                 handle_server_data(conn, listen_sock, epfd);
