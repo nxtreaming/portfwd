@@ -84,7 +84,6 @@
 #define ENABLE_STATS_ATOMICS 1
 #endif
 
-
 #ifndef DISABLE_PACKET_VALIDATION
 #define ENABLE_PACKET_VALIDATION 1
 #else
@@ -384,7 +383,6 @@ static inline void rate_limiter_dec_conn(const union sockaddr_inx *addr) {
     (void)addr;
 #endif
 }
-
 
 /* Destroy rate limiter */
 static void destroy_rate_limiter(void) {
@@ -873,7 +871,6 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         warned_high_water = true;
     }
 
-
     /* ------------------------------------------ */
     /* Establish the server-side connection */
     if ((svr_sock = socket(g_cfg.dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
@@ -972,14 +969,6 @@ err:
  * deregisters its socket from epoll, closes the server-side socket, and
  * returns the connection object to the memory pool.
  */
-static void release_proxy_conn(struct proxy_conn *conn, int epfd);
-
-static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
-    if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) == 1) {
-        release_proxy_conn(conn, epfd);
-    }
-}
-
 static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     if (!conn) {
         P_LOG_WARN("Attempted to release NULL connection");
@@ -1027,6 +1016,12 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     }
 
     conn_pool_release(&g_conn_pool, conn);
+}
+
+static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
+    if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) == 1) {
+        release_proxy_conn(conn, epfd);
+    }
 }
 
 static void proxy_conn_walk_continue(int epfd) {
@@ -1685,7 +1680,6 @@ int main(int argc, char *argv[]) {
         return 1;
     if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0)
         return 1;
-
 
     openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
