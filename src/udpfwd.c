@@ -155,7 +155,7 @@ struct rate_limit_entry {
 
 struct rate_limiter {
     struct rate_limit_entry entries[RATE_LIMIT_HASH_SIZE];
-    pthread_mutex_t lock;
+    pthread_mutex_t bucket_locks[RATE_LIMIT_HASH_SIZE];
     unsigned max_pps;
     unsigned max_bps;
     unsigned max_per_ip;
@@ -327,9 +327,15 @@ static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
 /* Initialize rate limiter */
 static int init_rate_limiter(unsigned max_per_ip, unsigned max_pps, unsigned max_bps) {
     memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
-    if (pthread_mutex_init(&g_rate_limiter.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize rate limiter mutex");
-        return -1;
+    for (unsigned i = 0; i < RATE_LIMIT_HASH_SIZE; ++i) {
+        if (pthread_mutex_init(&g_rate_limiter.bucket_locks[i], NULL) != 0) {
+            P_LOG_ERR("Failed to initialize rate limiter bucket mutex %u", i);
+            /* Roll back already initialized locks */
+            for (unsigned j = 0; j < i; ++j) {
+                pthread_mutex_destroy(&g_rate_limiter.bucket_locks[j]);
+            }
+            return -1;
+        }
     }
     g_rate_limiter.max_per_ip = max_per_ip;
     g_rate_limiter.max_pps = max_pps;
@@ -337,9 +343,48 @@ static int init_rate_limiter(unsigned max_per_ip, unsigned max_pps, unsigned max
     return 0;
 }
 
+/* Update connection_count in rate limiter for a given client address */
+static inline void rate_limiter_inc_conn(const union sockaddr_inx *addr) {
+#if ENABLE_RATE_LIMITING
+    uint32_t hash = addr_hash_for_rate_limit(addr);
+    pthread_mutex_t *lock = &g_rate_limiter.bucket_locks[hash];
+    pthread_mutex_lock(lock);
+    struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
+    if (entry->packet_count > 0 && !is_sockaddr_inx_equal(&entry->addr, addr)) {
+        memset(entry, 0, sizeof(*entry));
+    }
+    if (entry->packet_count == 0) {
+        entry->addr = *addr;
+        entry->window_start = atomic_load(&g_now_ts);
+    }
+    entry->connection_count++;
+    pthread_mutex_unlock(lock);
+#else
+    (void)addr;
+#endif
+}
+
+static inline void rate_limiter_dec_conn(const union sockaddr_inx *addr) {
+#if ENABLE_RATE_LIMITING
+    uint32_t hash = addr_hash_for_rate_limit(addr);
+    pthread_mutex_t *lock = &g_rate_limiter.bucket_locks[hash];
+    pthread_mutex_lock(lock);
+    struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
+    if (entry->packet_count > 0 && is_sockaddr_inx_equal(&entry->addr, addr)) {
+        if (entry->connection_count > 0) entry->connection_count--;
+    }
+    pthread_mutex_unlock(lock);
+#else
+    (void)addr;
+#endif
+}
+
+
 /* Destroy rate limiter */
 static void destroy_rate_limiter(void) {
-    pthread_mutex_destroy(&g_rate_limiter.lock);
+    for (unsigned i = 0; i < RATE_LIMIT_HASH_SIZE; ++i) {
+        pthread_mutex_destroy(&g_rate_limiter.bucket_locks[i]);
+    }
     memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
 }
 
@@ -355,9 +400,10 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
         return true; /* No limits configured */
     }
 
-    pthread_mutex_lock(&g_rate_limiter.lock);
-
     uint32_t hash = addr_hash_for_rate_limit(addr);
+    pthread_mutex_t *lock = &g_rate_limiter.bucket_locks[hash];
+    pthread_mutex_lock(lock);
+
     struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
     /* Use cached timestamp to avoid frequent time() syscalls */
     time_t now = atomic_load(&g_now_ts);
@@ -377,13 +423,13 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
         entry->packet_count = 1;
         entry->byte_count = packet_size;
         entry->window_start = now;
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+        pthread_mutex_unlock(lock);
         return true;
     }
 
     /* Check packet rate limit */
     if (g_rate_limiter.max_pps > 0 && entry->packet_count >= g_rate_limiter.max_pps) {
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+        pthread_mutex_unlock(lock);
         P_LOG_WARN("Packet rate limit exceeded for %s (%lu pps)", sockaddr_to_string(addr),
                    entry->packet_count);
         return false;
@@ -391,7 +437,7 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
 
     /* Check byte rate limit */
     if (g_rate_limiter.max_bps > 0 && entry->byte_count + packet_size > g_rate_limiter.max_bps) {
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+        pthread_mutex_unlock(lock);
         P_LOG_WARN("Byte rate limit exceeded for %s (%lu bps)", sockaddr_to_string(addr),
                    entry->byte_count);
         return false;
@@ -399,7 +445,7 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
 
     /* Check per-IP connection limit */
     if (g_rate_limiter.max_per_ip > 0 && entry->connection_count >= g_rate_limiter.max_per_ip) {
-        pthread_mutex_unlock(&g_rate_limiter.lock);
+        pthread_mutex_unlock(lock);
         P_LOG_WARN("Per-IP connection limit exceeded for %s (%u connections)",
                    sockaddr_to_string(addr), entry->connection_count);
         return false;
@@ -409,7 +455,7 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
     entry->packet_count++;
     entry->byte_count += packet_size;
 
-    pthread_mutex_unlock(&g_rate_limiter.lock);
+    pthread_mutex_unlock(lock);
     return true;
 #endif
 }
@@ -884,6 +930,9 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     pthread_mutex_unlock(&g_lru_lock);
 #endif
 
+    /* Update per-IP connection count for rate limiting */
+    rate_limiter_inc_conn(cli_addr);
+
     /* We already reserved the connection count via CAS earlier; read it for logging */
     unsigned new_count = atomic_load(&conn_tbl_len);
 
@@ -950,6 +999,9 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
 #if ENABLE_FINE_GRAINED_LOCKS
     pthread_spin_unlock(&conn_tbl_locks[bucket]);
 #endif
+
+    /* Update per-IP connection count for rate limiting */
+    rate_limiter_dec_conn(&conn->cli_addr);
 
     /* Update global connection count atomically */
     atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
