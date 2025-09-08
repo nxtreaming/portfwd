@@ -49,7 +49,7 @@
 
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
-#define DEFAULT_HASH_TABLE_SIZE 65537 /* Larger prime number for better distribution */
+#define DEFAULT_HASH_TABLE_SIZE 4096  /* Power-of-two for fast bitwise indexing; sized ~ max conns */
 #define MIN_BATCH_SIZE 64             /* Increased from 4 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
 #define BATCH_ADJUST_INTERVAL_SEC 30 /* Reduced frequency from 5 to 30 seconds */
@@ -64,7 +64,7 @@
 #define BATCH_HIGH_UTILIZATION_RATIO 0.9 /* Increased from 0.8 */
 #define BATCH_LOW_UTILIZATION_RATIO 0.1  /* Decreased from 0.3 */
 
-#define BATCH_HASH_SIZE 4096
+#define BATCH_HASH_SIZE 2048
 
 /* Performance optimization flags */
 #ifndef DISABLE_ADAPTIVE_BATCHING
@@ -109,11 +109,6 @@
 #define ENABLE_BACKPRESSURE_QUEUE 0
 #endif
 
-/* Batch processing limits - decouple max batches from per-batch message limit
- */
-/* Maximum number of concurrent server sockets in one batch cycle */
-#define MAX_CONCURRENT_BATCHES 1024
-
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
 
@@ -129,6 +124,10 @@
 /* Increased from 16 for much better performance */
 #define UDP_PROXY_BATCH_SZ 64
 #endif
+
+/* Maximum number of concurrent server sockets in one batch cycle */
+#define MAX_CONCURRENT_BATCHES UDP_PROXY_BATCH_SZ
+
 #ifndef UDP_PROXY_DGRAM_CAP
 /* Max safe UDP payload size: 1500 - 8 (UDP header) - 20 (IPv4 header) */
 #define UDP_PROXY_DGRAM_CAP 1472 /* 1500 MTU - 20 IPv4 - 8 UDP */
@@ -143,7 +142,7 @@
 
 /* Connection pool size */
 #ifndef UDP_PROXY_MAX_CONNS
-#define UDP_PROXY_MAX_CONNS 4096
+#define UDP_PROXY_MAX_CONNS 2048
 #endif
 
 /**
