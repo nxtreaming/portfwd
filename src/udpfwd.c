@@ -111,6 +111,17 @@
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
+/* Event loop timeout (ms) */
+#define EPOLL_WAIT_TIMEOUT_MS 2000
+/* Fairness caps to avoid starving other fds per wake */
+#define CLIENT_MAX_ITERATIONS 64
+#define SERVER_MAX_ITERATIONS 64
+/* Maintenance tick interval (seconds) */
+#define MAINT_INTERVAL_SEC 2
+/* LRU segmented update interval (seconds) */
+#define LRU_UPDATE_INTERVAL_SEC 1
+/* Cap for LRU segmented processing per tick */
+#define LRU_MAX_BUCKETS_PER_SEGMENT 256
 
 /* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
@@ -357,7 +368,7 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
 
 #if ENABLE_RATE_LIMITING
 /* Simple hash function for IP addresses */
-static uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
+static inline uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
     if (addr->sa.sa_family != AF_INET && addr->sa.sa_family != AF_INET6) {
         P_LOG_WARN("Unsupported address family: %d", addr->sa.sa_family);
         return 0;
@@ -403,7 +414,7 @@ static inline void rate_limiter_inc_conn(const union sockaddr_inx *addr) {
     }
     if (entry->packet_count == 0) {
         entry->addr = *addr;
-        entry->window_start = atomic_load(&g_now_ts);
+        entry->window_start = cached_now_seconds();
     }
     entry->connection_count++;
     pthread_mutex_unlock(lock);
@@ -453,10 +464,7 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
 
     struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
     /* Use cached timestamp to avoid frequent time() syscalls */
-    time_t now = atomic_load(&g_now_ts);
-    if (now == 0) {
-        now = time(NULL);
-    }
+    time_t now = cached_now_seconds();
 
     /* Check if this is the same IP or a hash collision */
     if (entry->packet_count > 0 && !is_sockaddr_inx_equal(&entry->addr, addr)) {
@@ -465,7 +473,7 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
     }
 
     /* Initialize or reset time window */
-    if (entry->packet_count == 0 || now - entry->window_start >= 1) {
+    if (entry->packet_count == 0 || now - entry->window_start >= RATE_LIMIT_WINDOW_SEC) {
         entry->addr = *addr;
         entry->packet_count = 1;
         entry->byte_count = packet_size;
@@ -697,7 +705,7 @@ static void record_batch_stats(int packets_in_batch) {
 #endif
 
 /* Improved hash function with better distribution */
-static uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
+static inline uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
     uint32_t hash = 0;
 
     if (sa->sa.sa_family != AF_INET && sa->sa.sa_family != AF_INET6) {
@@ -766,26 +774,24 @@ static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
 }
 
 /* Bucket index strategies (selected once at init) */
-static unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa) {
+static inline unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h & (g_conn_tbl_hash_size - 1);
 }
 
-static unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
+static inline unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h % g_conn_tbl_hash_size;
 }
 
-static uint32_t hash_addr(const union sockaddr_inx *a) {
+static inline uint32_t hash_addr(const union sockaddr_inx *a) {
     /* Use the improved hash function for better distribution */
     return improved_hash_addr(a);
 }
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Update timestamp only; defer LRU updates to periodic maintenance */
-    time_t snap = atomic_load(&g_now_ts);
-    time_t new_time = snap ? snap : monotonic_seconds();
-    conn->last_active = new_time;
+    conn->last_active = cached_now_seconds();
 #if ENABLE_LRU_LOCKS
     conn->needs_lru_update = true;
 #endif
@@ -798,7 +804,7 @@ static void segmented_update_lru(void) {
     time_t now = time(NULL);
 
     /* Only update segments every 1 second to reduce overhead */
-    if (now - g_lru_segment_state.last_segment_update < 1) {
+    if (now - g_lru_segment_state.last_segment_update < LRU_UPDATE_INTERVAL_SEC) {
         return;
     }
     g_lru_segment_state.last_segment_update = now;
@@ -806,8 +812,8 @@ static void segmented_update_lru(void) {
     /* Adjust buckets per segment based on total hash table size */
     if (g_lru_segment_state.buckets_per_segment == 0) {
         g_lru_segment_state.buckets_per_segment = (g_conn_tbl_hash_size / 32) + 1;
-        if (g_lru_segment_state.buckets_per_segment > 256) {
-            g_lru_segment_state.buckets_per_segment = 256;
+        if (g_lru_segment_state.buckets_per_segment > LRU_MAX_BUCKETS_PER_SEGMENT) {
+            g_lru_segment_state.buckets_per_segment = LRU_MAX_BUCKETS_PER_SEGMENT;
         }
     }
 
@@ -983,7 +989,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
                    ntohs(*port_of_sockaddr(cli_addr)), new_count);
     }
 
-    conn->last_active = monotonic_seconds();
+    conn->last_active = cached_now_seconds();
     return conn;
 
 err_unlock:
@@ -1144,7 +1150,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
     if (c_msgs && s_msgs) {
         /* Drain multiple batches per epoll wake to reduce syscalls */
         int iterations = 0;
-        const int max_iterations = 64; /* fairness cap per tick */
+        const int max_iterations = CLIENT_MAX_ITERATIONS; /* fairness cap per tick */
         const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
         for (; iterations < max_iterations; iterations++) {
             /* Ensure namelen is reset before each recvmmsg call */
@@ -1371,7 +1377,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
     }
 
     int iterations = 0;
-    const int max_iterations = 64; /* fairness cap per event */
+    const int max_iterations = SERVER_MAX_ITERATIONS; /* fairness cap per event */
     const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
 
     for (; iterations < max_iterations; iterations++) {
@@ -1858,7 +1864,7 @@ int main(int argc, char *argv[]) {
         time_t current_ts = monotonic_seconds();
 
         /* Periodic timeout check and connection recycling */
-        if ((long)(current_ts - last_check) >= 2) {
+        if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
             proxy_conn_walk_continue(epfd);
             /* Segmented LRU update to reduce per-packet overhead */
             segmented_update_lru();
@@ -1873,7 +1879,7 @@ int main(int argc, char *argv[]) {
         atomic_store(&g_now_ts, current_ts);
 
         /* Wait for events */
-        nfds = epoll_wait(epfd, events, countof(events), 1000 * 2);
+        nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
         if (nfds == 0)
             continue;
         if (nfds < 0) {
