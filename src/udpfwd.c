@@ -291,6 +291,15 @@ static inline time_t monotonic_seconds(void) {
     return time(NULL);
 }
 
+/* Load cached time with monotonic fallback for hot paths */
+static inline time_t cached_now_seconds(void) {
+    time_t now = atomic_load(&g_now_ts);
+    if (now == 0) {
+        now = monotonic_seconds();
+    }
+    return now;
+}
+
 static int safe_close(int fd) {
     if (fd < 0)
         return 0;
@@ -300,6 +309,41 @@ static int safe_close(int fd) {
         if (errno == EINTR)
             continue;
         return -1;
+    }
+}
+ 
+/* Returns true if errno indicates a transient, non-fatal condition. */
+static inline bool is_wouldblock(int e) {
+    return e == EAGAIN || e == EWOULDBLOCK;
+}
+
+static inline bool is_temporary_errno(int e) {
+    return e == EINTR || is_wouldblock(e);
+}
+
+/* Align up to a given power-of-two alignment (e.g., 64). */
+static inline size_t align_up(size_t n, size_t align) {
+    return (n + (align - 1)) & ~(align - 1);
+}
+
+/* Log helper for unexpected (non-transient) errno after a failed syscall */
+static inline void log_if_unexpected_errno(const char *what) {
+    int e = errno;
+    if (!is_temporary_errno(e)) {
+        P_LOG_WARN("%s: %s", what, strerror(e));
+    }
+}
+
+/* Prepare an iovec array from a list of message indices (helper for batching). */
+static inline void fill_iov_from_batch(const struct mmsghdr *c_msgs,
+                                       char (*c_bufs)[UDP_PROXY_DGRAM_CAP],
+                                       const int *msg_indices,
+                                       int count,
+                                       struct iovec *out_iovs) {
+    for (int k = 0; k < count; k++) {
+        const int msg_idx = msg_indices[k];
+        out_iovs[k].iov_base = c_bufs[msg_idx];
+        out_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
     }
 }
 
@@ -552,7 +596,7 @@ static void process_backpressure_queue(void) {
         }
 
         if (sent < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (is_wouldblock(errno)) {
                 /* Still blocked, stop processing */
                 break;
             }
@@ -1024,10 +1068,7 @@ static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
 }
 
 static void proxy_conn_walk_continue(int epfd) {
-    time_t now = atomic_load(&g_now_ts);
-    if (now == 0) {
-        now = monotonic_seconds();
-    }
+    time_t now = cached_now_seconds();
 
     pthread_mutex_lock(&g_lru_lock);
     if (list_empty(&g_lru_list)) {
@@ -1113,8 +1154,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
             int n = recvmmsg(lsn_sock, c_msgs, ncap, 0, NULL);
             if (n <= 0) {
-                if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-                    P_LOG_WARN("recvmmsg(): %s", strerror(errno));
+                if (n < 0)
+                    log_if_unexpected_errno("recvmmsg()");
                 break; /* no more to read now */
             }
 
@@ -1174,9 +1215,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
                         atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
                         #endif
                         ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
-                        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                            P_LOG_WARN("send(server, overflow): %s", strerror(errno));
-                        }
+                        if (wr < 0)
+                            log_if_unexpected_errno("send(server, overflow)");
                         continue;
                     }
                     batch_idx = num_batches++;
@@ -1192,14 +1232,10 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
                     /* Batch is full, flush it now to make space */
                     struct send_batch *b = &batches[batch_idx];
-                    for (int k = 0; k < b->count; k++) {
-                        int msg_idx = b->msg_indices[k];
-                        s_iovs[k].iov_base = c_bufs[msg_idx];
-                        s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
-                    }
+                    fill_iov_from_batch(c_msgs, c_bufs, b->msg_indices, b->count, s_iovs);
                     if (sendmmsg(b->sock, s_msgs, b->count, 0) < 0) {
-                        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-                            P_LOG_WARN("sendmmsg(server, batch_full): %s", strerror(errno));
+                        if (!is_temporary_errno(errno)) {
+                            log_if_unexpected_errno("sendmmsg(server, batch_full)");
                         }
                     }
 
@@ -1214,12 +1250,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
             for (int i = 0; i < num_batches; i++) {
                 struct send_batch *b = &batches[i];
-                for (int k = 0; k < b->count; k++) {
-                    int msg_idx = b->msg_indices[k];
-                    s_iovs[k].iov_base = c_bufs[msg_idx];
-                    s_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
-                    /* s_msgs already configured in init loop */
-                }
+                fill_iov_from_batch(c_msgs, c_bufs, b->msg_indices, b->count, s_iovs);
+                /* s_msgs already configured in init loop */
 
                 /* Retry on partial send to avoid dropping remaining packets */
                 int remaining = b->count;
@@ -1229,18 +1261,17 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 do {
                     int sent = sendmmsg(b->sock, msgp, remaining, 0);
                     if (sent < 0) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                        if (is_temporary_errno(errno)) {
                             /* Socket buffer full - rely on kernel buffering,
                              * don't queue in userspace */
                             /* This is more efficient than copying data to
                              * userspace queues */
-                            #if ENABLE_STATS_ATOMICS
+#if ENABLE_STATS_ATOMICS
                             atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, remaining);
-                            #endif
+#endif
                             break;
                         }
-                        P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, "
-                                   "remaining=%d",
+                        P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, remaining=%d",
                                    strerror(errno), remaining, remaining);
                         break;
                     }
@@ -1287,8 +1318,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
     int r = recvfrom(lsn_sock, buffer, sizeof(buffer), 0, (struct sockaddr *)&cli_addr, &cli_alen);
     if (r < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)
-            P_LOG_WARN("recvfrom(): %s", strerror(errno));
+        if (errno)
+            log_if_unexpected_errno("recvfrom()");
         return; /* drop this datagram and move on */
     }
 
@@ -1307,9 +1338,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
     touch_proxy_conn(conn);
 
     ssize_t wr = send(conn->svr_sock, buffer, r, 0);
-    if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-        P_LOG_WARN("send(server): %s", strerror(errno));
-    }
+    if (wr < 0)
+        log_if_unexpected_errno("send(server)");
 }
 
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) {
@@ -1355,10 +1385,10 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         int n = recvmmsg(conn->svr_sock, msgs, ncap, 0, NULL);
         if (n <= 0) {
             if (n < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                if (is_temporary_errno(errno)) {
                     break; /* drained */
                 }
-                P_LOG_WARN("recvmmsg(server): %s", strerror(errno));
+                log_if_unexpected_errno("recvmmsg(server)");
                 /* fatal error on server socket: close session */
                 proxy_conn_put(conn, epfd);
             }
@@ -1382,7 +1412,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         do {
             int sent = sendmmsg(lsn_sock, msgp, remaining, 0);
             if (sent < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                if (is_temporary_errno(errno)) {
                     /* leave remaining for later */
                     break;
                 }
@@ -1411,9 +1441,9 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
     for (;;) {
         r = recv(conn->svr_sock, buffer, sizeof(buffer), 0);
         if (r < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+            if (is_temporary_errno(errno))
                 break; /* drained */
-            P_LOG_WARN("recv(server): %s", strerror(errno));
+            log_if_unexpected_errno("recv(server)");
             /* fatal error on server socket: close session */
             proxy_conn_put(conn, epfd);
             break;
@@ -1424,9 +1454,8 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
 
         ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
                             sizeof_sockaddr(&conn->cli_addr));
-        if (wr < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-            P_LOG_WARN("sendto(client): %s", strerror(errno));
-        }
+        if (wr < 0)
+            log_if_unexpected_errno("sendto(client)");
 
         if (r < (int)sizeof(buffer)) {
             break; /* Drained */
@@ -1440,7 +1469,7 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
                                     struct sockaddr_storage **c_addrs,
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr **s_msgs,
                                     struct iovec **s_iovs) {
-    int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
+    const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
 
     size_t size_c_msgs = (size_t)ncap * sizeof(**c_msgs);
     size_t size_c_iov  = (size_t)ncap * sizeof(**c_iov);
@@ -1450,7 +1479,7 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
     size_t size_s_iovs = (size_t)ncap * sizeof(**s_iovs);
     size_t total = size_c_msgs + size_c_iov + size_c_addrs + size_c_bufs + size_s_msgs + size_s_iovs;
 
-    void *block = aligned_alloc(64, total);
+    void *block = aligned_alloc(64, align_up(total, 64));
     if (!block) {
         P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
         *c_msgs = NULL;
