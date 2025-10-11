@@ -1229,6 +1229,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
             struct send_batch {
                 int sock;
+                struct proxy_conn *conn;
                 int msg_indices[UDP_PROXY_BATCH_SZ];
                 int count;
                 int probe_distance; /* Robin Hood hashing: track probe distance */
@@ -1254,21 +1255,16 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 if (unlikely(!(conn = proxy_conn_get_or_create(sa, epfd))))
                     continue;
                 touch_proxy_conn(conn);
-                
-                /* Save socket fd and release reference immediately to reduce atomic ops */
-                int svr_sock = conn->svr_sock;
-                proxy_conn_put(conn, epfd);  /* Release reference early */
-                
                 /* Prefetch for next iteration */
-                PREFETCH_READ(&svr_sock);
+                PREFETCH_READ(&conn->svr_sock);
 
                 /* O(1) batch lookup using Robin Hood hashing for better collision handling */
-                int hash_key = svr_sock % BATCH_HASH_SIZE;
+                int hash_key = conn->svr_sock % BATCH_HASH_SIZE;
                 int batch_idx = batch_hash[hash_key];
                 int probe_count = 0;
 
                 /* Robin Hood hashing: probe with distance tracking */
-                while (batch_idx != -1 && batches[batch_idx].sock != svr_sock &&
+                while (batch_idx != -1 && batches[batch_idx].sock != conn->svr_sock &&
                        probe_count < RH_MAX_PROBE_LENGTH) {
                     hash_key = (hash_key + 1) % BATCH_HASH_SIZE;
                     batch_idx = batch_hash[hash_key];
@@ -1282,14 +1278,16 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
                 /* Early exit if probe chain too long (avoid pathological cases) */
                 if (unlikely(probe_count >= RH_MAX_PROBE_LENGTH && batch_idx != -1 && 
-                    batches[batch_idx].sock != svr_sock)) {
+                    batches[batch_idx].sock != conn->svr_sock)) {
                     /* Fallback to immediate send to avoid excessive probing */
-                    #if ENABLE_STATS_ATOMICS
+#if ENABLE_STATS_ATOMICS
                     atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
-                    #endif
-                    ssize_t wr = send(svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+#endif
+                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                     if (wr < 0)
                         log_if_unexpected_errno("send(server, probe_overflow)");
+                    /* Caller ref not transferred to batch; release it */
+                    proxy_conn_put(conn, epfd);
                     continue;
                 }
 
@@ -1297,25 +1295,32 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 if (batch_idx == -1) {
                     /* Check if we can create a new batch */
                     if (unlikely(num_batches >= MAX_CONCURRENT_BATCHES)) {
-                        #if ENABLE_STATS_ATOMICS
+#if ENABLE_STATS_ATOMICS
                         atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
-                        #endif
-                        ssize_t wr = send(svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+#endif
+                        ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                         if (wr < 0)
                             log_if_unexpected_errno("send(server, overflow)");
+                        /* Not added to any batch: release caller ref */
+                        proxy_conn_put(conn, epfd);
                         continue;
                     }
                     batch_idx = num_batches++;
-                    batches[batch_idx].sock = svr_sock;
+                    /* Transfer ownership: batch holds one ref; caller releases its ref */
+                    proxy_conn_hold(conn);
+                    batches[batch_idx].sock = conn->svr_sock;
+                    batches[batch_idx].conn = conn;
                     batches[batch_idx].count = 0;
                     batches[batch_idx].probe_distance = probe_count;
                     /* Update hash table for O(1) future lookups */
                     batch_hash[hash_key] = batch_idx;
+                    /* Release caller reference; batch retains its own */
+                    proxy_conn_put(conn, epfd);
                 }
                 if (batches[batch_idx].count >= get_optimal_batch_size()) {
-                    #if ENABLE_STATS_ATOMICS
+#if ENABLE_STATS_ATOMICS
                     atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
-                    #endif
+#endif
 
                     /* Batch is full, flush it now to make space */
                     struct send_batch *b = &batches[batch_idx];
@@ -1333,8 +1338,11 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 } else {
                     batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
                 }
+                /* If we used an existing batch, we still need to drop caller ref now */
+                if (batches[batch_idx].conn != conn) {
+                    proxy_conn_put(conn, epfd);
+                }
             }
-
             for (int i = 0; i < num_batches; i++) {
                 struct send_batch *b = &batches[i];
                 fill_iov_from_batch(c_msgs, c_bufs, b->msg_indices, b->count, s_iovs);
@@ -1375,6 +1383,11 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     remaining -= sent;
                     msgp += sent;
                 } while (remaining > 0);
+                /* Release the batch-held reference now that sending is done */
+                if (b->conn) {
+                    proxy_conn_put(b->conn, epfd);
+                    b->conn = NULL;
+                }
             }
 
             /* Record batch statistics for adaptive sizing */
