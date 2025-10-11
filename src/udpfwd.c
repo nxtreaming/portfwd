@@ -1247,16 +1247,21 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 if (unlikely(!(conn = proxy_conn_get_or_create(sa, epfd))))
                     continue;
                 touch_proxy_conn(conn);
-                /* Prefetch connection data for next iteration */
-                PREFETCH_READ(&conn->svr_sock);
+                
+                /* Save socket fd and release reference immediately to reduce atomic ops */
+                int svr_sock = conn->svr_sock;
+                proxy_conn_put(conn, epfd);  /* Release reference early */
+                
+                /* Prefetch for next iteration */
+                PREFETCH_READ(&svr_sock);
 
                 /* O(1) batch lookup using Robin Hood hashing for better collision handling */
-                int hash_key = conn->svr_sock % BATCH_HASH_SIZE;
+                int hash_key = svr_sock % BATCH_HASH_SIZE;
                 int batch_idx = batch_hash[hash_key];
                 int probe_count = 0;
 
                 /* Robin Hood hashing: probe with distance tracking */
-                while (batch_idx != -1 && batches[batch_idx].sock != conn->svr_sock &&
+                while (batch_idx != -1 && batches[batch_idx].sock != svr_sock &&
                        probe_count < RH_MAX_PROBE_LENGTH) {
                     hash_key = (hash_key + 1) % BATCH_HASH_SIZE;
                     batch_idx = batch_hash[hash_key];
@@ -1270,15 +1275,14 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
                 /* Early exit if probe chain too long (avoid pathological cases) */
                 if (unlikely(probe_count >= RH_MAX_PROBE_LENGTH && batch_idx != -1 && 
-                    batches[batch_idx].sock != conn->svr_sock)) {
+                    batches[batch_idx].sock != svr_sock)) {
                     /* Fallback to immediate send to avoid excessive probing */
                     #if ENABLE_STATS_ATOMICS
                     atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
                     #endif
-                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                    ssize_t wr = send(svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                     if (wr < 0)
                         log_if_unexpected_errno("send(server, probe_overflow)");
-                    proxy_conn_put(conn, epfd);  /* Release reference */
                     continue;
                 }
 
@@ -1289,14 +1293,13 @@ static void handle_client_data(int lsn_sock, int epfd) {
                         #if ENABLE_STATS_ATOMICS
                         atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
                         #endif
-                        ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                        ssize_t wr = send(svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                         if (wr < 0)
                             log_if_unexpected_errno("send(server, overflow)");
-                        proxy_conn_put(conn, epfd);  /* Release reference */
                         continue;
                     }
                     batch_idx = num_batches++;
-                    batches[batch_idx].sock = conn->svr_sock;
+                    batches[batch_idx].sock = svr_sock;
                     batches[batch_idx].count = 0;
                     batches[batch_idx].probe_distance = probe_count;
                     /* Update hash table for O(1) future lookups */
@@ -1323,9 +1326,6 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 } else {
                     batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
                 }
-                
-                /* Release reference after adding to batch */
-                proxy_conn_put(conn, epfd);
             }
 
             for (int i = 0; i < num_batches; i++) {
