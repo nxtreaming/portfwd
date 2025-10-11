@@ -66,6 +66,10 @@
 
 #define BATCH_HASH_SIZE 2048
 
+/* Robin Hood hashing parameters for better collision handling */
+#define RH_MAX_PROBE_LENGTH 32
+#define RH_LOAD_FACTOR_THRESHOLD 0.75
+
 /* Performance optimization flags */
 #ifndef DISABLE_ADAPTIVE_BATCHING
 #define ENABLE_ADAPTIVE_BATCHING 1
@@ -83,6 +87,18 @@
 #ifndef ENABLE_STATS_ATOMICS
 #define ENABLE_STATS_ATOMICS 1
 #endif
+
+/* Compiler optimization hints */
+#ifndef likely
+#define likely(x) __builtin_expect(!!(x), 1)
+#endif
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
+/* Prefetch hints for better cache utilization */
+#define PREFETCH_READ(addr) __builtin_prefetch((addr), 0, 3)
+#define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
 
 #ifndef DISABLE_PACKET_VALIDATION
 #define ENABLE_PACKET_VALIDATION 1
@@ -246,6 +262,18 @@ static _Atomic uint64_t g_stat_hash_collisions;
 static _Atomic uint64_t g_stat_lru_immediate_updates;
 static _Atomic uint64_t g_stat_lru_deferred_updates;
 
+/* Per-thread statistics to reduce atomic contention */
+#define MAX_THREAD_STATS 64
+struct thread_stats {
+    uint64_t packets_processed;
+    uint64_t bytes_processed;
+    uint64_t hash_collisions;
+    uint64_t lru_updates;
+    char padding[64 - 4 * sizeof(uint64_t)]; /* Cache line padding */
+};
+static __thread struct thread_stats tls_stats = {0};
+static struct thread_stats g_thread_stats[MAX_THREAD_STATS] __attribute__((aligned(64)));
+
 /* Global config */
 static struct fwd_config g_cfg;
 
@@ -325,11 +353,11 @@ static int safe_close(int fd) {
  
 /* Returns true if errno indicates a transient, non-fatal condition. */
 static inline bool is_wouldblock(int e) {
-    return e == EAGAIN || e == EWOULDBLOCK;
+    return likely(e == EAGAIN) || e == EWOULDBLOCK;
 }
 
 static inline bool is_temporary_errno(int e) {
-    return e == EINTR || is_wouldblock(e);
+    return likely(e == EINTR) || is_wouldblock(e);
 }
 
 /* Align up to a given power-of-two alignment (e.g., 64). */
@@ -791,10 +819,14 @@ static inline uint32_t hash_addr(const union sockaddr_inx *a) {
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Update timestamp only; defer LRU updates to periodic maintenance */
-    conn->last_active = cached_now_seconds();
+    time_t now = cached_now_seconds();
+    /* Only update if timestamp changed to reduce cache line writes */
+    if (conn->last_active != now) {
+        conn->last_active = now;
 #if ENABLE_LRU_LOCKS
-    conn->needs_lru_update = true;
+        conn->needs_lru_update = true;
 #endif
+    }
 }
 
 /* Segmented LRU update to avoid O(N) scans - process only a subset of buckets
@@ -866,6 +898,11 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     char s_addr[INET6_ADDRSTRLEN] = "";
 
     list_for_each_entry(conn, chain, list) {
+        /* Prefetch next connection for better cache utilization */
+        if (conn->list.next != chain) {
+            struct proxy_conn *next = list_entry(conn->list.next, struct proxy_conn, list);
+            PREFETCH_READ(&next->cli_addr);
+        }
         if (is_sockaddr_inx_equal(cli_addr, &conn->cli_addr)) {
             proxy_conn_hold(conn);
             touch_proxy_conn(conn);
@@ -874,7 +911,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     }
 
     /* Check rate limits before creating new connection */
-    if (!check_rate_limit(cli_addr, 0)) {
+    if (unlikely(!check_rate_limit(cli_addr, 0))) {
         /* Rate limit exceeded - drop the connection request */
         return NULL;
     }
@@ -1169,10 +1206,11 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 int sock;
                 int msg_indices[UDP_PROXY_BATCH_SZ];
                 int count;
+                int probe_distance; /* Robin Hood hashing: track probe distance */
             } batches[MAX_CONCURRENT_BATCHES];
             int num_batches = 0;
 
-            /* Hash table for O(1) batch lookup instead of O(n) linear scan */
+            /* Hash table for O(1) batch lookup with Robin Hood hashing */
             int batch_hash[BATCH_HASH_SIZE];
             memset(batch_hash, -1, sizeof(batch_hash));
 
@@ -1181,42 +1219,54 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
                 /* Validate packet size and rate limits */
                 size_t packet_len = c_msgs[i].msg_len;
-                if (!validate_packet(c_bufs[i], packet_len, sa)) {
+                if (unlikely(!validate_packet(c_bufs[i], packet_len, sa))) {
                     continue; /* Drop invalid packet */
                 }
-                if (!check_rate_limit(sa, packet_len)) {
+                if (unlikely(!check_rate_limit(sa, packet_len))) {
                     continue; /* Drop rate-limited packet */
                 }
 
-                if (!(conn = proxy_conn_get_or_create(sa, epfd)))
+                if (unlikely(!(conn = proxy_conn_get_or_create(sa, epfd))))
                     continue;
                 touch_proxy_conn(conn);
+                /* Prefetch connection data for next iteration */
+                PREFETCH_READ(&conn->svr_sock);
 
-                /* O(1) batch lookup using hash table with linear probing for
-                 * collision resolution */
+                /* O(1) batch lookup using Robin Hood hashing for better collision handling */
                 int hash_key = conn->svr_sock % BATCH_HASH_SIZE;
                 int batch_idx = batch_hash[hash_key];
                 int probe_count = 0;
 
-                /* Linear probing to handle hash collisions */
+                /* Robin Hood hashing: probe with distance tracking */
                 while (batch_idx != -1 && batches[batch_idx].sock != conn->svr_sock &&
-                       probe_count < BATCH_HASH_SIZE) {
+                       probe_count < RH_MAX_PROBE_LENGTH) {
                     hash_key = (hash_key + 1) % BATCH_HASH_SIZE;
                     batch_idx = batch_hash[hash_key];
                     probe_count++;
                 }
 
-                /* Track hash collision statistics */
-                if (probe_count > 0) {
-                #if ENABLE_STATS_ATOMICS
-                    atomic_fetch_add(&g_stat_hash_collisions, probe_count);
-                #endif
+                /* Track hash collision statistics - use thread-local to reduce contention */
+                if (unlikely(probe_count > 0)) {
+                    tls_stats.hash_collisions += probe_count;
+                }
+
+                /* Early exit if probe chain too long (avoid pathological cases) */
+                if (unlikely(probe_count >= RH_MAX_PROBE_LENGTH && batch_idx != -1 && 
+                    batches[batch_idx].sock != conn->svr_sock)) {
+                    /* Fallback to immediate send to avoid excessive probing */
+                    #if ENABLE_STATS_ATOMICS
+                    atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
+                    #endif
+                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
+                    if (wr < 0)
+                        log_if_unexpected_errno("send(server, probe_overflow)");
+                    continue;
                 }
 
                 /* If we found a matching socket or an empty slot */
                 if (batch_idx == -1) {
                     /* Check if we can create a new batch */
-                    if (num_batches >= MAX_CONCURRENT_BATCHES) {
+                    if (unlikely(num_batches >= MAX_CONCURRENT_BATCHES)) {
                         #if ENABLE_STATS_ATOMICS
                         atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
                         #endif
@@ -1228,6 +1278,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     batch_idx = num_batches++;
                     batches[batch_idx].sock = conn->svr_sock;
                     batches[batch_idx].count = 0;
+                    batches[batch_idx].probe_distance = probe_count;
                     /* Update hash table for O(1) future lookups */
                     batch_hash[hash_key] = batch_idx;
                 }
@@ -1298,6 +1349,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
 
             /* Record batch statistics for adaptive sizing */
             record_batch_stats(n);
+            /* Update thread-local statistics */
+            tls_stats.packets_processed += n;
 
             /* If we read fewer than the batch, likely drained; stop early */
             if (n < ncap)
@@ -1954,17 +2007,29 @@ cleanup:
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
 #endif
 
+    /* Aggregate thread-local statistics */
+    uint64_t total_packets = 0, total_bytes = 0, total_hash_collisions = 0, total_lru_updates = 0;
+    for (int i = 0; i < MAX_THREAD_STATS; i++) {
+        total_packets += g_thread_stats[i].packets_processed;
+        total_bytes += g_thread_stats[i].bytes_processed;
+        total_hash_collisions += g_thread_stats[i].hash_collisions;
+        total_lru_updates += g_thread_stats[i].lru_updates;
+    }
+
     /* Print performance statistics */
     uint64_t socket_overflows = atomic_load(&g_stat_c2s_batch_socket_overflow);
     uint64_t entry_overflows = atomic_load(&g_stat_c2s_batch_entry_overflow);
-    uint64_t hash_collisions = atomic_load(&g_stat_hash_collisions);
+    uint64_t hash_collisions = atomic_load(&g_stat_hash_collisions) + total_hash_collisions;
     uint64_t lru_immediate = atomic_load(&g_stat_lru_immediate_updates);
-    uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates);
+    uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates) + total_lru_updates;
 
     P_LOG_INFO("Performance statistics:");
+    P_LOG_INFO("  Total packets processed: %" PRIu64, total_packets);
+    P_LOG_INFO("  Total bytes processed: %" PRIu64, total_bytes);
     P_LOG_INFO("  Batch overflows: sockets=%" PRIu64 ", entries=%" PRIu64, socket_overflows,
                entry_overflows);
-    P_LOG_INFO("  Hash collisions: %" PRIu64, hash_collisions);
+    P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", hash_collisions,
+               total_packets > 0 ? (double)hash_collisions / total_packets : 0.0);
     P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64, lru_immediate,
                lru_deferred);
 
@@ -1972,9 +2037,14 @@ cleanup:
         P_LOG_WARN("Consider increasing -B (batch size) or -C (max "
                    "connections) if overflows are high");
     }
-    if (hash_collisions > socket_overflows * 10) {
-        P_LOG_WARN("High hash collision rate detected, consider adjusting hash "
-                   "table size");
+    if (total_packets > 0 && hash_collisions > total_packets / 2) {
+        P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash "
+                   "table size or connection distribution",
+                   (double)hash_collisions * 100.0 / total_packets);
+    }
+    if (total_packets > 0) {
+        double throughput_pps = (double)total_packets / (time(NULL) - last_check + 1);
+        P_LOG_INFO("  Estimated throughput: %.0f packets/sec", throughput_pps);
     }
     closelog();
 
