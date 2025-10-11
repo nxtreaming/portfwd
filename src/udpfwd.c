@@ -1034,6 +1034,10 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     }
 
     conn->last_active = cached_now_seconds();
+    
+    /* Hold reference for caller (consistent with existing connection path) */
+    proxy_conn_hold(conn);
+    
     return conn;
 
 err_unlock:
