@@ -77,10 +77,17 @@
 #define ENABLE_ADAPTIVE_BATCHING 0
 #endif
 
-#ifndef DISABLE_RATE_LIMITING
-#define ENABLE_RATE_LIMITING 1
+/* Rate limiting compile-time switch
+ * Default: disabled for maximum performance.
+ * You can enable with -DENABLE_RATE_LIMITING=1 or force disable with -DDISABLE_RATE_LIMITING.
+ */
+#ifdef DISABLE_RATE_LIMITING
+#  undef ENABLE_RATE_LIMITING
+#  define ENABLE_RATE_LIMITING 0
 #else
-#define ENABLE_RATE_LIMITING 0
+#  ifndef ENABLE_RATE_LIMITING
+#    define ENABLE_RATE_LIMITING 0
+#  endif
 #endif
 
 /* Stats atomics control: default off (0) to reduce overhead in single-threaded mode */
