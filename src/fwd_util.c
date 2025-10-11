@@ -65,7 +65,7 @@ int init_signals(void) {
     sigaddset(&sa.sa_mask, SIGQUIT);
 
     sa.sa_handler = handle_shutdown_signal;
-    sa.sa_flags = SA_RESTART; /* Restart interrupted system calls */
+    sa.sa_flags = 0; /* Do NOT restart - we want EINTR to check shutdown flag */
 
     if (sigaction(SIGTERM, &sa, NULL) < 0) {
         P_LOG_ERR("sigaction(SIGTERM): %s", strerror(errno));

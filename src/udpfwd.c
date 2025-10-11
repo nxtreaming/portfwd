@@ -1941,25 +1941,35 @@ int main(int argc, char *argv[]) {
             process_backpressure_queue();
 #endif
             last_check = current_ts;
+            
+            /* Check shutdown flag after maintenance tasks */
+            if (g_shutdown_requested)
+                break;
         }
 
         /* Cache current timestamp for hot paths - atomic update */
         atomic_store(&g_now_ts, current_ts);
 
+        /* Check shutdown flag before blocking */
+        if (g_shutdown_requested)
+            break;
+
         /* Wait for events */
         nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
+        
+        /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
+        if (g_shutdown_requested)
+            break;
+        
         if (nfds == 0)
-            continue;
+            continue; /* Timeout, loop back to check shutdown flag */
         if (nfds < 0) {
             if (errno == EINTR || errno == ERESTART)
-                continue;
+                continue; /* Interrupted, loop back to check shutdown flag */
             P_LOG_ERR("epoll_wait(): %s", strerror(errno));
             rc = 1;
             goto cleanup;
         }
-
-        if (g_shutdown_requested)
-            break;
 
         /* Process events */
         for (i = 0; i < nfds; i++) {
