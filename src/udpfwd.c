@@ -230,7 +230,8 @@ static struct adaptive_batch g_adaptive_batch = {
     .total_packets = 0,
     .total_batches = 0,
     .last_adjust = 0,
-    .lock = PTHREAD_MUTEX_INITIALIZER};
+    .lock = PTHREAD_MUTEX_INITIALIZER
+};
 #endif /* ENABLE_ADAPTIVE_BATCHING */
 #endif
 
@@ -318,6 +319,8 @@ static void handle_client_data(int listen_sock, int epfd, struct mmsghdr *c_msgs
 #else
 static void handle_client_data(int listen_sock, int epfd);
 #endif
+
+static void proxy_conn_put(struct proxy_conn *conn, int epfd);
 
 /* Simple monotonic-seconds helper (Linux) with portable fallback */
 static inline time_t monotonic_seconds(void) {
@@ -711,8 +714,7 @@ static int get_optimal_batch_size(void) {
 #if ENABLE_ADAPTIVE_BATCHING
     return g_adaptive_batch.current_size;
 #else
-    return UDP_PROXY_BATCH_SZ; /* Use fixed batch size for maximum performance
-                                */
+    return UDP_PROXY_BATCH_SZ; /* Use fixed batch size for maximum performance */
 #endif
 }
 
@@ -757,7 +759,6 @@ static inline uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
         uint16_t port = sa->sin.sin_port;
         hash ^= port;
         hash *= FNV_PRIME;
-
     } else if (sa->sa.sa_family == AF_INET6) {
         /* For IPv6, use a more sophisticated hash */
         const uint32_t *words = (const uint32_t *)&sa->sin6.sin6_addr;
@@ -784,8 +785,6 @@ static inline bool is_power_of_two(unsigned v) {
 static inline void proxy_conn_hold(struct proxy_conn *conn) {
     atomic_fetch_add_explicit(&conn->ref_count, 1, memory_order_relaxed);
 }
-
-static void proxy_conn_put(struct proxy_conn *conn, int epfd);
 
 static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
     if (!conn) {
@@ -919,9 +918,21 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     /* Reserve a connection slot atomically to avoid races under contention */
     bool reserved_slot = false;
     unsigned current_conn_count;
+    int eviction_attempts = 0;
+    const int MAX_EVICTION_ATTEMPTS = 3; /* Prevent infinite recursion */
+    
     for (;;) {
         current_conn_count = atomic_load(&conn_tbl_len);
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
+            /* Prevent excessive eviction attempts */
+            if (eviction_attempts >= MAX_EVICTION_ATTEMPTS) {
+                inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
+                P_LOG_WARN("Conn table full after %d eviction attempts, dropping %s:%d",
+                           eviction_attempts, s_addr, ntohs(*port_of_sockaddr(cli_addr)));
+                goto err;
+            }
+            eviction_attempts++;
+            
             /* Try to make room first */
             proxy_conn_walk_continue(epfd);
             current_conn_count = atomic_load(&conn_tbl_len);
@@ -931,13 +942,9 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
             /* Re-check after eviction */
             current_conn_count = atomic_load(&conn_tbl_len);
             if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-                inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
-                P_LOG_WARN("Conn table full (%u), dropping %s:%d", current_conn_count, s_addr,
-                           ntohs(*port_of_sockaddr(cli_addr)));
-                goto err;
+                /* Loop to attempt reservation after cleanup */
+                continue;
             }
-            /* Loop to attempt reservation after cleanup */
-            continue;
         }
         unsigned expected = current_conn_count;
         if (atomic_compare_exchange_weak_explicit(&conn_tbl_len, &expected, current_conn_count + 1, memory_order_acq_rel, memory_order_acquire)) {
@@ -1125,11 +1132,14 @@ static void proxy_conn_walk_continue(int epfd) {
     /* Collect all expired connections into a temporary reap_list */
     list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
         long diff = (long)(now - conn->last_active);
-        if (diff < 0) diff = 0;
 
+        if (diff < 0)
+            diff = 0;
         if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
             /* Move from LRU to our local reap list */
             list_move_tail(&conn->lru, &reap_list);
+            /* CRITICAL: Hold reference to prevent use-after-free */
+            proxy_conn_hold(conn);
         } else {
             /* List is ordered, so we can stop at the first non-expired conn */
             break;
@@ -1163,9 +1173,14 @@ static bool proxy_conn_evict_one(int epfd) {
     union sockaddr_inx addr = oldest->cli_addr;
     char s_addr[INET6_ADDRSTRLEN] = "";
 
+    /* CRITICAL: Hold reference before unlocking to prevent use-after-free */
+    proxy_conn_hold(oldest);
+
     /* Unlock before calling release_proxy_conn to avoid deadlock */
     pthread_mutex_unlock(&g_lru_lock);
 
+    /* Release our temporary hold + the original reference */
+    proxy_conn_put(oldest, epfd);
     proxy_conn_put(oldest, epfd);
     inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
     P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
