@@ -1179,8 +1179,7 @@ static bool proxy_conn_evict_one(int epfd) {
     /* Unlock before calling release_proxy_conn to avoid deadlock */
     pthread_mutex_unlock(&g_lru_lock);
 
-    /* Release our temporary hold + the original reference */
-    proxy_conn_put(oldest, epfd);
+    /* Release the temporary hold (connection will be freed if ref_count reaches 0) */
     proxy_conn_put(oldest, epfd);
     inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
     P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
@@ -1275,6 +1274,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                     if (wr < 0)
                         log_if_unexpected_errno("send(server, probe_overflow)");
+                    proxy_conn_put(conn, epfd);  /* Release reference */
                     continue;
                 }
 
@@ -1288,6 +1288,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                         ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
                         if (wr < 0)
                             log_if_unexpected_errno("send(server, overflow)");
+                        proxy_conn_put(conn, epfd);  /* Release reference */
                         continue;
                     }
                     batch_idx = num_batches++;
@@ -1318,6 +1319,9 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 } else {
                     batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
                 }
+                
+                /* Release reference after adding to batch */
+                proxy_conn_put(conn, epfd);
             }
 
             for (int i = 0; i < num_batches; i++) {
@@ -1414,6 +1418,9 @@ static void handle_client_data(int lsn_sock, int epfd) {
     ssize_t wr = send(conn->svr_sock, buffer, r, 0);
     if (wr < 0)
         log_if_unexpected_errno("send(server)");
+    
+    /* Release reference after sending */
+    proxy_conn_put(conn, epfd);
 }
 
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) {
