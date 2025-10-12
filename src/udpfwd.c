@@ -1089,6 +1089,14 @@ static void proxy_conn_walk_continue(int epfd) {
             diff = 0;
         
         if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
+            unsigned ref = atomic_load_explicit(&conn->ref_count, memory_order_acquire);
+            if (unlikely(ref != 1)) {
+                if (unlikely(ref == 0)) {
+                    P_LOG_WARN("Skipping expired conn with ref_count=0 for %s:%d", sockaddr_to_string(&conn->cli_addr), ntohs(*port_of_sockaddr(&conn->cli_addr)));
+                }
+                /* Connection still referenced somewhere else; skip for now. */
+                continue;
+            }
             /* Move to reap_list for processing outside the lock */
             list_move_tail(&conn->lru, &reap_list);
         } else {
@@ -1853,14 +1861,15 @@ int main(int argc, char *argv[]) {
     for (;;) {
         int nfds;
         time_t current_ts = monotonic_seconds();
-
-        /* Refresh cached timestamp immediately so maintenance passes see the
-         * up-to-date wall clock. */
-        atomic_store(&g_now_ts, current_ts);
         time_t pre_wait_ts = current_ts;
+#if !DEBUG_HANG
+        (void)pre_wait_ts;
+#endif
 
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
+            /* Ensure maintenance walkers observe the real current time. */
+            atomic_store(&g_now_ts, current_ts);
 #if DEBUG_HANG
             P_LOG_INFO("[HANG_DEBUG] Maintenance cycle: current_ts=%ld, active_conns=%d",
                        current_ts, atomic_load(&conn_tbl_len));
@@ -1883,20 +1892,18 @@ int main(int argc, char *argv[]) {
 
         /* Wait for events */
         nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
-    
-        /* Update cached timestamp only if time has advanced since pre-wait.
-         * This avoids redundant atomic stores when epoll_wait returns immediately
-         * (high PPS scenario), improving performance while maintaining correctness. */
+
+        /* Record the time at which events are processed so that activity
+         * timestamps reflect the *arrival* time rather than the time we
+         * went to sleep in epoll_wait(). */
         current_ts = monotonic_seconds();
-        if (current_ts != pre_wait_ts) {
-            atomic_store(&g_now_ts, current_ts);
+        atomic_store(&g_now_ts, current_ts);
 #if DEBUG_HANG
-            if (current_ts - pre_wait_ts > 5) {
-                P_LOG_INFO("[HANG_DEBUG] Main loop: g_now_ts updated %ld -> %ld (epoll blocked %ld sec)",
-                           pre_wait_ts, current_ts, current_ts - pre_wait_ts);
-            }
-#endif
+        if (current_ts - pre_wait_ts > 5) {
+            P_LOG_INFO("[HANG_DEBUG] Main loop: g_now_ts updated %ld -> %ld (epoll blocked %ld sec)",
+                       pre_wait_ts, current_ts, current_ts - pre_wait_ts);
         }
+#endif
         
         /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
         if (g_shutdown_requested)
