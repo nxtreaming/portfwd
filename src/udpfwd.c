@@ -1106,9 +1106,20 @@ static void proxy_conn_walk_continue(int epfd) {
         char s_addr[INET6_ADDRSTRLEN] = "";
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                   s_addr, sizeof(s_addr));
-        P_LOG_INFO("Recycling %s:%d - last_active=%ld, now=%ld, idle=%ld sec, timeout=%u sec, "
-                   "client_pkts=%lu, server_pkts=%lu",
-                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+        
+        /* Determine if this is a one-way or two-way connection */
+        const char *conn_type = "";
+        if (conn->client_packets == 0 && conn->server_packets > 0) {
+            conn_type = " [SERVER-ONLY]";
+        } else if (conn->client_packets > 0 && conn->server_packets == 0) {
+            conn_type = " [CLIENT-ONLY]";
+        } else if (conn->client_packets > 0 && conn->server_packets > 0) {
+            conn_type = " [BIDIRECTIONAL]";
+        }
+        
+        P_LOG_INFO("Recycling %s:%d%s - last_active=%ld, now=%ld, idle=%ld sec, timeout=%u sec, "
+                   "client_pkts=%lu, server_pkts=%lu. Client must send new data to re-establish.",
+                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), conn_type,
                    conn->last_active, now,
                    (long)(now - conn->last_active), g_cfg.proxy_conn_timeo,
                    conn->client_packets, conn->server_packets);
@@ -1342,8 +1353,9 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         char s_addr[INET6_ADDRSTRLEN];
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                   s_addr, sizeof(s_addr));
-        P_LOG_INFO("[HANG_DEBUG] Received %d packets from server for %s:%d",
-                   n, s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
+        P_LOG_INFO("[HANG_DEBUG] Received %d packets from server for %s:%d (total_size=%zu bytes)",
+                   n, s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                   (size_t)(msgs[0].msg_len + (n > 1 ? msgs[1].msg_len : 0)));
 #endif
         touch_proxy_conn(conn);
 
@@ -1401,13 +1413,16 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         } while (remaining > 0);
         
 #if DEBUG_HANG
+        char s_addr[INET6_ADDRSTRLEN];
+        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                  s_addr, sizeof(s_addr));
         if (total_sent < n) {
-            char s_addr[INET6_ADDRSTRLEN];
-            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                      s_addr, sizeof(s_addr));
-            P_LOG_INFO("[HANG_DEBUG] Incomplete send to %s:%d: sent=%d/%d",
+            P_LOG_WARN("[HANG_DEBUG] Incomplete send to %s:%d: sent=%d/%d packets",
                        s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
                        total_sent, n);
+        } else {
+            P_LOG_INFO("[HANG_DEBUG] Successfully sent %d packets to %s:%d",
+                       total_sent, s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
         }
 #endif
     }
@@ -1930,6 +1945,29 @@ int main(int argc, char *argv[]) {
             } else {
                 /* Data from server */
                 conn = evp->data.ptr;
+                
+                /* Check if connection is still valid (ref_count > 0) */
+                int ref = atomic_load_explicit(&conn->ref_count, memory_order_acquire);
+                if (ref <= 0) {
+                    /* Connection was recycled but epoll event was already queued.
+                     * This can happen when:
+                     * 1. Server sends data → epoll event queued
+                     * 2. Connection times out → recycled
+                     * 3. We process the queued event → connection already gone
+                     * 
+                     * Solution: Discard the server data. Client must send new data
+                     * to re-establish the connection. */
+                    char s_addr[INET6_ADDRSTRLEN] = "unknown";
+                    /* Try to get address, but conn might be partially freed */
+                    if (conn->svr_sock >= 0) {
+                        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                                  s_addr, sizeof(s_addr));
+                    }
+                    P_LOG_INFO("Server data arrived for recycled connection %s (ref_count=%d). "
+                               "Discarding. Client must send new data to re-establish.", s_addr, ref);
+                    continue;
+                }
+                
 #if DEBUG_HANG
                 char s_addr[INET6_ADDRSTRLEN];
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
