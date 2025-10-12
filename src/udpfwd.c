@@ -1357,29 +1357,59 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         /* Send out the batch to client, retry on partial */
         int remaining = n;
         struct mmsghdr *msgp = msgs;
+        int total_sent = 0;
         do {
             int sent = sendmmsg(lsn_sock, msgp, remaining, 0);
             if (sent < 0) {
                 if (is_temporary_errno(errno)) {
                     /* leave remaining for later */
+#if DEBUG_HANG
+                    P_LOG_INFO("[HANG_DEBUG] sendmmsg(client) temporary error: %s, sent=%d/%d",
+                               strerror(errno), total_sent, n);
+#endif
                     break;
                 }
-                P_LOG_WARN("sendmmsg(client) failed: %s, attempted=%d, remaining=%d",
-                           strerror(errno), remaining, remaining);
+                /* Always log send failures - this is critical! */
+                char s_addr[INET6_ADDRSTRLEN];
+                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                          s_addr, sizeof(s_addr));
+                P_LOG_WARN("sendmmsg(client) FAILED for %s:%d: %s, sent=%d/%d, remaining=%d",
+                           s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                           strerror(errno), total_sent, n, remaining);
                 break;
             }
             if (sent == 0) {
                 /* Avoid tight loop if nothing progressed */
-                P_LOG_WARN("sendmmsg(client) sent 0 packets, remaining=%d", remaining);
+                char s_addr[INET6_ADDRSTRLEN];
+                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                          s_addr, sizeof(s_addr));
+                P_LOG_WARN("sendmmsg(client) sent 0 packets for %s:%d, sent=%d/%d, remaining=%d",
+                           s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                           total_sent, n, remaining);
                 break;
             }
             if (sent < remaining) {
                 /* Partial send - log for debugging */
-                P_LOG_INFO("sendmmsg(client) partial: sent=%d, remaining=%d", sent, remaining);
+#if DEBUG_HANG
+                P_LOG_INFO("[HANG_DEBUG] sendmmsg(client) partial: sent=%d, remaining=%d",
+                           sent, remaining);
+#endif
             }
+            total_sent += sent;
             remaining -= sent;
             msgp += sent;
         } while (remaining > 0);
+        
+#if DEBUG_HANG
+        if (total_sent < n) {
+            char s_addr[INET6_ADDRSTRLEN];
+            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                      s_addr, sizeof(s_addr));
+            P_LOG_INFO("[HANG_DEBUG] Incomplete send to %s:%d: sent=%d/%d",
+                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                       total_sent, n);
+        }
+#endif
     }
     return;
 #else
@@ -1404,8 +1434,15 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
 
         ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
                             sizeof_sockaddr(&conn->cli_addr));
-        if (wr < 0)
-            log_if_unexpected_errno("sendto(client)");
+        if (wr < 0) {
+            /* Always log send failures - this is critical! */
+            char s_addr[INET6_ADDRSTRLEN];
+            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                      s_addr, sizeof(s_addr));
+            P_LOG_WARN("sendto(client) FAILED for %s:%d: %s, packet_size=%d",
+                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                       strerror(errno), r);
+        }
 
         if (r < (int)sizeof(buffer)) {
             break; /* Drained */
