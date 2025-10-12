@@ -136,7 +136,7 @@
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
 /* Event loop timeout (ms) */
-#define EPOLL_WAIT_TIMEOUT_MS 2000
+#define EPOLL_WAIT_TIMEOUT_MS 500  /* Reduced from 2000ms for faster signal response */
 /* Fairness caps to avoid starving other fds per wake */
 #define CLIENT_MAX_ITERATIONS 64
 #define SERVER_MAX_ITERATIONS 64
@@ -1075,41 +1075,46 @@ static void proxy_conn_walk_continue(int epfd) {
     LIST_HEAD(reap_list);
     struct proxy_conn *conn, *tmp;
 
-    /* Collect all expired connections into a temporary reap_list */
+    /* Collect all expired connections into a temporary reap_list.
+     * IMPORTANT: Do NOT log or do I/O while holding the lock! */
     list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
+        /* Check shutdown flag to allow fast exit */
+        if (g_shutdown_requested) {
+            pthread_mutex_unlock(&g_lru_lock);
+            return;
+        }
+        
         long diff = (long)(now - conn->last_active);
-
         if (diff < 0)
             diff = 0;
+        
         if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
-            /* Always log connection recycling with detailed info (not just in DEBUG_HANG) */
-            char s_addr[INET6_ADDRSTRLEN] = "";
-            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                      s_addr, sizeof(s_addr));
-            P_LOG_INFO("Recycling %s:%d - last_active=%ld, now=%ld, idle=%ld sec, timeout=%u sec, "
-                       "client_pkts=%lu, server_pkts=%lu",
-                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                       conn->last_active, now, diff, g_cfg.proxy_conn_timeo,
-                       conn->client_packets, conn->server_packets);
-            proxy_conn_put(conn, epfd);
+            /* Move to reap_list for processing outside the lock */
+            list_move_tail(&conn->lru, &reap_list);
         } else {
             /* List is ordered, so we can stop at the first non-expired conn */
             break;
         }
     }
 
-    /* Now that we're done touching the global list, we can unlock it */
+    /* Release lock BEFORE logging or doing I/O */
     pthread_mutex_unlock(&g_lru_lock);
-
-    /* Reap the collected connections without holding the global LRU lock */
+    
+    /* Now process the reap_list without holding the lock */
     list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
+        /* Log connection recycling with detailed info */
         char s_addr[INET6_ADDRSTRLEN] = "";
-        union sockaddr_inx addr = conn->cli_addr;
-
+        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                  s_addr, sizeof(s_addr));
+        P_LOG_INFO("Recycling %s:%d - last_active=%ld, now=%ld, idle=%ld sec, timeout=%u sec, "
+                   "client_pkts=%lu, server_pkts=%lu",
+                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                   conn->last_active, now,
+                   (long)(now - conn->last_active), g_cfg.proxy_conn_timeo,
+                   conn->client_packets, conn->server_packets);
+        
+        /* Actually recycle the connection */
         proxy_conn_put(conn, epfd);
-        inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
-        P_LOG_INFO("Recycled %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
-                   atomic_load(&conn_tbl_len));
     }
 }
 
