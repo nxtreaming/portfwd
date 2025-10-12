@@ -317,6 +317,7 @@ static inline time_t cached_now_seconds(void) {
     time_t now = atomic_load(&g_now_ts);
     if (now == 0) {
         now = monotonic_seconds();
+        atomic_store(&g_now_ts, now);
     }
     return now;
 }
@@ -1119,6 +1120,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 break;
             }
 
+            atomic_store(&g_now_ts, monotonic_seconds());
+
             for (int i = 0; i < n; i++) {
                 union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
                 size_t packet_len = c_msgs[i].msg_len;
@@ -1173,6 +1176,8 @@ static void handle_client_data(int lsn_sock, int epfd) {
             log_if_unexpected_errno("recvfrom()");
         return;
     }
+
+    atomic_store(&g_now_ts, monotonic_seconds());
 
     if (!validate_packet(buffer, (size_t)r, &cli_addr))
         return;
@@ -1247,6 +1252,8 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
             return;
         }
 
+        atomic_store(&g_now_ts, monotonic_seconds());
+
         /* Prepare destination (original client) for each message */
         /* All packets are for the same connection, so touch it only once per batch. */
         touch_proxy_conn(conn);
@@ -1302,6 +1309,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         }
 
         /* r >= 0: forward even zero-length datagrams */
+        atomic_store(&g_now_ts, monotonic_seconds());
         touch_proxy_conn(conn);
 
         ssize_t wr = sendto(lsn_sock, buffer, r, 0, (struct sockaddr *)&conn->cli_addr,
@@ -1691,6 +1699,10 @@ int main(int argc, char *argv[]) {
         int nfds;
         time_t current_ts = monotonic_seconds();
 
+        /* Refresh cached timestamp immediately so maintenance passes see the
+         * up-to-date wall clock. */
+        atomic_store(&g_now_ts, current_ts);
+
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
             proxy_conn_walk_continue(epfd);
@@ -1705,20 +1717,21 @@ int main(int argc, char *argv[]) {
                 break;
         }
 
-        /* Cache current timestamp for hot paths - atomic update */
-        atomic_store(&g_now_ts, current_ts);
-
         /* Check shutdown flag before blocking */
         if (g_shutdown_requested)
             break;
 
         /* Wait for events */
         nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
-        
+
+        /* Update cached timestamp for event handlers regardless of wait result. */
+        current_ts = monotonic_seconds();
+        atomic_store(&g_now_ts, current_ts);
+
         /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
         if (g_shutdown_requested)
             break;
-        
+
         if (nfds == 0)
             continue; /* Timeout, loop back to check shutdown flag */
         if (nfds < 0) {
