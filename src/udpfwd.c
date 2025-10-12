@@ -783,6 +783,13 @@ static inline uint32_t hash_addr(const union sockaddr_inx *a) {
 }
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
+    /* When timeout is disabled (proxy_conn_timeo == 0), skip all timestamp
+     * and LRU updates to eliminate lock contention and improve performance.
+     * UDP is connectionless - we don't need timestamps to track "liveness". */
+    if (g_cfg.proxy_conn_timeo == 0) {
+        return;  /* Fast path: no timeout checking needed */
+    }
+    
     /* Keep the LRU ordering in sync with the timestamp that drives expiration */
     time_t now = cached_now_seconds();
     
@@ -1859,7 +1866,8 @@ int main(int argc, char *argv[]) {
 #endif
 
         /* Periodic timeout check and connection recycling */
-        if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
+        /* Skip maintenance cycle if timeout is disabled (proxy_conn_timeo == 0) */
+        if (g_cfg.proxy_conn_timeo != 0 && (long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
             /* Ensure maintenance walkers observe the real current time. */
             atomic_store(&g_now_ts, current_ts);
 #if DEBUG_HANG
