@@ -136,11 +136,6 @@
 #define SERVER_MAX_ITERATIONS 64
 /* Maintenance tick interval (seconds) */
 #define MAINT_INTERVAL_SEC 2
-/* LRU segmented update interval (seconds) */
-#define LRU_UPDATE_INTERVAL_SEC 1
-/* Cap for LRU segmented processing per tick */
-#define LRU_MAX_BUCKETS_PER_SEGMENT 256
-
 /* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
 /* Increased from 256KB to 2MB for better throughput */
@@ -238,15 +233,6 @@ static struct adaptive_batch g_adaptive_batch = {
 static LIST_HEAD(g_lru_list);
 static pthread_mutex_t g_lru_lock = PTHREAD_MUTEX_INITIALIZER;
 
-#if ENABLE_LRU_LOCKS
-/* Segmented LRU update state to avoid O(N) scans */
-static struct {
-    unsigned next_bucket;         /* Next bucket to scan in segmented update */
-    time_t last_segment_update;   /* Last time we did a segment update */
-    unsigned buckets_per_segment; /* How many buckets to process per segment */
-} g_lru_segment_state = {0, 0, 64};
-#endif
-
 /* Cached current timestamp (monotonic seconds on Linux) for hot paths */
 static atomic_long g_now_ts; /**< Atomic timestamp cache */
 
@@ -256,7 +242,6 @@ static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 /* Additional performance statistics */
 static _Atomic uint64_t g_stat_hash_collisions;
 static _Atomic uint64_t g_stat_lru_immediate_updates;
-static _Atomic uint64_t g_stat_lru_deferred_updates;
 
 /* Per-thread statistics to reduce atomic contention */
 #define MAX_THREAD_STATS 64
@@ -788,75 +773,20 @@ static inline uint32_t hash_addr(const union sockaddr_inx *a) {
 }
 
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
-    /* Update timestamp only; defer LRU updates to periodic maintenance */
+    /* Keep the LRU ordering in sync with the timestamp that drives expiration */
     time_t now = cached_now_seconds();
-    /* Only update if timestamp changed to reduce cache line writes */
-    if (conn->last_active != now) {
-        conn->last_active = now;
-#if ENABLE_LRU_LOCKS
-        conn->needs_lru_update = true;
-#endif
-    }
-}
-
-/* Segmented LRU update to avoid O(N) scans - process only a subset of buckets
- * each time */
-static void segmented_update_lru(void) {
-#if ENABLE_LRU_LOCKS
-    time_t now = time(NULL);
-
-    /* Only update segments every 1 second to reduce overhead */
-    if (now - g_lru_segment_state.last_segment_update < LRU_UPDATE_INTERVAL_SEC) {
+    if (conn->last_active == now)
         return;
-    }
-    g_lru_segment_state.last_segment_update = now;
 
-    /* Adjust buckets per segment based on total hash table size */
-    if (g_lru_segment_state.buckets_per_segment == 0) {
-        g_lru_segment_state.buckets_per_segment = (g_conn_tbl_hash_size / 32) + 1;
-        if (g_lru_segment_state.buckets_per_segment > LRU_MAX_BUCKETS_PER_SEGMENT) {
-            g_lru_segment_state.buckets_per_segment = LRU_MAX_BUCKETS_PER_SEGMENT;
-        }
+    conn->last_active = now;
+#if ENABLE_LRU_LOCKS
+    pthread_mutex_lock(&g_lru_lock);
+    /* Connections are linked into g_lru_list once established; guard for safety */
+    if (!list_empty(&conn->lru)) {
+        list_move_tail(&conn->lru, &g_lru_list);
     }
-
-    /* Process only a segment of buckets to spread the work over time */
-    unsigned start_bucket = g_lru_segment_state.next_bucket;
-    unsigned end_bucket = start_bucket + g_lru_segment_state.buckets_per_segment;
-    if (end_bucket > g_conn_tbl_hash_size) {
-        end_bucket = g_conn_tbl_hash_size;
-    }
-
-    for (unsigned i = start_bucket; i < end_bucket; i++) {
-        struct proxy_conn *conn, *tmp;
-        bool took_lru_lock = false;
-#if ENABLE_FINE_GRAINED_LOCKS
-        pthread_spin_lock(&conn_tbl_locks[i]);
-#endif
-        list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
-            if (conn->needs_lru_update) {
-                if (!took_lru_lock) {
-                    /* lock order: bucket -> LRU to avoid deadlock with release path */
-                    pthread_mutex_lock(&g_lru_lock);
-                    took_lru_lock = true;
-                }
-                list_del(&conn->lru);
-                list_add_tail(&conn->lru, &g_lru_list);
-                conn->needs_lru_update = false;
-            }
-        }
-        if (took_lru_lock) {
-            pthread_mutex_unlock(&g_lru_lock);
-        }
-#if ENABLE_FINE_GRAINED_LOCKS
-        pthread_spin_unlock(&conn_tbl_locks[i]);
-#endif
-    }
-
-    /* Update next segment start position */
-    g_lru_segment_state.next_bucket = end_bucket;
-    if (g_lru_segment_state.next_bucket >= g_conn_tbl_hash_size) {
-        g_lru_segment_state.next_bucket = 0; /* Wrap around */
-    }
+    pthread_mutex_unlock(&g_lru_lock);
+    atomic_fetch_add_explicit(&g_stat_lru_immediate_updates, 1, memory_order_relaxed);
 #endif
 }
 
@@ -1764,8 +1694,6 @@ int main(int argc, char *argv[]) {
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
             proxy_conn_walk_continue(epfd);
-            /* Segmented LRU update to reduce per-packet overhead */
-            segmented_update_lru();
             /* Process any queued backpressure packets */
 #if ENABLE_BACKPRESSURE_QUEUE
             process_backpressure_queue();
@@ -1863,26 +1791,23 @@ cleanup:
 #endif
 
     /* Aggregate thread-local statistics */
-    uint64_t total_packets = 0, total_bytes = 0, total_hash_collisions = 0, total_lru_updates = 0;
+    uint64_t total_packets = 0, total_bytes = 0, total_hash_collisions = 0;
     for (int i = 0; i < MAX_THREAD_STATS; i++) {
         total_packets += g_thread_stats[i].packets_processed;
         total_bytes += g_thread_stats[i].bytes_processed;
         total_hash_collisions += g_thread_stats[i].hash_collisions;
-        total_lru_updates += g_thread_stats[i].lru_updates;
     }
 
     /* Print performance statistics */
     uint64_t hash_collisions = atomic_load(&g_stat_hash_collisions) + total_hash_collisions;
     uint64_t lru_immediate = atomic_load(&g_stat_lru_immediate_updates);
-    uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates) + total_lru_updates;
 
     P_LOG_INFO("Performance statistics:");
     P_LOG_INFO("  Total packets processed: %" PRIu64, total_packets);
     P_LOG_INFO("  Total bytes processed: %" PRIu64, total_bytes);
     P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", hash_collisions,
                total_packets > 0 ? (double)hash_collisions / total_packets : 0.0);
-    P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64, lru_immediate,
-               lru_deferred);
+    P_LOG_INFO("  LRU updates: %" PRIu64, lru_immediate);
 
     if (total_packets > 0 && hash_collisions > total_packets / 2) {
         P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash "
