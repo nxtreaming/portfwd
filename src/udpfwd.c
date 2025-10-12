@@ -19,6 +19,12 @@
 #include "proxy_conn.h"
 #include "list.h"
 
+/* ============ DEBUG FLAGS (can be enabled via -DDEBUG_HANG=1) ============ */
+#ifndef DEBUG_HANG
+#define DEBUG_HANG 0  /* Set to 1 to enable hang debugging, or use -DDEBUG_HANG=1 */
+#endif
+/* ========================================================================= */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -284,7 +290,7 @@ static struct backpressure_queue g_backpressure_queue;
 #endif /* ENABLE_BACKPRESSURE_QUEUE */
 
 /* Hash functions */
-static uint32_t hash_addr(const union sockaddr_inx *a);
+static uint32_t hash_addr(const union sockaddr_inx *sa);
 
 /* Connection management */
 static void proxy_conn_walk_continue(int epfd);
@@ -318,6 +324,9 @@ static inline time_t cached_now_seconds(void) {
     if (now == 0) {
         now = monotonic_seconds();
         atomic_store(&g_now_ts, now);
+#if DEBUG_HANG
+        P_LOG_INFO("[HANG_DEBUG] g_now_ts initialized to %ld", now);
+#endif
     }
     return now;
 }
@@ -776,10 +785,24 @@ static inline uint32_t hash_addr(const union sockaddr_inx *a) {
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Keep the LRU ordering in sync with the timestamp that drives expiration */
     time_t now = cached_now_seconds();
+    time_t old_active = conn->last_active;
+    
     if (conn->last_active == now)
         return;
 
     conn->last_active = now;
+    
+#if DEBUG_HANG
+    /* Log significant time gaps to detect timestamp issues */
+    if (now - old_active > 60) {
+        char s_addr[INET6_ADDRSTRLEN];
+        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                  s_addr, sizeof(s_addr));
+        P_LOG_INFO("[HANG_DEBUG] Connection %s:%d last_active jumped: %ld -> %ld (gap: %ld sec)",
+                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                   old_active, now, now - old_active);
+    }
+#endif
 #if ENABLE_LRU_LOCKS
     pthread_mutex_lock(&g_lru_lock);
     /* Connections are linked into g_lru_list once established; guard for safety */
@@ -1042,10 +1065,15 @@ static void proxy_conn_walk_continue(int epfd) {
         if (diff < 0)
             diff = 0;
         if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
-            /* Move from LRU to our local reap list */
-            list_move_tail(&conn->lru, &reap_list);
-            /* CRITICAL: Hold reference to prevent use-after-free */
-            proxy_conn_hold(conn);
+#if DEBUG_HANG
+            char s_addr[INET6_ADDRSTRLEN] = "";
+            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                      s_addr, sizeof(s_addr));
+            P_LOG_INFO("[HANG_DEBUG] Recycling %s:%d - last_active=%ld, now=%ld, diff=%ld, timeout=%u",
+                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                       conn->last_active, now, diff, g_cfg.proxy_conn_timeo);
+#endif
+            proxy_conn_put(conn, epfd);
         } else {
             /* List is ordered, so we can stop at the first non-expired conn */
             break;
@@ -1556,6 +1584,21 @@ int main(int argc, char *argv[]) {
     if (g_cfg.daemonize) {
         if (do_daemonize() != 0)
             return 1;
+        
+        /* Open log file in daemon mode: /var/log/udpfwd_${port}.log */
+        char log_path[256];
+        unsigned short listen_port = ntohs(*port_of_sockaddr(&g_cfg.listen_addr));
+        snprintf(log_path, sizeof(log_path), "/var/log/udpfwd_%u.log", listen_port);
+        
+        g_state.log_file = fopen(log_path, "a");
+        if (!g_state.log_file) {
+            /* Fall back to syslog if log file cannot be opened */
+            syslog(LOG_WARNING, "Failed to open log file %s: %s, using syslog", 
+                   log_path, strerror(errno));
+        } else {
+            /* Log startup message */
+            P_LOG_INFO("UDP forwarder started, logging to %s", log_path);
+        }
     }
 
     if (g_cfg.pidfile) {
@@ -1731,6 +1774,12 @@ int main(int argc, char *argv[]) {
         current_ts = monotonic_seconds();
         if (current_ts != pre_wait_ts) {
             atomic_store(&g_now_ts, current_ts);
+#if DEBUG_HANG
+            if (current_ts - pre_wait_ts > 5) {
+                P_LOG_INFO("[HANG_DEBUG] Main loop: g_now_ts updated %ld -> %ld (epoll blocked %ld sec)",
+                           pre_wait_ts, current_ts, current_ts - pre_wait_ts);
+            }
+#endif
         }
         
         /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
@@ -1836,6 +1885,13 @@ cleanup:
         double throughput_pps = (double)total_packets / (time(NULL) - last_check + 1);
         P_LOG_INFO("  Estimated throughput: %.0f packets/sec", throughput_pps);
     }
+    
+    /* Close log file if opened */
+    if (g_state.log_file) {
+        fclose(g_state.log_file);
+        g_state.log_file = NULL;
+    }
+    
     closelog();
 
     return rc;

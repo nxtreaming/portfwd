@@ -3,7 +3,8 @@
 #include <assert.h>
 #include <sys/file.h>
 #include <stdarg.h>
-struct app_state g_state = {.daemonized = false};
+#include <time.h>
+struct app_state g_state = {.daemonized = false, .log_file = NULL};
 
 /* Simple sanitizer: mask long hex-like sequences (potential keys) */
 static void sanitize_message(char *dst, size_t dst_sz, const char *src) {
@@ -41,7 +42,27 @@ void log_msg(int level, const char *fmt, ...) {
     sanitize_message(s_buf, sizeof(s_buf), buf);
 
     if (g_state.daemonized) {
-        syslog(level, "%s", s_buf);
+        /* Daemon mode: write to log file if available, otherwise use syslog */
+        if (g_state.log_file) {
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            char timestamp[64];
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+            
+            const char *level_str = "INFO";
+            switch (level) {
+                case LOG_ERR: level_str = "ERROR"; break;
+                case LOG_WARNING: level_str = "WARN"; break;
+                case LOG_INFO: level_str = "INFO"; break;
+                case LOG_DEBUG: level_str = "DEBUG"; break;
+                case LOG_CRIT: level_str = "CRIT"; break;
+            }
+            
+            fprintf(g_state.log_file, "%s [%s] %s\n", timestamp, level_str, s_buf);
+            fflush(g_state.log_file);  /* Ensure immediate write */
+        } else {
+            syslog(level, "%s", s_buf);
+        }
     } else {
         fprintf(stderr, "%s\n", s_buf);
     }

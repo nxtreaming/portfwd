@@ -31,6 +31,7 @@ union sockaddr_inx {
 
 struct app_state {
     bool daemonized;
+    FILE *log_file;  /* Log file handle for daemon mode */
 };
 
 extern struct app_state g_state;
