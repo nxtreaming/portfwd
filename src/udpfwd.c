@@ -1691,6 +1691,10 @@ int main(int argc, char *argv[]) {
         int nfds;
         time_t current_ts = monotonic_seconds();
 
+        /* Refresh cached timestamp immediately so maintenance passes see the
+         * up-to-date wall clock. */
+        atomic_store(&g_now_ts, current_ts);
+
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
             proxy_conn_walk_continue(epfd);
@@ -1705,15 +1709,16 @@ int main(int argc, char *argv[]) {
                 break;
         }
 
-        /* Cache current timestamp for hot paths - atomic update */
-        atomic_store(&g_now_ts, current_ts);
-
         /* Check shutdown flag before blocking */
         if (g_shutdown_requested)
             break;
 
         /* Wait for events */
         nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
+    
+        /* Update cached timestamp for event handlers regardless of wait result. */
+        current_ts = monotonic_seconds();
+        atomic_store(&g_now_ts, current_ts);
         
         /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
         if (g_shutdown_requested)
