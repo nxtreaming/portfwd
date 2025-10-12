@@ -1096,6 +1096,14 @@ static void proxy_conn_walk_continue(int epfd) {
             diff = 0;
         
         if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
+            unsigned ref = atomic_load_explicit(&conn->ref_count, memory_order_acquire);
+            if (unlikely(ref != 1)) {
+                if (unlikely(ref == 0)) {
+                    P_LOG_WARN("Skipping expired conn with ref_count=0 for %s:%d", sockaddr_to_string(&conn->cli_addr), ntohs(*port_of_sockaddr(&conn->cli_addr)));
+                }
+                /* Connection still referenced somewhere else; skip for now. */
+                continue;
+            }
             /* Move to reap_list for processing outside the lock */
             list_move_tail(&conn->lru, &reap_list);
         } else {
