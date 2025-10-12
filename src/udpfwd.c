@@ -1694,6 +1694,7 @@ int main(int argc, char *argv[]) {
         /* Refresh cached timestamp immediately so maintenance passes see the
          * up-to-date wall clock. */
         atomic_store(&g_now_ts, current_ts);
+        time_t pre_wait_ts = current_ts;
 
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
@@ -1716,9 +1717,13 @@ int main(int argc, char *argv[]) {
         /* Wait for events */
         nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
     
-        /* Update cached timestamp for event handlers regardless of wait result. */
+        /* Update cached timestamp only if time has advanced since pre-wait.
+         * This avoids redundant atomic stores when epoll_wait returns immediately
+         * (high PPS scenario), improving performance while maintaining correctness. */
         current_ts = monotonic_seconds();
-        atomic_store(&g_now_ts, current_ts);
+        if (current_ts != pre_wait_ts) {
+            atomic_store(&g_now_ts, current_ts);
+        }
         
         /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
         if (g_shutdown_requested)
