@@ -785,15 +785,18 @@ static inline uint32_t hash_addr(const union sockaddr_inx *a) {
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Keep the LRU ordering in sync with the timestamp that drives expiration */
     time_t now = cached_now_seconds();
-    time_t old_active = conn->last_active;
     
     if (conn->last_active == now)
         return;
 
+#if DEBUG_HANG
+    /* Log significant time gaps to detect timestamp issues */
+    time_t old_active = conn->last_active;
+#endif
+
     conn->last_active = now;
     
 #if DEBUG_HANG
-    /* Log significant time gaps to detect timestamp issues */
     if (now - old_active > 60) {
         char s_addr[INET6_ADDRSTRLEN];
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
