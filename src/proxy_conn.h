@@ -65,6 +65,10 @@ struct proxy_conn {
     time_t last_active;
     time_t last_addr_warn; /* Last time we warned about unexpected UDP source */
     struct list_head lru;  /* LRU linkage: oldest at head, newest at tail */
+    
+    /* Statistics (always enabled for diagnostics) */
+    unsigned long client_packets;  /* Packets received from client */
+    unsigned long server_packets;  /* Packets received from server */
 
     /* KCP tunneling fields (used by kcptcp-* binaries) */
     struct IKCPCB *kcp; /* KCP control block */
