@@ -64,11 +64,6 @@
 #define BATCH_HIGH_UTILIZATION_RATIO 0.9 /* Increased from 0.8 */
 #define BATCH_LOW_UTILIZATION_RATIO 0.1  /* Decreased from 0.3 */
 
-#define BATCH_HASH_SIZE 2048
-
-/* Robin Hood hashing parameters for better collision handling */
-#define RH_MAX_PROBE_LENGTH 32
-#define RH_LOAD_FACTOR_THRESHOLD 0.75
 
 /* Performance optimization flags */
 #ifndef DISABLE_ADAPTIVE_BATCHING
@@ -158,9 +153,6 @@
 /* Increased from 16 for much better performance */
 #define UDP_PROXY_BATCH_SZ 64
 #endif
-
-/* Maximum number of concurrent server sockets in one batch cycle */
-#define MAX_CONCURRENT_BATCHES UDP_PROXY_BATCH_SZ
 
 #ifndef UDP_PROXY_DGRAM_CAP
 /* Max safe UDP payload size: 1500 - 8 (UDP header) - 20 (IPv4 header) */
@@ -261,10 +253,6 @@ static atomic_long g_now_ts; /**< Atomic timestamp cache */
 /* Function pointer to compute bucket index from a 32-bit hash */
 static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 
-/* Stats: batch overflow immediate-sends (client->server) - atomic counters */
-static _Atomic uint64_t g_stat_c2s_batch_socket_overflow;
-static _Atomic uint64_t g_stat_c2s_batch_entry_overflow;
-
 /* Additional performance statistics */
 static _Atomic uint64_t g_stat_hash_collisions;
 static _Atomic uint64_t g_stat_lru_immediate_updates;
@@ -321,7 +309,6 @@ static bool proxy_conn_evict_one(int epfd);
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd);
 #ifdef __linux__
 static void handle_client_data(int listen_sock, int epfd, struct mmsghdr *c_msgs,
-                               struct mmsghdr *s_msgs, struct iovec *s_iovs,
                                char (*c_bufs)[UDP_PROXY_DGRAM_CAP]);
 #else
 static void handle_client_data(int listen_sock, int epfd);
@@ -383,25 +370,11 @@ static inline void log_if_unexpected_errno(const char *what) {
     }
 }
 
-/* Prepare an iovec array from a list of message indices (helper for batching). */
-static inline void fill_iov_from_batch(const struct mmsghdr *c_msgs,
-                                       char (*c_bufs)[UDP_PROXY_DGRAM_CAP],
-                                       const int *msg_indices,
-                                       int count,
-                                       struct iovec *out_iovs) {
-    for (int k = 0; k < count; k++) {
-        const int msg_idx = msg_indices[k];
-        out_iovs[k].iov_base = c_bufs[msg_idx];
-        out_iovs[k].iov_len = c_msgs[msg_idx].msg_len;
-    }
-}
-
 /* Linux batching support */
 #ifdef __linux__
 static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
                                     struct sockaddr_storage **c_addrs,
-                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr **s_msgs,
-                                    struct iovec **s_iovs);
+                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP]);
 #endif
 
 #if ENABLE_RATE_LIMITING
@@ -715,15 +688,6 @@ static void adjust_batch_size(void) {
     pthread_mutex_unlock(&g_adaptive_batch.lock);
 }
 #endif /* ENABLE_ADAPTIVE_BATCHING */
-
-/* Get current optimal batch size */
-static int get_optimal_batch_size(void) {
-#if ENABLE_ADAPTIVE_BATCHING
-    return g_adaptive_batch.current_size;
-#else
-    return UDP_PROXY_BATCH_SZ; /* Use fixed batch size for maximum performance */
-#endif
-}
 
 /* Record batch statistics */
 static void record_batch_stats(int packets_in_batch) {
@@ -1201,7 +1165,6 @@ static bool proxy_conn_evict_one(int epfd) {
 
 #ifdef __linux__
 static void handle_client_data(int lsn_sock, int epfd, struct mmsghdr *c_msgs,
-                               struct mmsghdr *s_msgs, struct iovec *s_iovs,
                                char (*c_bufs)[UDP_PROXY_DGRAM_CAP]) {
 #else
 static void handle_client_data(int lsn_sock, int epfd) {
@@ -1209,13 +1172,12 @@ static void handle_client_data(int lsn_sock, int epfd) {
     struct proxy_conn *conn;
 
 #ifdef __linux__
-    if (c_msgs && s_msgs) {
-        /* Drain multiple batches per epoll wake to reduce syscalls */
+    if (c_msgs && c_bufs) {
         int iterations = 0;
-        const int max_iterations = CLIENT_MAX_ITERATIONS; /* fairness cap per tick */
+        const int max_iterations = CLIENT_MAX_ITERATIONS;
         const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
+
         for (; iterations < max_iterations; iterations++) {
-            /* Ensure namelen is reset before each recvmmsg call */
             for (int i = 0; i < ncap; i++) {
                 c_msgs[i].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
             }
@@ -1224,183 +1186,40 @@ static void handle_client_data(int lsn_sock, int epfd) {
             if (n <= 0) {
                 if (n < 0)
                     log_if_unexpected_errno("recvmmsg()");
-                break; /* no more to read now */
+                break;
             }
-
-            struct send_batch {
-                int sock;
-                struct proxy_conn *conn;
-                int msg_indices[UDP_PROXY_BATCH_SZ];
-                int count;
-                int probe_distance; /* Robin Hood hashing: track probe distance */
-            } batches[MAX_CONCURRENT_BATCHES];
-            int num_batches = 0;
-
-            /* Hash table for O(1) batch lookup with Robin Hood hashing */
-            int batch_hash[BATCH_HASH_SIZE];
-            memset(batch_hash, -1, sizeof(batch_hash));
 
             for (int i = 0; i < n; i++) {
                 union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
-
-                /* Validate packet size and rate limits */
                 size_t packet_len = c_msgs[i].msg_len;
-                if (unlikely(!validate_packet(c_bufs[i], packet_len, sa))) {
-                    continue; /* Drop invalid packet */
-                }
-                if (unlikely(!check_rate_limit(sa, packet_len))) {
-                    continue; /* Drop rate-limited packet */
-                }
 
-                if (unlikely(!(conn = proxy_conn_get_or_create(sa, epfd))))
+                if (unlikely(!validate_packet(c_bufs[i], packet_len, sa)))
                     continue;
+                if (unlikely(!check_rate_limit(sa, packet_len)))
+                    continue;
+
+                conn = proxy_conn_get_or_create(sa, epfd);
+                if (!conn)
+                    continue;
+
                 touch_proxy_conn(conn);
-                /* Prefetch for next iteration */
-                PREFETCH_READ(&conn->svr_sock);
 
-                /* O(1) batch lookup using Robin Hood hashing for better collision handling */
-                int hash_key = conn->svr_sock % BATCH_HASH_SIZE;
-                int batch_idx = batch_hash[hash_key];
-                int probe_count = 0;
-
-                /* Robin Hood hashing: probe with distance tracking */
-                while (batch_idx != -1 && batches[batch_idx].sock != conn->svr_sock &&
-                       probe_count < RH_MAX_PROBE_LENGTH) {
-                    hash_key = (hash_key + 1) % BATCH_HASH_SIZE;
-                    batch_idx = batch_hash[hash_key];
-                    probe_count++;
-                }
-
-                /* Track hash collision statistics - use thread-local to reduce contention */
-                if (unlikely(probe_count > 0)) {
-                    tls_stats.hash_collisions += probe_count;
-                }
-
-                /* Early exit if probe chain too long (avoid pathological cases) */
-                if (unlikely(probe_count >= RH_MAX_PROBE_LENGTH && batch_idx != -1 && 
-                    batches[batch_idx].sock != conn->svr_sock)) {
-                    /* Fallback to immediate send to avoid excessive probing */
-#if ENABLE_STATS_ATOMICS
-                    atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
-#endif
-                    ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
-                    if (wr < 0)
-                        log_if_unexpected_errno("send(server, probe_overflow)");
-                    /* Caller ref not transferred to batch; release it */
-                    proxy_conn_put(conn, epfd);
-                    continue;
-                }
-
-                /* If we found a matching socket or an empty slot */
-                if (batch_idx == -1) {
-                    /* Check if we can create a new batch */
-                    if (unlikely(num_batches >= MAX_CONCURRENT_BATCHES)) {
-#if ENABLE_STATS_ATOMICS
-                        atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, 1);
-#endif
-                        ssize_t wr = send(conn->svr_sock, c_bufs[i], c_msgs[i].msg_len, 0);
-                        if (wr < 0)
-                            log_if_unexpected_errno("send(server, overflow)");
-                        /* Not added to any batch: release caller ref */
-                        proxy_conn_put(conn, epfd);
-                        continue;
-                    }
-                    batch_idx = num_batches++;
-                    /* Transfer ownership: batch holds one ref; caller releases its ref */
-                    proxy_conn_hold(conn);
-                    batches[batch_idx].sock = conn->svr_sock;
-                    batches[batch_idx].conn = conn;
-                    batches[batch_idx].count = 0;
-                    batches[batch_idx].probe_distance = probe_count;
-                    /* Update hash table for O(1) future lookups */
-                    batch_hash[hash_key] = batch_idx;
-                    /* Release caller reference; batch retains its own */
-                    proxy_conn_put(conn, epfd);
-                }
-                if (batches[batch_idx].count >= get_optimal_batch_size()) {
-#if ENABLE_STATS_ATOMICS
-                    atomic_fetch_add(&g_stat_c2s_batch_entry_overflow, 1);
-#endif
-
-                    /* Batch is full, flush it now to make space */
-                    struct send_batch *b = &batches[batch_idx];
-                    fill_iov_from_batch(c_msgs, c_bufs, b->msg_indices, b->count, s_iovs);
-                    if (sendmmsg(b->sock, s_msgs, b->count, 0) < 0) {
-                        if (!is_temporary_errno(errno)) {
-                            log_if_unexpected_errno("sendmmsg(server, batch_full)");
-                        }
-                    }
-
-                    /* Reset batch and add current packet */
-                    b->count = 0;
-                    batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
-
+                ssize_t wr = send(conn->svr_sock, c_bufs[i], packet_len, 0);
+                if (wr < 0) {
+                    log_if_unexpected_errno("send(server)");
                 } else {
-                    batches[batch_idx].msg_indices[batches[batch_idx].count++] = i;
+                    tls_stats.bytes_processed += (size_t)wr;
                 }
-                /* If we used an existing batch, we still need to drop caller ref now */
-                if (batches[batch_idx].conn != conn) {
-                    proxy_conn_put(conn, epfd);
-                }
-            }
-            for (int i = 0; i < num_batches; i++) {
-                struct send_batch *b = &batches[i];
-                fill_iov_from_batch(c_msgs, c_bufs, b->msg_indices, b->count, s_iovs);
-                /* s_msgs already configured in init loop */
-
-                /* Retry on partial send to avoid dropping remaining packets */
-                int remaining = b->count;
-                if (remaining > g_batch_sz_runtime)
-                    remaining = g_batch_sz_runtime;
-                struct mmsghdr *msgp = s_msgs;
-                do {
-                    int sent = sendmmsg(b->sock, msgp, remaining, 0);
-                    if (sent < 0) {
-                        if (is_temporary_errno(errno)) {
-                            /* Socket buffer full - rely on kernel buffering,
-                             * don't queue in userspace */
-                            /* This is more efficient than copying data to
-                             * userspace queues */
-#if ENABLE_STATS_ATOMICS
-                            atomic_fetch_add(&g_stat_c2s_batch_socket_overflow, remaining);
-#endif
-                            break;
-                        }
-                        P_LOG_WARN("sendmmsg(server) failed: %s, attempted=%d, remaining=%d",
-                                   strerror(errno), remaining, remaining);
-                        break;
-                    }
-                    if (sent == 0) {
-                        /* Avoid tight loop if nothing progressed */
-                        P_LOG_WARN("sendmmsg(server) sent 0 packets, remaining=%d", remaining);
-                        break;
-                    }
-                    if (sent < remaining) {
-                        /* Partial send - log for debugging */
-                        P_LOG_INFO("sendmmsg(server) partial: sent=%d, remaining=%d", sent,
-                                   remaining);
-                    }
-                    remaining -= sent;
-                    msgp += sent;
-                } while (remaining > 0);
-                /* Release the batch-held reference now that sending is done */
-                if (b->conn) {
-                    proxy_conn_put(b->conn, epfd);
-                    b->conn = NULL;
-                }
+                proxy_conn_put(conn, epfd);
             }
 
-            /* Record batch statistics for adaptive sizing */
             record_batch_stats(n);
-            /* Update thread-local statistics */
             tls_stats.packets_processed += n;
 
-            /* If we read fewer than the batch, likely drained; stop early */
             if (n < ncap)
                 break;
         }
 
-        /* Periodically adjust batch size based on performance */
 #if ENABLE_ADAPTIVE_BATCHING
         static time_t last_adjust_check = 0;
         time_t now = time(NULL);
@@ -1422,28 +1241,26 @@ static void handle_client_data(int lsn_sock, int epfd) {
     if (r < 0) {
         if (errno)
             log_if_unexpected_errno("recvfrom()");
-        return; /* drop this datagram and move on */
+        return;
     }
 
-    /* Validate packet and check rate limits */
-    if (!validate_packet(buffer, (size_t)r, &cli_addr)) {
-        return; /* Drop invalid packet */
-    }
-    if (!check_rate_limit(&cli_addr, (size_t)r)) {
-        return; /* Drop rate-limited packet */
-    }
-
-    if (!(conn = proxy_conn_get_or_create(&cli_addr, epfd)))
+    if (!validate_packet(buffer, (size_t)r, &cli_addr))
+        return;
+    if (!check_rate_limit(&cli_addr, (size_t)r))
         return;
 
-    /* refresh activity */
+    conn = proxy_conn_get_or_create(&cli_addr, epfd);
+    if (!conn)
+        return;
+
     touch_proxy_conn(conn);
 
     ssize_t wr = send(conn->svr_sock, buffer, r, 0);
     if (wr < 0)
         log_if_unexpected_errno("send(server)");
-    
-    /* Release reference after sending */
+    else
+        tls_stats.bytes_processed += (size_t)wr;
+
     proxy_conn_put(conn, epfd);
 }
 
@@ -1572,17 +1389,14 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
 #ifdef __linux__
 static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
                                     struct sockaddr_storage **c_addrs,
-                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr **s_msgs,
-                                    struct iovec **s_iovs) {
+                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP]) {
     const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
 
     size_t size_c_msgs = (size_t)ncap * sizeof(**c_msgs);
     size_t size_c_iov  = (size_t)ncap * sizeof(**c_iov);
     size_t size_c_addrs= (size_t)ncap * sizeof(**c_addrs);
     size_t size_c_bufs = (size_t)ncap * sizeof(**c_bufs);
-    size_t size_s_msgs = (size_t)ncap * sizeof(**s_msgs);
-    size_t size_s_iovs = (size_t)ncap * sizeof(**s_iovs);
-    size_t total = size_c_msgs + size_c_iov + size_c_addrs + size_c_bufs + size_s_msgs + size_s_iovs;
+    size_t total = size_c_msgs + size_c_iov + size_c_addrs + size_c_bufs;
 
     void *block = aligned_alloc(64, align_up(total, 64));
     if (!block) {
@@ -1591,8 +1405,6 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
         *c_iov = NULL;
         *c_addrs = NULL;
         *c_bufs = NULL;
-        *s_msgs = NULL;
-        *s_iovs = NULL;
         return;
     }
 
@@ -1608,13 +1420,6 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
     p += size_c_addrs;
     *c_bufs = (char (*)[UDP_PROXY_DGRAM_CAP])p;
 
-    p += size_c_bufs;
-    *s_msgs = (struct mmsghdr *)p;
-
-    p += size_s_msgs;
-    *s_iovs = (struct iovec *)p;
-    p += size_s_iovs;
-
     /* Initialize mmsghdr/iovec structures */
     for (int i = 0; i < ncap; i++) {
         (*c_iov)[i].iov_base = (*c_bufs)[i];
@@ -1623,9 +1428,6 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
         (*c_msgs)[i].msg_hdr.msg_iovlen = 1;
         (*c_msgs)[i].msg_hdr.msg_name = &(*c_addrs)[i];
         (*c_msgs)[i].msg_hdr.msg_namelen = sizeof((*c_addrs)[i]);
-
-        (*s_msgs)[i].msg_hdr.msg_iov = &(*s_iovs)[i];
-        (*s_msgs)[i].msg_hdr.msg_iovlen = 1;
     }
 
     /* Store the base pointer for single-free at destroy time by stashing it in c_msgs[-1].msg_hdr.msg_iov */
@@ -1634,14 +1436,11 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
 
 static void destroy_batching_resources(struct mmsghdr *c_msgs, struct iovec *c_iov,
                                        struct sockaddr_storage *c_addrs,
-                                       char (*c_bufs)[UDP_PROXY_DGRAM_CAP], struct mmsghdr *s_msgs,
-                                       struct iovec *s_iovs) {
+                                       char (*c_bufs)[UDP_PROXY_DGRAM_CAP]) {
     /* Single block allocation: freeing c_msgs frees all the contiguous arrays */
     (void)c_iov;
     (void)c_addrs;
     (void)c_bufs;
-    (void)s_msgs;
-    (void)s_iovs;
     free(c_msgs);
 }
 #endif
@@ -1677,8 +1476,8 @@ int main(int argc, char *argv[]) {
     uintptr_t magic_listener = EV_MAGIC_LISTENER;
 
 #ifdef __linux__
-    struct mmsghdr *c_msgs = NULL, *s_msgs = NULL;
-    struct iovec *c_iov = NULL, *s_iovs = NULL;
+    struct mmsghdr *c_msgs = NULL;
+    struct iovec *c_iov = NULL;
     struct sockaddr_storage *c_addrs = NULL;
     char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = {0};
 #endif
@@ -1936,7 +1735,7 @@ int main(int argc, char *argv[]) {
 
     /* Optional Linux batching init */
 #ifdef __linux__
-    init_batching_resources(&c_msgs, &c_iov, &c_addrs, &c_bufs, &s_msgs, &s_iovs);
+    init_batching_resources(&c_msgs, &c_iov, &c_addrs, &c_bufs);
 #endif
 
     if (init_rate_limiter(g_cfg.max_per_ip_connections, 0, 0) != 0) {
@@ -2015,7 +1814,7 @@ int main(int argc, char *argv[]) {
                     goto cleanup;
                 }
 #ifdef __linux__
-                handle_client_data(listen_sock, epfd, c_msgs, s_msgs, s_iovs, c_bufs);
+                handle_client_data(listen_sock, epfd, c_msgs, c_bufs);
 #else
                 handle_client_data(listen_sock, epfd);
 #endif
@@ -2060,7 +1859,7 @@ cleanup:
     destroy_backpressure_queue();
 #endif
 #ifdef __linux__
-    destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs, s_msgs, s_iovs);
+    destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs);
 #endif
 
     /* Aggregate thread-local statistics */
@@ -2073,8 +1872,6 @@ cleanup:
     }
 
     /* Print performance statistics */
-    uint64_t socket_overflows = atomic_load(&g_stat_c2s_batch_socket_overflow);
-    uint64_t entry_overflows = atomic_load(&g_stat_c2s_batch_entry_overflow);
     uint64_t hash_collisions = atomic_load(&g_stat_hash_collisions) + total_hash_collisions;
     uint64_t lru_immediate = atomic_load(&g_stat_lru_immediate_updates);
     uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates) + total_lru_updates;
@@ -2082,17 +1879,11 @@ cleanup:
     P_LOG_INFO("Performance statistics:");
     P_LOG_INFO("  Total packets processed: %" PRIu64, total_packets);
     P_LOG_INFO("  Total bytes processed: %" PRIu64, total_bytes);
-    P_LOG_INFO("  Batch overflows: sockets=%" PRIu64 ", entries=%" PRIu64, socket_overflows,
-               entry_overflows);
     P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", hash_collisions,
                total_packets > 0 ? (double)hash_collisions / total_packets : 0.0);
     P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64, lru_immediate,
                lru_deferred);
 
-    if (socket_overflows > 0) {
-        P_LOG_WARN("Consider increasing -B (batch size) or -C (max "
-                   "connections) if overflows are high");
-    }
     if (total_packets > 0 && hash_collisions > total_packets / 2) {
         P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash "
                    "table size or connection distribution",
