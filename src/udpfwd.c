@@ -1302,6 +1302,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
     struct mmsghdr *msgs = tls_msgs;
     struct iovec *iovs = tls_iovs;
     char (*bufs)[UDP_PROXY_DGRAM_CAP] = tls_bufs;
+    char s_addr[INET6_ADDRSTRLEN];  /* Declare once for entire function */
 
     /* One-time initialization of constant mmsghdr fields */
     if (!tls_inited) {
@@ -1350,7 +1351,6 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         /* All packets are for the same connection, so touch it only once per batch. */
         conn->server_packets += n;  /* Count server packets */
 #if DEBUG_HANG
-        char s_addr[INET6_ADDRSTRLEN];
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                   s_addr, sizeof(s_addr));
         P_LOG_INFO("[HANG_DEBUG] Received %d packets from server for %s:%d (total_size=%zu bytes)",
@@ -1382,7 +1382,6 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
                     break;
                 }
                 /* Always log send failures - this is critical! */
-                char s_addr[INET6_ADDRSTRLEN];
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                           s_addr, sizeof(s_addr));
                 P_LOG_WARN("sendmmsg(client) FAILED for %s:%d: %s, sent=%d/%d, remaining=%d",
@@ -1392,7 +1391,6 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
             }
             if (sent == 0) {
                 /* Avoid tight loop if nothing progressed */
-                char s_addr[INET6_ADDRSTRLEN];
                 inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                           s_addr, sizeof(s_addr));
                 P_LOG_WARN("sendmmsg(client) sent 0 packets for %s:%d, sent=%d/%d, remaining=%d",
@@ -1413,9 +1411,6 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         } while (remaining > 0);
         
 #if DEBUG_HANG
-        char s_addr[INET6_ADDRSTRLEN];
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                  s_addr, sizeof(s_addr));
         if (total_sent < n) {
             P_LOG_WARN("[HANG_DEBUG] Incomplete send to %s:%d: sent=%d/%d packets",
                        s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
