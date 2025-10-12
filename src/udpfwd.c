@@ -797,13 +797,21 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     conn->last_active = now;
     
 #if DEBUG_HANG
-    if (now - old_active > 60) {
+    /* Log all updates (not just > 60 sec) to see if touch is being called */
+    if (now != old_active) {
         char s_addr[INET6_ADDRSTRLEN];
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                   s_addr, sizeof(s_addr));
-        P_LOG_INFO("[HANG_DEBUG] Connection %s:%d last_active jumped: %ld -> %ld (gap: %ld sec)",
-                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                   old_active, now, now - old_active);
+        if (now - old_active > 60) {
+            P_LOG_INFO("[HANG_DEBUG] Connection %s:%d last_active jumped: %ld -> %ld (gap: %ld sec)",
+                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                       old_active, now, now - old_active);
+        } else if (now - old_active > 15) {
+            /* Log gaps > 15 sec at lower verbosity */
+            P_LOG_INFO("[HANG_DEBUG] Connection %s:%d last_active: %ld -> %ld (gap: %ld sec)",
+                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                       old_active, now, now - old_active);
+        }
     }
 #endif
 #if ENABLE_LRU_LOCKS
@@ -1741,6 +1749,9 @@ int main(int argc, char *argv[]) {
     }
 
     /* Main event loop */
+#if DEBUG_HANG
+    P_LOG_INFO("[HANG_DEBUG] Main loop started, g_now_ts initialized to %ld", monotonic_seconds());
+#endif
     for (;;) {
         int nfds;
         time_t current_ts = monotonic_seconds();
@@ -1752,6 +1763,10 @@ int main(int argc, char *argv[]) {
 
         /* Periodic timeout check and connection recycling */
         if ((long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
+#if DEBUG_HANG
+            P_LOG_INFO("[HANG_DEBUG] Maintenance cycle: current_ts=%ld, active_conns=%d",
+                       current_ts, atomic_load(&conn_tbl_len));
+#endif
             proxy_conn_walk_continue(epfd);
             /* Process any queued backpressure packets */
 #if ENABLE_BACKPRESSURE_QUEUE
