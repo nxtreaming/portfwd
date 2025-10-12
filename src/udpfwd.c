@@ -49,7 +49,7 @@
 
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
-#define DEFAULT_HASH_TABLE_SIZE 2048  /* Power-of-two for fast bitwise indexing; sized ~ max conns */
+#define DEFAULT_HASH_TABLE_SIZE 4096  /* Power-of-two for fast bitwise indexing; sized ~ max conns */
 #define MIN_BATCH_SIZE 64             /* Increased from 4 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
 #define BATCH_ADJUST_INTERVAL_SEC 30 /* Reduced frequency from 5 to 30 seconds */
@@ -138,8 +138,8 @@
 #define MAINT_INTERVAL_SEC 2
 /* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
-/* Increased from 256KB to 512KB for better throughput */
-#define UDP_PROXY_SOCKBUF_CAP (512 * 1024)
+/* Increased from 256KB to 1024KB for better throughput */
+#define UDP_PROXY_SOCKBUF_CAP (1024 * 1024)
 #endif
 
 /* Linux-specific batching parameters */
@@ -163,7 +163,7 @@
 
 /* Connection pool size */
 #ifndef UDP_PROXY_MAX_CONNS
-#define UDP_PROXY_MAX_CONNS 1024
+#define UDP_PROXY_MAX_CONNS 2048
 #endif
 
 /**
