@@ -19,7 +19,6 @@
 #include "proxy_conn.h"
 #include "list.h"
 
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,10 +50,10 @@
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
 #define DEFAULT_HASH_TABLE_SIZE 4096  /* Power-of-two for fast bitwise indexing; sized ~ max conns */
-#define MIN_BATCH_SIZE 64             /* Increased from 4 for better performance */
+#define MIN_BATCH_SIZE 128             /* Increased from 64 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
-#define BATCH_ADJUST_INTERVAL_SEC 30 /* Reduced frequency from 5 to 30 seconds */
-#define RATE_LIMIT_WINDOW_SEC 1
+#define BATCH_ADJUST_INTERVAL_SEC 60 /* Reduced frequency from 30 to 60 seconds */
+#define RATE_LIMIT_WINDOW_SEC 2
 
 /* Hash function constants */
 #define FNV_PRIME_32 0x01000193
@@ -62,9 +61,14 @@
 #define GOLDEN_RATIO_32 0x9e3779b9
 
 /* Adaptive batch sizing thresholds - less aggressive */
-#define BATCH_HIGH_UTILIZATION_RATIO 0.9 /* Increased from 0.8 */
-#define BATCH_LOW_UTILIZATION_RATIO 0.1  /* Decreased from 0.3 */
+#define BATCH_HIGH_UTILIZATION_RATIO 0.95 /* Increased from 0.9 */
+#define BATCH_LOW_UTILIZATION_RATIO 0.05  /* Decreased from 0.1 */
 
+/* Connection logging and monitoring constants */
+#define LOG_EVERY_NTH_CONNECTION 50  /* Log every Nth connection to reduce spam */
+#define HIGH_WATER_MARK_PERCENT 95    /* Warn at 95% capacity */
+#define MAX_EVICTION_ATTEMPTS 5       /* Prevent infinite eviction loops */
+#define TIME_GAP_WARNING_THRESHOLD_SEC 120  /* Warn on time gaps > 120 seconds */
 
 /* Performance optimization flags */
 #ifndef DISABLE_ADAPTIVE_BATCHING
@@ -300,6 +304,7 @@ static struct backpressure_queue g_backpressure_queue;
 
 /* Hash functions */
 static uint32_t hash_addr(const union sockaddr_inx *sa);
+static inline void format_client_addr(const union sockaddr_inx *addr, char *buf, size_t bufsize);
 
 /* Connection management */
 static void proxy_conn_walk_continue(int epfd);
@@ -458,7 +463,12 @@ static void destroy_rate_limiter(void) {
     memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
 }
 
-/* Check if packet is allowed by rate limiter */
+/**
+ * @brief Check if packet is allowed by rate limiter
+ * @param addr Source address
+ * @param packet_size Size of packet in bytes
+ * @return true if packet is allowed, false if rate limit exceeded
+ */
 static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size) {
 #if !ENABLE_RATE_LIMITING
     (void)addr;
@@ -527,7 +537,13 @@ static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size)
 #endif
 }
 
-/* Validate packet size and content */
+/**
+ * @brief Validate packet size and content
+ * @param data Packet data buffer
+ * @param len Packet length
+ * @param src Source address
+ * @return true if packet is valid, false otherwise
+ */
 static bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
 #if !ENABLE_PACKET_VALIDATION
     (void)data;
@@ -706,7 +722,11 @@ static void record_batch_stats(int packets_in_batch) {
 }
 #endif
 
-/* Improved hash function with better distribution */
+/**
+ * @brief Improved hash function with better distribution using FNV-1a
+ * @param sa Socket address to hash
+ * @return 32-bit hash value, or 0 if address family is unsupported
+ */
 static inline uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
     uint32_t hash = 0;
 
@@ -744,20 +764,28 @@ static inline uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
     return hash;
 }
 
-/* Small helper to check if an unsigned value is a power of two */
+/**
+ * @brief Check if an unsigned value is a power of two
+ * @param v Value to check
+ * @return true if v is a power of two, false otherwise
+ */
 static inline bool is_power_of_two(unsigned v) {
     return v && ((v & (v - 1)) == 0);
 }
 
 /**
- * @brief Initializes a newly allocated proxy connection.
- * @param conn A pointer to the connection object from the pool.
- * @return The initialized connection object, or NULL on failure.
+ * @brief Increment reference count for a proxy connection
+ * @param conn Connection to hold a reference to
  */
 static inline void proxy_conn_hold(struct proxy_conn *conn) {
     atomic_fetch_add_explicit(&conn->ref_count, 1, memory_order_relaxed);
 }
 
+/**
+ * @brief Initialize a newly allocated proxy connection
+ * @param conn Pointer to the connection object from the pool
+ * @return The initialized connection object, or NULL on failure
+ */
 static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
     if (!conn) {
         return NULL;
@@ -772,12 +800,21 @@ static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
     return conn;
 }
 
-/* Bucket index strategies (selected once at init) */
+/**
+ * @brief Compute bucket index using bitwise AND (for power-of-2 table sizes)
+ * @param sa Socket address
+ * @return Bucket index
+ */
 static inline unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h & (g_conn_tbl_hash_size - 1);
 }
 
+/**
+ * @brief Compute bucket index using modulo (for non-power-of-2 table sizes)
+ * @param sa Socket address
+ * @return Bucket index
+ */
 static inline unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h % g_conn_tbl_hash_size;
@@ -786,6 +823,19 @@ static inline unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
 static inline uint32_t hash_addr(const union sockaddr_inx *a) {
     /* Use the improved hash function for better distribution */
     return improved_hash_addr(a);
+}
+
+/**
+ * @brief Format client address for logging (reduces code duplication)
+ * @param addr The address to format
+ * @param buf Output buffer
+ * @param bufsize Size of output buffer
+ */
+static inline void format_client_addr(const union sockaddr_inx *addr, char *buf, size_t bufsize) {
+    if (!addr || !buf || bufsize == 0) {
+        return;
+    }
+    inet_ntop(addr->sa.sa_family, addr_of_sockaddr(addr), buf, bufsize);
 }
 
 /**
@@ -828,11 +878,10 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 
     /* Log abnormal time gaps */
     time_t gap = now - old_active;
-    if (gap > 60) {
+    if (gap > TIME_GAP_WARNING_THRESHOLD_SEC) {
         /* Large time gap - always log as this indicates potential issues */
         char s_addr[INET6_ADDRSTRLEN];
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                  s_addr, sizeof(s_addr));
+        format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
         P_LOG_WARN("Large time gap for %s:%d: gap=%ld sec (last_active=%ld, now=%ld). "
                    "System may have been suspended or heavily loaded.",
                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
@@ -844,6 +893,13 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 #endif
 }
 
+/**
+ * @brief Update LRU list in segments to reduce lock contention
+ * 
+ * This function processes a segment of hash table buckets per call,
+ * updating the LRU list for connections that have been touched.
+ * This amortizes the cost of LRU updates across multiple maintenance cycles.
+ */
 static void segmented_update_lru(void) {
 #if ENABLE_LRU_LOCKS
     if (g_conn_tbl_hash_size == 0) {
@@ -856,10 +912,13 @@ static void segmented_update_lru(void) {
     }
     g_lru_segment_state.last_segment_update = now;
 
+    /* Initialize buckets_per_segment on first call */
     if (g_lru_segment_state.buckets_per_segment == 0) {
+        /* Process ~1/32 of hash table per second, capped at 256 buckets */
         unsigned buckets = (g_conn_tbl_hash_size / 32) + 1;
-        if (buckets > 256) {
-            buckets = 256;
+        const unsigned MAX_BUCKETS_PER_SEGMENT = 256;
+        if (buckets > MAX_BUCKETS_PER_SEGMENT) {
+            buckets = MAX_BUCKETS_PER_SEGMENT;
         }
         g_lru_segment_state.buckets_per_segment = buckets;
     }
@@ -905,6 +964,12 @@ static void segmented_update_lru(void) {
 #endif
 }
 
+/**
+ * @brief Get existing connection or create new one for client address
+ * @param cli_addr Client socket address
+ * @param epfd Epoll file descriptor
+ * @return Proxy connection pointer, or NULL on failure
+ */
 static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
     struct list_head *chain = &conn_tbl_hbase[bucket_index_fun(cli_addr)];
     struct proxy_conn *conn = NULL;
@@ -935,14 +1000,13 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     bool reserved_slot = false;
     unsigned current_conn_count;
     int eviction_attempts = 0;
-    const int MAX_EVICTION_ATTEMPTS = 3; /* Prevent infinite recursion */
     
     for (;;) {
         current_conn_count = atomic_load(&conn_tbl_len);
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
             /* Prevent excessive eviction attempts */
             if (eviction_attempts >= MAX_EVICTION_ATTEMPTS) {
-                inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
+                format_client_addr(cli_addr, s_addr, sizeof(s_addr));
                 P_LOG_WARN("Conn table full after %d eviction attempts, dropping %s:%d",
                            eviction_attempts, s_addr, ntohs(*port_of_sockaddr(cli_addr)));
                 goto err;
@@ -970,10 +1034,10 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         /* CAS failed due to concurrent change; retry */
     }
 
-    /* High-water one-time warning at ~90% capacity */
+    /* High-water one-time warning at configured threshold */
     static bool warned_high_water = false;
     if (!warned_high_water && g_conn_pool.capacity > 0 &&
-        atomic_load(&conn_tbl_len) >= (unsigned)((g_conn_pool.capacity * 9) / 10)) {
+        atomic_load(&conn_tbl_len) >= (unsigned)((g_conn_pool.capacity * HIGH_WATER_MARK_PERCENT) / 100)) {
         P_LOG_WARN("UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or reducing -t.",
                    atomic_load(&conn_tbl_len), (unsigned)g_conn_pool.capacity,
                    (int)((atomic_load(&conn_tbl_len) * 100) / (unsigned)g_conn_pool.capacity));
@@ -1040,13 +1104,13 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
 
     /* Log new connections at DEBUG level to reduce overhead in high-connection
      * scenarios */
-    /* Only log every 100th connection to avoid spam */
+    /* Only log every Nth connection to avoid spam */
     static _Atomic unsigned log_counter = 0;
     unsigned current_count = atomic_fetch_add(&log_counter, 1);
-    if ((current_count % 100) == 0) {
-        inet_ntop(cli_addr->sa.sa_family, addr_of_sockaddr(cli_addr), s_addr, sizeof(s_addr));
-        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every 100th)", s_addr,
-                   ntohs(*port_of_sockaddr(cli_addr)), new_count);
+    if ((current_count % LOG_EVERY_NTH_CONNECTION) == 0) {
+        format_client_addr(cli_addr, s_addr, sizeof(s_addr));
+        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every %dth)", s_addr,
+                   ntohs(*port_of_sockaddr(cli_addr)), new_count, LOG_EVERY_NTH_CONNECTION);
     }
 
     conn->last_active = cached_now_seconds();
@@ -1076,11 +1140,14 @@ err:
 }
 
 /**
- * @brief Releases a proxy connection.
+ * @brief Release a proxy connection and free all resources
  *
  * This function removes the connection from the hash table and LRU list,
  * deregisters its socket from epoll, closes the server-side socket, and
  * returns the connection object to the memory pool.
+ *
+ * @param conn Connection to release
+ * @param epfd Epoll file descriptor
  */
 static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     if (!conn) {
@@ -1131,12 +1198,21 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     conn_pool_release(&g_conn_pool, conn);
 }
 
+/**
+ * @brief Decrement reference count and release if zero
+ * @param conn Connection to release reference
+ * @param epfd Epoll file descriptor
+ */
 static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
     if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) == 1) {
         release_proxy_conn(conn, epfd);
     }
 }
 
+/**
+ * @brief Walk LRU list and recycle expired connections
+ * @param epfd Epoll file descriptor
+ */
 static void proxy_conn_walk_continue(int epfd) {
     time_t now = cached_now_seconds();
 
@@ -1197,8 +1273,7 @@ static void proxy_conn_walk_continue(int epfd) {
             conn_type = " [BIDIRECTIONAL]";
         }
         
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                  s_addr, sizeof(s_addr));
+        format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
         P_LOG_INFO("Recycling %s:%d%s - last_active=%ld, now=%ld, idle=%ld sec, timeout=%u sec, "
                    "client_pkts=%lu, server_pkts=%lu. Client must send new data to re-establish.",
                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), conn_type,
@@ -1211,7 +1286,11 @@ static void proxy_conn_walk_continue(int epfd) {
     }
 }
 
-/* Evict the least recently active connection (LRU-ish across all buckets) */
+/**
+ * @brief Evict the least recently active connection from LRU list
+ * @param epfd Epoll file descriptor
+ * @return true if a connection was evicted, false if LRU list was empty
+ */
 static bool proxy_conn_evict_one(int epfd) {
     pthread_mutex_lock(&g_lru_lock);
     if (list_empty(&g_lru_list)) {
@@ -1231,7 +1310,7 @@ static bool proxy_conn_evict_one(int epfd) {
 
     /* Release the temporary hold (connection will be freed if ref_count reaches 0) */
     proxy_conn_put(oldest, epfd);
-    inet_ntop(addr.sa.sa_family, addr_of_sockaddr(&addr), s_addr, sizeof(s_addr));
+    format_client_addr(&addr, s_addr, sizeof(s_addr));
     P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
                atomic_load(&conn_tbl_len));
 
@@ -1429,8 +1508,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
                     break;
                 }
                 /* Always log send failures - this is critical! */
-                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                          s_addr, sizeof(s_addr));
+                format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
                 P_LOG_WARN("sendmmsg(client) FAILED for %s:%d: %s, sent=%d/%d, remaining=%d",
                            s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
                            strerror(errno), total_sent, n, remaining);
@@ -1438,8 +1516,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
             }
             if (sent == 0) {
                 /* Avoid tight loop if nothing progressed */
-                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                          s_addr, sizeof(s_addr));
+                format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
                 P_LOG_WARN("sendmmsg(client) sent 0 packets for %s:%d, sent=%d/%d, remaining=%d",
                            s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
                            total_sent, n, remaining);
@@ -1479,8 +1556,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         if (wr < 0) {
             /* Always log send failures - this is critical! */
             char s_addr[INET6_ADDRSTRLEN];
-            inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                      s_addr, sizeof(s_addr));
+            format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
             P_LOG_WARN("sendto(client) FAILED for %s:%d: %s, packet_size=%d",
                        s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
                        strerror(errno), r);
@@ -1494,6 +1570,13 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
 }
 
 #ifdef __linux__
+/**
+ * @brief Initialize batching resources for recvmmsg/sendmmsg
+ * @param c_msgs Pointer to receive mmsghdr array
+ * @param c_iov Pointer to receive iovec array
+ * @param c_addrs Pointer to receive sockaddr_storage array
+ * @param c_bufs Pointer to receive buffer array
+ */
 static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
                                     struct sockaddr_storage **c_addrs,
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP]) {
@@ -1541,6 +1624,13 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
     /* We can't portably store it there; instead, rely on contiguous block: free(c_msgs) frees all */
 }
 
+/**
+ * @brief Free batching resources allocated by init_batching_resources
+ * @param c_msgs mmsghdr array to free
+ * @param c_iov iovec array (part of same allocation)
+ * @param c_addrs sockaddr_storage array (part of same allocation)
+ * @param c_bufs buffer array (part of same allocation)
+ */
 static void destroy_batching_resources(struct mmsghdr *c_msgs, struct iovec *c_iov,
                                        struct sockaddr_storage *c_addrs,
                                        char (*c_bufs)[UDP_PROXY_DGRAM_CAP]) {
@@ -1552,6 +1642,10 @@ static void destroy_batching_resources(struct mmsghdr *c_msgs, struct iovec *c_i
 }
 #endif
 
+/**
+ * @brief Display usage information and command-line options
+ * @param prog Program name (argv[0])
+ */
 static void show_help(const char *prog) {
     P_LOG_INFO("Userspace UDP proxy.");
     P_LOG_INFO("Usage:");
@@ -1963,8 +2057,7 @@ int main(int argc, char *argv[]) {
                     char s_addr[INET6_ADDRSTRLEN] = "unknown";
                     /* Try to get address, but conn might be partially freed */
                     if (conn->svr_sock >= 0) {
-                        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                                  s_addr, sizeof(s_addr));
+                        format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
                     }
                     P_LOG_INFO("Server data arrived for recycled connection %s (ref_count=%d). "
                                "Discarding. Client must send new data to re-establish.", s_addr, ref);
