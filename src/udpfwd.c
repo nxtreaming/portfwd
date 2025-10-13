@@ -242,10 +242,6 @@ static struct adaptive_batch g_adaptive_batch = {
 static LIST_HEAD(g_lru_list);
 static pthread_mutex_t g_lru_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Hang detection: track last activity timestamp */
-static _Atomic time_t g_last_packet_time = 0;
-static _Atomic uint64_t g_total_packets_processed = 0;
-
 #if ENABLE_LRU_LOCKS
 struct lru_segment_state {
     unsigned next_bucket;
@@ -912,19 +908,8 @@ static inline void apply_lru_update_batch(struct proxy_conn **batch, size_t coun
 #if ENABLE_LRU_LOCKS
     if (!count)
         return;
-    
-    struct timespec ts_before, ts_after;
-    clock_gettime(CLOCK_MONOTONIC, &ts_before);
 
     pthread_mutex_lock(&g_lru_lock);
-    clock_gettime(CLOCK_MONOTONIC, &ts_after);
-    
-    long wait_us = (ts_after.tv_sec - ts_before.tv_sec) * 1000000L +
-                   (ts_after.tv_nsec - ts_before.tv_nsec) / 1000L;
-    
-    if (wait_us > 100) {
-        P_LOG_WARN("[LRU] apply_lru_update_batch waited %ldμs for g_lru_lock (count=%zu)", wait_us, count);
-    }
     for (size_t i = 0; i < count; ++i) {
         struct proxy_conn *conn = batch[i];
         if (!conn)
@@ -933,16 +918,7 @@ static inline void apply_lru_update_batch(struct proxy_conn **batch, size_t coun
             list_move_tail(&conn->lru, &g_lru_list);
         }
     }
-    
-    clock_gettime(CLOCK_MONOTONIC, &ts_before);
     pthread_mutex_unlock(&g_lru_lock);
-    
-    long hold_us = (ts_before.tv_sec - ts_after.tv_sec) * 1000000L +
-                   (ts_before.tv_nsec - ts_after.tv_nsec) / 1000L;
-    
-    if (hold_us > 10) {
-        P_LOG_WARN("[LRU] apply_lru_update_batch held g_lru_lock for %ldμs (count=%zu)", hold_us, count);
-    }
 #else
     (void)batch;
     (void)count;
@@ -960,9 +936,6 @@ static void segmented_update_lru(void) {
         return;
     }
     g_lru_segment_state.last_segment_update = now;
-    
-    struct timespec ts_start, ts_end;
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     /* Initialize buckets_per_segment on first call */
     if (g_lru_segment_state.buckets_per_segment == 0) {
@@ -1012,15 +985,6 @@ static void segmented_update_lru(void) {
     g_lru_segment_state.next_bucket = end_bucket;
     if (g_lru_segment_state.next_bucket >= g_conn_tbl_hash_size) {
         g_lru_segment_state.next_bucket = 0;
-    }
-    
-    clock_gettime(CLOCK_MONOTONIC, &ts_end);
-    long elapsed_us = (ts_end.tv_sec - ts_start.tv_sec) * 1000000L +
-                      (ts_end.tv_nsec - ts_start.tv_nsec) / 1000L;
-    
-    if (elapsed_us > 100) {
-        P_LOG_INFO("[MAINT] segmented_update_lru: elapsed=%ldμs buckets=%u-%u",
-                   elapsed_us, start_bucket, end_bucket);
     }
 #endif
 }
@@ -1292,14 +1256,8 @@ static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
  */
 static void proxy_conn_walk_continue(int epfd) {
     time_t now = cached_now_seconds();
-    struct timespec ts_start, ts_lock_acquired, ts_lock_released;
-    
-    /* Diagnostic: Record timing */
-    clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
     pthread_mutex_lock(&g_lru_lock);
-    clock_gettime(CLOCK_MONOTONIC, &ts_lock_acquired);
-    
     if (list_empty(&g_lru_list)) {
         pthread_mutex_unlock(&g_lru_lock);
         return;
@@ -1356,18 +1314,6 @@ static void proxy_conn_walk_continue(int epfd) {
 
     /* Release lock BEFORE logging or doing I/O */
     pthread_mutex_unlock(&g_lru_lock);
-    clock_gettime(CLOCK_MONOTONIC, &ts_lock_released);
-    
-    /* Diagnostic: Log lock hold time if significant */
-    long lock_wait_us = (ts_lock_acquired.tv_sec - ts_start.tv_sec) * 1000000L +
-                        (ts_lock_acquired.tv_nsec - ts_start.tv_nsec) / 1000L;
-    long lock_hold_us = (ts_lock_released.tv_sec - ts_lock_acquired.tv_sec) * 1000000L +
-                        (ts_lock_released.tv_nsec - ts_lock_acquired.tv_nsec) / 1000L;
-    
-    if (lock_wait_us > 1000 || lock_hold_us > 10 || scanned > 0 || reaped > 0) {
-        P_LOG_INFO("[MAINT] walk_continue: wait=%ldμs hold=%ldμs scanned=%zu reaped=%zu conn_count=%u",
-                   lock_wait_us, lock_hold_us, scanned, reaped, atomic_load(&conn_tbl_len));
-    }
     
     /* Now process the reap_list without holding the lock */
     list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
@@ -1435,18 +1381,6 @@ static void handle_client_data(int lsn_sock, int epfd, struct mmsghdr *c_msgs,
 static void handle_client_data(int lsn_sock, int epfd) {
 #endif
     struct proxy_conn *conn;
-    static _Atomic uint64_t total_client_calls = 0;
-    static time_t last_log_time = 0;
-    
-    uint64_t call_count = atomic_fetch_add(&total_client_calls, 1);
-    time_t now = time(NULL);
-    
-    /* Log every 10 seconds */
-    if (now - last_log_time >= 10) {
-        P_LOG_INFO("[DATA] handle_client_data calls: %lu, conn_count=%u",
-                   call_count, atomic_load(&conn_tbl_len));
-        last_log_time = now;
-    }
 
 #ifdef __linux__
     if (c_msgs && c_bufs) {
@@ -1467,8 +1401,6 @@ static void handle_client_data(int lsn_sock, int epfd) {
             }
 
             atomic_store(&g_now_ts, monotonic_seconds());
-            atomic_store(&g_last_packet_time, time(NULL));
-            atomic_fetch_add(&g_total_packets_processed, n);
 
             for (int i = 0; i < n; i++) {
                 union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
@@ -1554,17 +1486,6 @@ static void handle_client_data(int lsn_sock, int epfd) {
 }
 
 static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) {
-    static _Atomic uint64_t total_server_calls = 0;
-    static time_t last_log_time = 0;
-    
-    uint64_t call_count = atomic_fetch_add(&total_server_calls, 1);
-    time_t now = time(NULL);
-    
-    /* Log every 10 seconds */
-    if (now - last_log_time >= 10) {
-        P_LOG_INFO("[DATA] handle_server_data calls: %lu", call_count);
-        last_log_time = now;
-    }
 #ifdef __linux__
     /* Use recvmmsg() to batch receive from server and sendmmsg() to client */
     static __thread struct mmsghdr tls_msgs[UDP_PROXY_BATCH_SZ];
@@ -2119,27 +2040,8 @@ int main(int argc, char *argv[]) {
             /* Ensure maintenance walkers observe the real current time. */
             atomic_store(&g_now_ts, current_ts);
             
-            struct timespec maint_start, maint_end;
-            clock_gettime(CLOCK_MONOTONIC, &maint_start);
-            
             proxy_conn_walk_continue(epfd);
             segmented_update_lru();
-            
-            clock_gettime(CLOCK_MONOTONIC, &maint_end);
-            long maint_us = (maint_end.tv_sec - maint_start.tv_sec) * 1000000L +
-                           (maint_end.tv_nsec - maint_start.tv_nsec) / 1000L;
-            
-            if (maint_us > 1000) {
-                P_LOG_WARN("[MAINT] Maintenance cycle took %ldμs (>1ms) - potential hang!", maint_us);
-            }
-            
-            /* Hang detection: check if we're still processing packets */
-            time_t last_pkt = atomic_load(&g_last_packet_time);
-            uint64_t total_pkts = atomic_load(&g_total_packets_processed);
-            if (last_pkt > 0 && current_ts - last_pkt > 10) {
-                P_LOG_WARN("[HANG?] No packets processed for %ld seconds (total=%lu, conn_count=%u)",
-                           current_ts - last_pkt, total_pkts, atomic_load(&conn_tbl_len));
-            }
             
             /* Process any queued backpressure packets */
 #if ENABLE_BACKPRESSURE_QUEUE
@@ -2157,19 +2059,7 @@ int main(int argc, char *argv[]) {
             break;
 
         /* Wait for events */
-        struct timespec epoll_start, epoll_end;
-        clock_gettime(CLOCK_MONOTONIC, &epoll_start);
-        
         nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
-        
-        clock_gettime(CLOCK_MONOTONIC, &epoll_end);
-        long epoll_us = (epoll_end.tv_sec - epoll_start.tv_sec) * 1000000L +
-                       (epoll_end.tv_nsec - epoll_start.tv_nsec) / 1000L;
-        
-        /* Log if epoll_wait took longer than expected (accounting for timeout) */
-        if (nfds > 0 && epoll_us > 10000) {
-            P_LOG_WARN("[EPOLL] epoll_wait took %ldμs (nfds=%d) - possible blocking!", epoll_us, nfds);
-        }
 
         /* After epoll_wait() returns, refresh the cached timestamp so all subsequent
          * packet handlers see the time at which we woke up, not the time at which we
