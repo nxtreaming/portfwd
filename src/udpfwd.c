@@ -141,6 +141,9 @@
 #define SERVER_MAX_ITERATIONS 64
 /* Maintenance tick interval (seconds) */
 #define MAINT_INTERVAL_SEC 2
+/* Limit the amount of work done while holding global locks */
+#define LRU_UPDATE_BATCH_SIZE 32
+#define MAX_EXPIRE_PER_SWEEP 64
 /* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
 /* Increased from 256KB to 1024KB for better throughput */
@@ -900,6 +903,27 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
  * updating the LRU list for connections that have been touched.
  * This amortizes the cost of LRU updates across multiple maintenance cycles.
  */
+static inline void apply_lru_update_batch(struct proxy_conn **batch, size_t count) {
+#if ENABLE_LRU_LOCKS
+    if (!count)
+        return;
+
+    pthread_mutex_lock(&g_lru_lock);
+    for (size_t i = 0; i < count; ++i) {
+        struct proxy_conn *conn = batch[i];
+        if (!conn)
+            continue;
+        if (!list_empty(&conn->lru)) {
+            list_move_tail(&conn->lru, &g_lru_list);
+        }
+    }
+    pthread_mutex_unlock(&g_lru_lock);
+#else
+    (void)batch;
+    (void)count;
+#endif
+}
+
 static void segmented_update_lru(void) {
 #if ENABLE_LRU_LOCKS
     if (g_conn_tbl_hash_size == 0) {
@@ -929,10 +953,12 @@ static void segmented_update_lru(void) {
         end_bucket = g_conn_tbl_hash_size;
     }
 
+    struct proxy_conn *update_batch[LRU_UPDATE_BATCH_SIZE];
+
     for (unsigned i = start_bucket; i < end_bucket; ++i) {
         struct proxy_conn *conn;
         struct proxy_conn *tmp;
-        bool took_lru_lock = false;
+        size_t batch_count = 0;
 #if ENABLE_FINE_GRAINED_LOCKS
         pthread_spin_lock(&conn_tbl_locks[i]);
 #endif
@@ -940,18 +966,16 @@ static void segmented_update_lru(void) {
             if (!conn->needs_lru_update) {
                 continue;
             }
-            if (!took_lru_lock) {
-                pthread_mutex_lock(&g_lru_lock);
-                took_lru_lock = true;
-            }
-            if (!list_empty(&conn->lru)) {
-                list_move_tail(&conn->lru, &g_lru_list);
-            }
             conn->needs_lru_update = false;
+            update_batch[batch_count++] = conn;
+
+            if (batch_count == countof(update_batch)) {
+                apply_lru_update_batch(update_batch, batch_count);
+                batch_count = 0;
+            }
         }
-        if (took_lru_lock) {
-            pthread_mutex_unlock(&g_lru_lock);
-        }
+        apply_lru_update_batch(update_batch, batch_count);
+        batch_count = 0;
 #if ENABLE_FINE_GRAINED_LOCKS
         pthread_spin_unlock(&conn_tbl_locks[i]);
 #endif
@@ -1232,6 +1256,7 @@ static void proxy_conn_walk_continue(int epfd) {
 
     /* Collect all expired connections into a temporary reap_list.
      * IMPORTANT: Do NOT log or do I/O while holding the lock! */
+    size_t reaped = 0;
     list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
         /* Check shutdown flag to allow fast exit */
         if (g_shutdown_requested) {
@@ -1254,6 +1279,9 @@ static void proxy_conn_walk_continue(int epfd) {
             }
             /* Move to reap_list for processing outside the lock */
             list_move_tail(&conn->lru, &reap_list);
+            if (++reaped >= MAX_EXPIRE_PER_SWEEP) {
+                break;
+            }
         } else {
             /* List is ordered, so we can stop at the first non-expired conn */
             break;
