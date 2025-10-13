@@ -239,6 +239,19 @@ static struct adaptive_batch g_adaptive_batch = {
 static LIST_HEAD(g_lru_list);
 static pthread_mutex_t g_lru_lock = PTHREAD_MUTEX_INITIALIZER;
 
+#if ENABLE_LRU_LOCKS
+struct lru_segment_state {
+    unsigned next_bucket;
+    unsigned buckets_per_segment;
+    time_t last_segment_update;
+};
+static struct lru_segment_state g_lru_segment_state = {
+    .next_bucket = 0,
+    .buckets_per_segment = 0,
+    .last_segment_update = 0,
+};
+#endif
+
 /* Cached current timestamp (monotonic seconds on Linux) for hot paths */
 static atomic_long g_now_ts; /**< Atomic timestamp cache */
 
@@ -248,6 +261,7 @@ static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 /* Additional performance statistics */
 static _Atomic uint64_t g_stat_hash_collisions;
 static _Atomic uint64_t g_stat_lru_immediate_updates;
+static _Atomic uint64_t g_stat_lru_deferred_updates;
 
 /* Per-thread statistics to reduce atomic contention */
 #define MAX_THREAD_STATS 64
@@ -789,17 +803,17 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     if (g_cfg.proxy_conn_timeo == 0) {
         return;  /* Fast path: no timeout checking needed */
     }
-    
+
     /* Keep the LRU ordering in sync with the timestamp that drives expiration */
     time_t now = cached_now_seconds();
-    
+
     if (conn->last_active == now)
         return;
 
     /* Save old value for logging (always needed, not just DEBUG_HANG) */
     time_t old_active = conn->last_active;
     conn->last_active = now;
-    
+
     /* Log abnormal time gaps (always enabled, not just DEBUG_HANG) */
     time_t gap = now - old_active;
     if (gap > 60) {
@@ -828,13 +842,69 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     }
 #endif
 #if ENABLE_LRU_LOCKS
-    pthread_mutex_lock(&g_lru_lock);
-    /* Connections are linked into g_lru_list once established; guard for safety */
-    if (!list_empty(&conn->lru)) {
-        list_move_tail(&conn->lru, &g_lru_list);
+    conn->needs_lru_update = true;
+    atomic_fetch_add_explicit(&g_stat_lru_deferred_updates, 1, memory_order_relaxed);
+#endif
+}
+
+static void segmented_update_lru(void) {
+#if ENABLE_LRU_LOCKS
+    if (g_conn_tbl_hash_size == 0) {
+        return;
     }
-    pthread_mutex_unlock(&g_lru_lock);
-    atomic_fetch_add_explicit(&g_stat_lru_immediate_updates, 1, memory_order_relaxed);
+
+    time_t now = monotonic_seconds();
+    if (now - g_lru_segment_state.last_segment_update < 1) {
+        return;
+    }
+    g_lru_segment_state.last_segment_update = now;
+
+    if (g_lru_segment_state.buckets_per_segment == 0) {
+        unsigned buckets = (g_conn_tbl_hash_size / 32) + 1;
+        if (buckets > 256) {
+            buckets = 256;
+        }
+        g_lru_segment_state.buckets_per_segment = buckets;
+    }
+
+    unsigned start_bucket = g_lru_segment_state.next_bucket;
+    unsigned end_bucket = start_bucket + g_lru_segment_state.buckets_per_segment;
+    if (end_bucket > g_conn_tbl_hash_size) {
+        end_bucket = g_conn_tbl_hash_size;
+    }
+
+    for (unsigned i = start_bucket; i < end_bucket; ++i) {
+        struct proxy_conn *conn;
+        struct proxy_conn *tmp;
+        bool took_lru_lock = false;
+#if ENABLE_FINE_GRAINED_LOCKS
+        pthread_spin_lock(&conn_tbl_locks[i]);
+#endif
+        list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
+            if (!conn->needs_lru_update) {
+                continue;
+            }
+            if (!took_lru_lock) {
+                pthread_mutex_lock(&g_lru_lock);
+                took_lru_lock = true;
+            }
+            if (!list_empty(&conn->lru)) {
+                list_move_tail(&conn->lru, &g_lru_list);
+            }
+            conn->needs_lru_update = false;
+        }
+        if (took_lru_lock) {
+            pthread_mutex_unlock(&g_lru_lock);
+        }
+#if ENABLE_FINE_GRAINED_LOCKS
+        pthread_spin_unlock(&conn_tbl_locks[i]);
+#endif
+    }
+
+    g_lru_segment_state.next_bucket = end_bucket;
+    if (g_lru_segment_state.next_bucket >= g_conn_tbl_hash_size) {
+        g_lru_segment_state.next_bucket = 0;
+    }
 #endif
 }
 
@@ -1883,6 +1953,7 @@ int main(int argc, char *argv[]) {
                        current_ts, atomic_load(&conn_tbl_len));
 #endif
             proxy_conn_walk_continue(epfd);
+            segmented_update_lru();
             /* Process any queued backpressure packets */
 #if ENABLE_BACKPRESSURE_QUEUE
             process_backpressure_queue();
@@ -2042,13 +2113,15 @@ cleanup:
     /* Print performance statistics */
     uint64_t hash_collisions = atomic_load(&g_stat_hash_collisions) + total_hash_collisions;
     uint64_t lru_immediate = atomic_load(&g_stat_lru_immediate_updates);
+    uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates);
 
     P_LOG_INFO("Performance statistics:");
     P_LOG_INFO("  Total packets processed: %" PRIu64, total_packets);
     P_LOG_INFO("  Total bytes processed: %" PRIu64, total_bytes);
     P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", hash_collisions,
                total_packets > 0 ? (double)hash_collisions / total_packets : 0.0);
-    P_LOG_INFO("  LRU updates: %" PRIu64, lru_immediate);
+    P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64,
+               lru_immediate, lru_deferred);
 
     if (total_packets > 0 && hash_collisions > total_packets / 2) {
         P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash "
