@@ -1031,24 +1031,51 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* Keep the LRU ordering in sync with the timestamp that drives expiration */
     time_t now = cached_now_seconds();
 
-    if (conn->last_active == now)
-        return;
+    /* CRITICAL FIX: Always update last_active timestamp, even if it's the same second.
+     * 
+     * Previous bug: if (conn->last_active == now) return;
+     * 
+     * This optimization caused serious issues with high-frequency UDP traffic:
+     * - When multiple packets arrive in the same second (PPS > 1), only the first
+     *   packet would update last_active, and subsequent packets were ignored.
+     * - For bursty traffic (e.g., TCP over UDP like OpenVPN), packets often arrive
+     *   in bursts within the same second due to retransmissions or congestion control.
+     * - This caused active connections to be incorrectly marked as idle and recycled,
+     *   even though they were actively transmitting data.
+     * 
+     * Example scenario that triggered the bug:
+     * - OpenVPN connection with 931 packets over 6 minutes (avg 2.6 pps)
+     * - Packets arrived in bursts: 500 packets at t=0, 431 packets at t=8
+     * - last_active only updated twice (at t=0 and t=8)
+     * - Connection recycled after 302 seconds idle, despite having traffic
+     * 
+     * The performance cost of always updating is negligible:
+     * - Writing a time_t variable: ~1-2 nanoseconds
+     * - Setting needs_lru_update flag: ~1 nanosecond
+     * - No locks involved in this hot path
+     * 
+     * This fix ensures that ANY packet activity keeps the connection alive,
+     * which is the correct behavior for a UDP forwarder.
+     */
 
     /* Save old value for logging */
     time_t old_active = conn->last_active;
     conn->last_active = now;
 
-    /* Log abnormal time gaps */
-    time_t gap = now - old_active;
-    if (gap > TIME_GAP_WARNING_THRESHOLD_SEC) {
-        /* Large time gap - always log as this indicates potential issues */
-        char s_addr[INET6_ADDRSTRLEN];
-        format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
-        P_LOG_WARN("Large time gap for %s:%d: gap=%ld sec (last_active=%ld, now=%ld). "
-                   "System may have been suspended or heavily loaded.",
-                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                   gap, old_active, now);
+    /* Log abnormal time gaps (only if time actually changed) */
+    if (old_active != now) {
+        time_t gap = now - old_active;
+        if (gap > TIME_GAP_WARNING_THRESHOLD_SEC) {
+            /* Large time gap - always log as this indicates potential issues */
+            char s_addr[INET6_ADDRSTRLEN];
+            format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
+            P_LOG_WARN("Large time gap for %s:%d: gap=%ld sec (last_active=%ld, now=%ld). "
+                       "System may have been suspended or heavily loaded.",
+                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                       gap, old_active, now);
+        }
     }
+
 #if ENABLE_LRU_LOCKS
     conn->needs_lru_update = true;
     atomic_fetch_add_explicit(&g_stat_lru_deferred_updates, 1, memory_order_relaxed);
