@@ -788,6 +788,26 @@ static inline uint32_t hash_addr(const union sockaddr_inx *a) {
     return improved_hash_addr(a);
 }
 
+/**
+ * @brief Touch a proxy connection to update its last-active timestamp.
+ * 
+ * CRITICAL PERFORMANCE REQUIREMENT:
+ * This function is in the HOT PATH - called for EVERY packet (both inbound 
+ * and outbound). It MUST NOT acquire locks directly (especially g_lru_lock).
+ * 
+ * LESSON LEARNED (commit 4418a784):
+ * Adding pthread_mutex_lock(&g_lru_lock) here caused catastrophic performance
+ * degradation and multi-second freeze/hang symptoms under load. The lock 
+ * contention between packet processing and maintenance cycles serialized all
+ * traffic, even at low PPS.
+ * 
+ * DESIGN PRINCIPLE:
+ * Use deferred updates via needs_lru_update flag. The maintenance cycle
+ * (segmented_update_lru) batches LRU list updates outside the hot path,
+ * keeping packet processing lock-free and fast.
+ * 
+ * @param conn The connection to touch
+ */
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* When timeout is disabled (proxy_conn_timeo == 0), skip all timestamp
      * and LRU updates to eliminate lock contention and improve performance.
