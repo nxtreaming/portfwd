@@ -19,11 +19,6 @@
 #include "proxy_conn.h"
 #include "list.h"
 
-/* ============ DEBUG FLAGS (can be enabled via -DDEBUG_HANG=1) ============ */
-#ifndef DEBUG_HANG
-#define DEBUG_HANG 0  /* Set to 1 to enable hang debugging, or use -DDEBUG_HANG=1 */
-#endif
-/* ========================================================================= */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -338,9 +333,6 @@ static inline time_t cached_now_seconds(void) {
     if (now == 0) {
         now = monotonic_seconds();
         atomic_store(&g_now_ts, now);
-#if DEBUG_HANG
-        P_LOG_INFO("[HANG_DEBUG] g_now_ts initialized to %ld", now);
-#endif
     }
     return now;
 }
@@ -810,37 +802,22 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     if (conn->last_active == now)
         return;
 
-    /* Save old value for logging (always needed, not just DEBUG_HANG) */
+    /* Save old value for logging */
     time_t old_active = conn->last_active;
     conn->last_active = now;
 
-    /* Log abnormal time gaps (always enabled, not just DEBUG_HANG) */
+    /* Log abnormal time gaps */
     time_t gap = now - old_active;
     if (gap > 60) {
         /* Large time gap - always log as this indicates potential issues */
         char s_addr[INET6_ADDRSTRLEN];
         inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
                   s_addr, sizeof(s_addr));
-        P_LOG_WARN("Connection %s:%d: large time gap detected: %ld sec (last_active=%ld, now=%ld)",
+        P_LOG_WARN("Large time gap for %s:%d: gap=%ld sec (last_active=%ld, now=%ld). "
+                   "System may have been suspended or heavily loaded.",
                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
                    gap, old_active, now);
     }
-#if DEBUG_HANG
-    else if (gap > 15) {
-        char s_addr[INET6_ADDRSTRLEN];
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                  s_addr, sizeof(s_addr));
-        P_LOG_INFO("[HANG_DEBUG] Connection %s:%d last_active: %ld -> %ld (gap: %ld sec)",
-                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                   old_active, now, gap);
-    } else if (gap > 5) {
-        char s_addr[INET6_ADDRSTRLEN];
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                  s_addr, sizeof(s_addr));
-        P_LOG_INFO("[HANG_DEBUG] Connection %s:%d touch: gap=%ld sec",
-                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), gap);
-    }
-#endif
 #if ENABLE_LRU_LOCKS
     conn->needs_lru_update = true;
     atomic_fetch_add_explicit(&g_stat_lru_deferred_updates, 1, memory_order_relaxed);
@@ -1189,8 +1166,6 @@ static void proxy_conn_walk_continue(int epfd) {
     list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
         /* Log connection recycling with detailed info */
         char s_addr[INET6_ADDRSTRLEN] = "";
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                  s_addr, sizeof(s_addr));
         
         /* Determine if this is a one-way or two-way connection */
         const char *conn_type = "";
@@ -1202,6 +1177,8 @@ static void proxy_conn_walk_continue(int epfd) {
             conn_type = " [BIDIRECTIONAL]";
         }
         
+        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
+                  s_addr, sizeof(s_addr));
         P_LOG_INFO("Recycling %s:%d%s - last_active=%ld, now=%ld, idle=%ld sec, timeout=%u sec, "
                    "client_pkts=%lu, server_pkts=%lu. Client must send new data to re-establish.",
                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), conn_type,
@@ -1274,21 +1251,9 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 size_t packet_len = c_msgs[i].msg_len;
 
                 if (unlikely(!validate_packet(c_bufs[i], packet_len, sa))) {
-#if DEBUG_HANG
-                    char s_addr[INET6_ADDRSTRLEN];
-                    inet_ntop(sa->sa.sa_family, addr_of_sockaddr(sa), s_addr, sizeof(s_addr));
-                    P_LOG_INFO("[HANG_DEBUG] Packet validation failed for %s:%d",
-                               s_addr, ntohs(*port_of_sockaddr(sa)));
-#endif
                     continue;
                 }
                 if (unlikely(!check_rate_limit(sa, packet_len))) {
-#if DEBUG_HANG
-                    char s_addr[INET6_ADDRSTRLEN];
-                    inet_ntop(sa->sa.sa_family, addr_of_sockaddr(sa), s_addr, sizeof(s_addr));
-                    P_LOG_INFO("[HANG_DEBUG] Rate limit exceeded for %s:%d",
-                               s_addr, ntohs(*port_of_sockaddr(sa)));
-#endif
                     continue;
                 }
 
@@ -1342,21 +1307,9 @@ static void handle_client_data(int lsn_sock, int epfd) {
     atomic_store(&g_now_ts, monotonic_seconds());
 
     if (!validate_packet(buffer, (size_t)r, &cli_addr)) {
-#if DEBUG_HANG
-        char s_addr[INET6_ADDRSTRLEN];
-        inet_ntop(cli_addr.sa.sa_family, addr_of_sockaddr(&cli_addr), s_addr, sizeof(s_addr));
-        P_LOG_INFO("[HANG_DEBUG] Packet validation failed for %s:%d",
-                   s_addr, ntohs(*port_of_sockaddr(&cli_addr)));
-#endif
         return;
     }
     if (!check_rate_limit(&cli_addr, (size_t)r)) {
-#if DEBUG_HANG
-        char s_addr[INET6_ADDRSTRLEN];
-        inet_ntop(cli_addr.sa.sa_family, addr_of_sockaddr(&cli_addr), s_addr, sizeof(s_addr));
-        P_LOG_INFO("[HANG_DEBUG] Rate limit exceeded for %s:%d",
-                   s_addr, ntohs(*port_of_sockaddr(&cli_addr)));
-#endif
         return;
     }
 
@@ -1435,13 +1388,6 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         /* Prepare destination (original client) for each message */
         /* All packets are for the same connection, so touch it only once per batch. */
         conn->server_packets += n;  /* Count server packets */
-#if DEBUG_HANG
-        inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                  s_addr, sizeof(s_addr));
-        P_LOG_INFO("[HANG_DEBUG] Received %d packets from server for %s:%d (total_size=%zu bytes)",
-                   n, s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                   (size_t)(msgs[0].msg_len + (n > 1 ? msgs[1].msg_len : 0)));
-#endif
         touch_proxy_conn(conn);
 
         for (int i = 0; i < n; i++) {
@@ -1460,10 +1406,6 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
             if (sent < 0) {
                 if (is_temporary_errno(errno)) {
                     /* leave remaining for later */
-#if DEBUG_HANG
-                    P_LOG_INFO("[HANG_DEBUG] sendmmsg(client) temporary error: %s, sent=%d/%d",
-                               strerror(errno), total_sent, n);
-#endif
                     break;
                 }
                 /* Always log send failures - this is critical! */
@@ -1484,27 +1426,12 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
                 break;
             }
             if (sent < remaining) {
-                /* Partial send - log for debugging */
-#if DEBUG_HANG
-                P_LOG_INFO("[HANG_DEBUG] sendmmsg(client) partial: sent=%d, remaining=%d",
-                           sent, remaining);
-#endif
+                /* Partial send - continue */
             }
             total_sent += sent;
             remaining -= sent;
             msgp += sent;
         } while (remaining > 0);
-        
-#if DEBUG_HANG
-        if (total_sent < n) {
-            P_LOG_WARN("[HANG_DEBUG] Incomplete send to %s:%d: sent=%d/%d packets",
-                       s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                       total_sent, n);
-        } else {
-            P_LOG_INFO("[HANG_DEBUG] Successfully sent %d packets to %s:%d",
-                       total_sent, s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
-        }
-#endif
     }
     return;
 #else
@@ -1932,26 +1859,15 @@ int main(int argc, char *argv[]) {
     }
 
     /* Main event loop */
-#if DEBUG_HANG
-    P_LOG_INFO("[HANG_DEBUG] Main loop started, g_now_ts initialized to %ld", monotonic_seconds());
-#endif
     for (;;) {
         int nfds;
         time_t current_ts = monotonic_seconds();
-        time_t pre_wait_ts = current_ts;
-#if !DEBUG_HANG
-        (void)pre_wait_ts;
-#endif
 
         /* Periodic timeout check and connection recycling */
         /* Skip maintenance cycle if timeout is disabled (proxy_conn_timeo == 0) */
         if (g_cfg.proxy_conn_timeo != 0 && (long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
             /* Ensure maintenance walkers observe the real current time. */
             atomic_store(&g_now_ts, current_ts);
-#if DEBUG_HANG
-            P_LOG_INFO("[HANG_DEBUG] Maintenance cycle: current_ts=%ld, active_conns=%d",
-                       current_ts, atomic_load(&conn_tbl_len));
-#endif
             proxy_conn_walk_continue(epfd);
             segmented_update_lru();
             /* Process any queued backpressure packets */
@@ -1972,17 +1888,11 @@ int main(int argc, char *argv[]) {
         /* Wait for events */
         nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
 
-        /* Record the time at which events are processed so that activity
-         * timestamps reflect the *arrival* time rather than the time we
+        /* After epoll_wait() returns, refresh the cached timestamp so all subsequent
+         * packet handlers see the time at which we woke up, not the time at which we
          * went to sleep in epoll_wait(). */
         current_ts = monotonic_seconds();
         atomic_store(&g_now_ts, current_ts);
-#if DEBUG_HANG
-        if (current_ts - pre_wait_ts > 5) {
-            P_LOG_INFO("[HANG_DEBUG] Main loop: g_now_ts updated %ld -> %ld (epoll blocked %ld sec)",
-                       pre_wait_ts, current_ts, current_ts - pre_wait_ts);
-        }
-#endif
         
         /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
         if (g_shutdown_requested)
@@ -1999,20 +1909,12 @@ int main(int argc, char *argv[]) {
         }
 
         /* Process events */
-#if DEBUG_HANG
-        if (nfds > 0) {
-            P_LOG_INFO("[HANG_DEBUG] Processing %d epoll events", nfds);
-        }
-#endif
         for (i = 0; i < nfds; i++) {
             struct epoll_event *evp = &events[i];
             struct proxy_conn *conn;
 
             if (evp->data.ptr == &magic_listener) {
                 /* Data from client */
-#if DEBUG_HANG
-                P_LOG_INFO("[HANG_DEBUG] Event: client data (listener socket)");
-#endif
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
                     P_LOG_ERR("listener: EPOLLERR/HUP");
                     rc = 1;
@@ -2037,7 +1939,7 @@ int main(int argc, char *argv[]) {
                      * 3. We process the queued event → connection already gone
                      * 
                      * Solution: Discard the server data. Client must send new data
-                     * to re-establish the connection. */
+                     * to re-establish. */
                     char s_addr[INET6_ADDRSTRLEN] = "unknown";
                     /* Try to get address, but conn might be partially freed */
                     if (conn->svr_sock >= 0) {
@@ -2049,13 +1951,6 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 
-#if DEBUG_HANG
-                char s_addr[INET6_ADDRSTRLEN];
-                inet_ntop(conn->cli_addr.sa.sa_family, addr_of_sockaddr(&conn->cli_addr),
-                          s_addr, sizeof(s_addr));
-                P_LOG_INFO("[HANG_DEBUG] Event: server data for %s:%d",
-                           s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)));
-#endif
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
                     /* fatal on this flow: release session */
                     proxy_conn_put(conn, epfd);
@@ -2064,11 +1959,6 @@ int main(int argc, char *argv[]) {
                 handle_server_data(conn, listen_sock, epfd);
             }
         }
-#if DEBUG_HANG
-        if (nfds > 0) {
-            P_LOG_INFO("[HANG_DEBUG] Finished processing %d events", nfds);
-        }
-#endif
     }
 
 cleanup:
