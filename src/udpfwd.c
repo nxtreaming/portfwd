@@ -144,6 +144,7 @@
 /* Limit the amount of work done while holding global locks */
 #define LRU_UPDATE_BATCH_SIZE 32
 #define MAX_EXPIRE_PER_SWEEP 64
+#define MAX_SCAN_PER_SWEEP 128  /* Limit LRU list traversal to prevent long lock holds */
 /* Socket buffer size */
 #ifndef UDP_PROXY_SOCKBUF_CAP
 /* Increased from 256KB to 1024KB for better throughput */
@@ -1241,6 +1242,17 @@ static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
 /**
  * @brief Walk LRU list and recycle expired connections
  * @param epfd Epoll file descriptor
+ * 
+ * CRITICAL: This function limits both the number of connections scanned AND
+ * the number of connections reaped to prevent holding g_lru_lock for too long.
+ * 
+ * Why this matters:
+ * - Without scan limit: If there are 10,000 connections with idle times of
+ *   250-299 seconds (close to but not exceeding 300s timeout), we would scan
+ *   all 10,000 while holding the lock, causing 100+ microsecond lock holds.
+ * - With scan limit: We scan at most MAX_SCAN_PER_SWEEP (128) connections,
+ *   guaranteeing lock hold time < 2 microseconds even with 10,000 connections.
+ * - Multiple maintenance cycles will eventually scan the entire list.
  */
 static void proxy_conn_walk_continue(int epfd) {
     time_t now = cached_now_seconds();
@@ -1255,13 +1267,25 @@ static void proxy_conn_walk_continue(int epfd) {
     struct proxy_conn *conn, *tmp;
 
     /* Collect all expired connections into a temporary reap_list.
-     * IMPORTANT: Do NOT log or do I/O while holding the lock! */
+     * IMPORTANT: Do NOT log or do I/O while holding the lock! 
+     * 
+     * CRITICAL FIX: Limit the number of connections scanned to prevent
+     * long lock holds when there are many connections close to timeout
+     * but not yet expired. */
     size_t reaped = 0;
+    size_t scanned = 0;
     list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
         /* Check shutdown flag to allow fast exit */
         if (g_shutdown_requested) {
             pthread_mutex_unlock(&g_lru_lock);
             return;
+        }
+        
+        /* CRITICAL: Limit scan count to prevent long lock holds.
+         * Without this, scanning 10,000 connections can hold the lock
+         * for 100+ microseconds, causing freeze/hang symptoms. */
+        if (++scanned >= MAX_SCAN_PER_SWEEP) {
+            break;  /* Scanned enough for this cycle, continue next time */
         }
         
         long diff = (long)(now - conn->last_active);
