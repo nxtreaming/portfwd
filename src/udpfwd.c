@@ -1013,18 +1013,23 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
             }
             eviction_attempts++;
             
-            /* Try to make room first */
-            proxy_conn_walk_continue(epfd);
-            current_conn_count = atomic_load(&conn_tbl_len);
-            if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-                proxy_conn_evict_one(epfd);
+            /* CRITICAL FIX: Do NOT call proxy_conn_walk_continue() here!
+             * It can hold g_lru_lock for O(N) time while traversing the entire
+             * LRU list, causing severe lock contention and freeze/hang symptoms.
+             * 
+             * Instead, just evict the LRU head (O(1) operation).
+             * The periodic maintenance cycle will handle expired connections.
+             */
+            if (!proxy_conn_evict_one(epfd)) {
+                /* LRU list is empty, cannot evict */
+                format_client_addr(cli_addr, s_addr, sizeof(s_addr));
+                P_LOG_WARN("Conn table full but LRU empty, dropping %s:%d",
+                           s_addr, ntohs(*port_of_sockaddr(cli_addr)));
+                goto err;
             }
-            /* Re-check after eviction */
-            current_conn_count = atomic_load(&conn_tbl_len);
-            if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
-                /* Loop to attempt reservation after cleanup */
-                continue;
-            }
+            
+            /* Re-check after eviction and retry */
+            continue;
         }
         unsigned expected = current_conn_count;
         if (atomic_compare_exchange_weak_explicit(&conn_tbl_len, &expected, current_conn_count + 1, memory_order_acq_rel, memory_order_acquire)) {
