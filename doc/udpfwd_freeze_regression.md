@@ -4,7 +4,7 @@
 - **Root cause commit:** `4418a784aee92bcc260e5d619ed8d1d669ddf784` ("Fix UDP LRU updates to prevent stale evictions").
 - **Change volume:** 376 lines touched in `src/udpfwd.c` plus struct churn in `src/proxy_conn.h`, replacing the previously stable LRU maintenance design with a synchronous one we authored.【89a383†L1-L8】
 - **Primary change:** Replaced the deferred LRU maintenance loop with synchronous per-packet locking inside `touch_proxy_conn()`.
-- **Impact:** Under load the hot path now grabs the global `g_lru_lock` for every datagram, creating severe contention, starving worker threads, and producing the reported multi-second freezes until traffic subsides.
+- **Impact:** The hot path now grabs the global `g_lru_lock` for every datagram, so whenever the maintenance sweep holds the same lock—even at low packet rates—forwarding threads stall and users observe multi-second freezes until the backlog drains.
 
 ## Stable baseline (`6458690db6c61f05cbe4c94de75bc1c30be7dcda`)
 At the last known-good revision the UDP fast path simply marked connections for later LRU maintenance and avoided taking locks while packets were flowing. The periodic maintenance sweep moved any "touched" sessions to the tail of the shared list in manageable segments.【cd8f13†L1-L58】【796039†L24-L63】
@@ -70,10 +70,10 @@ The main loop still executes maintenance every two seconds but no longer perform
 - The periodic `segmented_update_lru()` function and its invocation inside the two-second maintenance window were excised, removing the batching mechanism entirely.【cd8f13†L21-L58】【796039†L28-L36】【748d72†L95-L123】
 
 ## Why this causes freeze/hang symptoms
-- `touch_proxy_conn()` runs for every inbound and outbound datagram. Under realistic workloads (10k+ packets/sec) it therefore performs thousands of mutex operations per second on the single global `g_lru_lock`.
-- Multiple worker threads enter `handle_client_data()` and `handle_server_data()` concurrently. Each call to `touch_proxy_conn()` serializes behind the mutex, creating a lock convoy where all threads spin waiting for the same lock.
-- While threads wait, packet processing stalls, sockets fill, and dependent applications observe the forwarder as "frozen". Once traffic subsides enough for the mutex to become available, the backlog drains and service appears to "recover"—matching the observed tens-of-seconds hang windows.
-- Disabling timeouts (`-t 0`) bypasses the problematic block because the new guard returns early, confirming the lock contention as the failure mode rather than stale timestamps.【91856b†L39-L54】
+- `proxy_conn_walk_continue()` still performs the timeout sweep by locking `g_lru_lock` and traversing the entire LRU list looking for expired sessions.【1e3231†L1-L66】 With thousands of entries the walk routinely holds the mutex for tens of milliseconds.
+- `touch_proxy_conn()` now takes the same mutex for every datagram, so even modest packet rates queue behind the maintenance sweep. PPS does not need to be high—any packet that arrives while the sweep owns the lock will block until the walk finishes.
+- Once the sweep finally releases the mutex the queued packet handlers run, draining the backlog and giving the appearance that forwarding "recovers" after a brief freeze. The next maintenance window repeats the pattern, explaining hangs even when traffic volume is low.
+- Disabling timeouts (`-t 0`) bypasses both the LRU walk and the per-packet mutex, which is why production recovered immediately when the timeout feature was turned off despite unchanged traffic levels.【91856b†L39-L54】
 
 ## Subsequent commits
 Later commits add debugging, tweak timestamp caching, and adjust maintenance logging, but none of them restore deferred LRU processing. As a result the lock contention introduced in `4418a784` persists all the way to HEAD.
