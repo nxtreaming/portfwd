@@ -1062,6 +1062,17 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     time_t old_active = conn->last_active;
     conn->last_active = now;
 
+    /* TEMPORARY DEBUG: Log every timestamp update to verify fix is working */
+    static _Atomic uint64_t update_count = 0;
+    uint64_t count = atomic_fetch_add(&update_count, 1);
+    if (count % 100 == 0) {  /* Log every 100th update to avoid spam */
+        char s_addr[INET6_ADDRSTRLEN];
+        format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
+        P_LOG_INFO("[DEBUG] touch_proxy_conn #%lu: %s:%d old=%ld new=%ld (diff=%ld)",
+                   count, s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                   old_active, now, now - old_active);
+    }
+
     /* Log abnormal time gaps (only if time actually changed) */
     if (old_active != now) {
         time_t gap = now - old_active;
@@ -1317,16 +1328,10 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     /* We already reserved the connection count via CAS earlier; read it for logging */
     unsigned new_count = atomic_load(&conn_tbl_len);
 
-    /* Log new connections at DEBUG level to reduce overhead in high-connection
-     * scenarios */
-    /* Only log every Nth connection to avoid spam */
-    static _Atomic unsigned log_counter = 0;
-    unsigned current_count = atomic_fetch_add(&log_counter, 1);
-    if ((current_count % LOG_EVERY_NTH_CONNECTION) == 0) {
-        format_client_addr(cli_addr, s_addr, sizeof(s_addr));
-        P_LOG_INFO("New UDP session [%s]:%d, total %u (logging every %dth)", s_addr,
-                   ntohs(*port_of_sockaddr(cli_addr)), new_count, LOG_EVERY_NTH_CONNECTION);
-    }
+    /* Log every new connection for better debugging visibility */
+    format_client_addr(cli_addr, s_addr, sizeof(s_addr));
+    P_LOG_INFO("New UDP session [%s]:%d, total %u", s_addr,
+               ntohs(*port_of_sockaddr(cli_addr)), new_count);
 
     conn->last_active = cached_now_seconds();
     
@@ -1617,6 +1622,13 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 if (!udp_flush_backlog(conn, epfd)) {
                     if (!udp_queue_datagram(conn, epfd, c_bufs[i], packet_len)) {
                         P_LOG_WARN("Dropping UDP datagram (%zu bytes) due to backlog overflow", packet_len);
+                    } else {
+                        /* DEBUG: Log backlog queuing */
+                        static _Atomic uint64_t queue_count = 0;
+                        if (atomic_fetch_add(&queue_count, 1) % 10 == 0) {
+                            P_LOG_INFO("[DEBUG] Queued packet to backlog (count=%lu, len=%zu)", 
+                                       atomic_load(&queue_count), packet_len);
+                        }
                     }
                     proxy_conn_put(conn, epfd);
                     continue;
@@ -1631,6 +1643,13 @@ static void handle_client_data(int lsn_sock, int epfd) {
                     if (is_wouldblock(errno)) {
                         if (!udp_queue_datagram(conn, epfd, c_bufs[i], packet_len)) {
                             P_LOG_WARN("Dropping UDP datagram (%zu bytes) due to backlog allocation failure", packet_len);
+                        } else {
+                            /* DEBUG: Log EWOULDBLOCK */
+                            static _Atomic uint64_t wouldblock_count = 0;
+                            if (atomic_fetch_add(&wouldblock_count, 1) % 10 == 0) {
+                                P_LOG_WARN("[DEBUG] send() returned EWOULDBLOCK (count=%lu)", 
+                                           atomic_load(&wouldblock_count));
+                            }
                         }
                     } else {
                         log_if_unexpected_errno("send(server)");
