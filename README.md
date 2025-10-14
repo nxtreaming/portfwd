@@ -340,6 +340,121 @@ Notes:
 - When the table reaches `UDP_PROXY_MAX_CONNS`, it first recycles timed-out entries, then evicts the least recently active (LRU) connection.
 - Increase the cap via `CFLAGS` or reduce `-t` to make recycling more aggressive.
 
+## Troubleshooting UDP Freeze/Hang Issues
+
+If you experience freeze or hang issues with `udpfwd` (especially when used with OpenVPN), the root cause is often **network packet loss** rather than a code bug.
+
+### Symptoms
+
+- ✅ `udpfwd` logs show normal operation (no "Recycling" errors)
+- ❌ OpenVPN connection becomes broken/timeout
+- ❌ All VPN-dependent applications freeze
+- ⏱️ Requires "cool down" period to recover
+- 🌐 **Only occurs in poor network environments** (home WiFi, mobile networks)
+- ✅ **Works perfectly in good network environments** (corporate networks, wired connections)
+
+### Root Cause
+
+This is a **cascading failure** triggered by network packet loss:
+
+```
+Network packet loss (5-15%)
+  ↓
+OpenVPN keepalive timeout
+  ↓
+OpenVPN enters broken state
+  ↓
+TUN/TAP interface blocks
+  ↓
+All VPN applications freeze
+```
+
+### Diagnosis
+
+Run the network quality test script:
+
+```bash
+chmod +x test_network_quality.sh
+./test_network_quality.sh your_udpfwd_server
+```
+
+Or manually test packet loss:
+
+```bash
+# Test packet loss rate
+ping -c 100 your_server
+
+# Analyze route quality
+mtr --report --report-cycles 100 your_server
+
+# Test UDP throughput
+iperf3 -c your_server -u -b 10M -t 60
+```
+
+**Network Quality Guidelines:**
+
+| Packet Loss | Network Quality | udpfwd Performance | Recommendation |
+|-------------|----------------|-------------------|----------------|
+| < 0.1% | Excellent | ✅ Perfect | Use as-is |
+| 1-5% | Acceptable | ⚠️ May have issues | Optimize OpenVPN config |
+| 5-10% | Poor | ❌ Frequent freezes | Improve network or use TCP |
+| > 10% | Very Poor | ❌ Unusable | Must improve network |
+
+### Solutions
+
+#### Immediate (Mitigate Symptoms)
+
+1. **Optimize OpenVPN Configuration** - Add to your OpenVPN config:
+   ```
+   # More aggressive keepalive
+   keepalive 5 30
+   ping-restart 60
+   
+   # Reduce MTU to minimize packet loss impact
+   mssfix 1200
+   tun-mtu 1400
+   
+   # Enable compression to reduce packet count
+   compress lz4-v2
+   
+   # Disable TLS renegotiation timeout
+   reneg-sec 0
+   ```
+
+2. **Disable udpfwd Timeout** - Prevent premature connection recycling:
+   ```bash
+   ./udpfwd 0.0.0.0:1194 server:1194 -C 100 -t 0
+   ```
+
+3. **Increase System UDP Buffers**:
+   ```bash
+   sudo sysctl -w net.core.rmem_max=26214400
+   sudo sysctl -w net.core.wmem_max=26214400
+   ```
+
+#### Short-term (Improve Network)
+
+1. **Use wired connection** instead of WiFi (can reduce packet loss by 80%)
+2. **Enable router QoS** to prioritize VPN traffic
+3. **Test different times** to avoid peak congestion
+4. **Upgrade ISP plan** or switch to a better provider
+
+#### Long-term (Architecture)
+
+1. **Switch to TCP mode** - More reliable but slower:
+   ```bash
+   ./tcpfwd 0.0.0.0:1194 server:1194
+   ```
+   Configure OpenVPN to use TCP instead of UDP.
+
+2. **Implement Forward Error Correction (FEC)** - Can tolerate 20-30% packet loss
+3. **Multi-path transmission** - Use multiple network interfaces simultaneously
+
+### See Also
+
+- `diagnose_hang.md` - Comprehensive troubleshooting guide
+- `test_network_quality.sh` - Automated network quality testing script
+
 ## TCP performance tunables
 
 `tcpfwd` increases throughput via larger userspace buffers and kernel socket buffers, plus backpressure gating and TCP keepalive.
