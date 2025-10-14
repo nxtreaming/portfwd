@@ -607,11 +607,6 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     char s_addr[INET6_ADDRSTRLEN] = "";
 
     list_for_each_entry(conn, chain, list) {
-        /* Prefetch next connection for better cache utilization */
-        if (conn->list.next != chain) {
-            struct proxy_conn *next = list_entry(conn->list.next, struct proxy_conn, list);
-            PREFETCH_READ(&next->cli_addr);
-        }
         if (is_sockaddr_inx_equal(cli_addr, &conn->cli_addr)) {
             proxy_conn_hold(conn);
             touch_proxy_conn(conn);
