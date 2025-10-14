@@ -68,11 +68,6 @@
 #define ENABLE_ADAPTIVE_BATCHING 0
 #endif
 
-/* Stats atomics control: default off (0) to reduce overhead in single-threaded mode */
-#ifndef ENABLE_STATS_ATOMICS
-#define ENABLE_STATS_ATOMICS 1
-#endif
-
 /* Compiler optimization hints */
 #ifndef likely
 #define likely(x) __builtin_expect(!!(x), 1)
@@ -81,16 +76,6 @@
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
 
-/* Prefetch hints for better cache utilization */
-#define PREFETCH_READ(addr) __builtin_prefetch((addr), 0, 3)
-#define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
-
-#ifndef DISABLE_BACKPRESSURE_QUEUE
-/* Disabled by default for better performance */
-#define ENABLE_BACKPRESSURE_QUEUE 0
-#else
-#define ENABLE_BACKPRESSURE_QUEUE 0
-#endif
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
@@ -182,46 +167,15 @@ static time_t g_now_ts; /**< Timestamp cache */
 /* Function pointer to compute bucket index from a 32-bit hash */
 static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 
-/* Additional performance statistics */
-static uint64_t g_stat_hash_collisions;
-static uint64_t g_stat_lru_immediate_updates;
-static uint64_t g_stat_lru_deferred_updates;
-
-/* Per-thread statistics to reduce atomic contention */
-#define MAX_THREAD_STATS 64
-struct thread_stats {
+/* Simple performance statistics (single-threaded) */
+static struct {
     uint64_t packets_processed;
     uint64_t bytes_processed;
     uint64_t hash_collisions;
-    uint64_t lru_updates;
-    char padding[64 - 4 * sizeof(uint64_t)]; /* Cache line padding */
-};
-static __thread struct thread_stats tls_stats = {0};
-static struct thread_stats g_thread_stats[MAX_THREAD_STATS] __attribute__((aligned(64)));
+} g_stats = {0};
 
 /* Global config */
 static struct fwd_config g_cfg;
-
-#if ENABLE_BACKPRESSURE_QUEUE
-/* Simple backpressure queue for handling EAGAIN */
-#define BACKPRESSURE_QUEUE_SIZE 1024
-struct backpressure_entry {
-    int sock;
-    char data[UDP_PROXY_DGRAM_CAP];
-    size_t len;
-    union sockaddr_inx dest_addr;
-    socklen_t dest_len;
-};
-
-struct backpressure_queue {
-    struct backpressure_entry entries[BACKPRESSURE_QUEUE_SIZE];
-    int head;
-    int tail;
-    int count;
-};
-
-static struct backpressure_queue g_backpressure_queue;
-#endif /* ENABLE_BACKPRESSURE_QUEUE */
 
 /* Hash functions */
 static uint32_t hash_addr(const union sockaddr_inx *sa);
@@ -460,102 +414,19 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
 #endif
 
 /**
- * @brief Validate packet size and content
- * @param data Packet data buffer
+ * @brief Validate packet size (basic check)
+ * @param data Packet data buffer (unused)
  * @param len Packet length
- * @param src Source address
- * @return true if packet is valid, false otherwise
+ * @param src Source address (unused)
+ * @return true if packet size is valid, false otherwise
  */
-static bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
-#if !ENABLE_PACKET_VALIDATION
+static inline bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
     (void)data;
-    (void)len;
     (void)src;
-    return true; /* Packet validation disabled at compile time */
-#else
-    /* Check packet size limits */
-    if (len < 1 || len > UDP_PROXY_DGRAM_CAP) {
-        P_LOG_WARN("Invalid packet size %zu from %s (min=1, max=%d)", len, sockaddr_to_string(src),
-                   UDP_PROXY_DGRAM_CAP);
-        return false;
-    }
-
-    /* Additional validation can be added here:
-     * - Check for suspicious patterns
-     * - Validate protocol headers
-     * - Check for amplification attack patterns
-     */
-
-    (void)data; /* Suppress unused parameter warning for now */
-    return true;
-#endif
+    /* Basic sanity check: packet must be non-empty and within MTU limits */
+    return (len > 0 && len <= UDP_PROXY_DGRAM_CAP);
 }
 
-#if ENABLE_BACKPRESSURE_QUEUE
-/* Initialize backpressure queue */
-static int init_backpressure_queue(void) {
-    memset(&g_backpressure_queue, 0, sizeof(g_backpressure_queue));
-    return 0;
-}
-
-/* Destroy backpressure queue */
-static void destroy_backpressure_queue(void) {
-    memset(&g_backpressure_queue, 0, sizeof(g_backpressure_queue));
-}
-
-/* Add entry to backpressure queue */
-static bool enqueue_backpressure(int sock, const char *data, size_t len,
-                                 const union sockaddr_inx *dest_addr, socklen_t dest_len) {
-    if (g_backpressure_queue.count >= BACKPRESSURE_QUEUE_SIZE) {
-        return false; /* Queue full */
-    }
-
-    struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.tail];
-    entry->sock = sock;
-    memcpy(entry->data, data, len);
-    entry->len = len;
-    if (dest_addr) {
-        entry->dest_addr = *dest_addr;
-        entry->dest_len = dest_len;
-    } else {
-        entry->dest_len = 0;
-    }
-
-    g_backpressure_queue.tail = (g_backpressure_queue.tail + 1) % BACKPRESSURE_QUEUE_SIZE;
-    g_backpressure_queue.count++;
-
-    return true;
-}
-
-/* Process backpressure queue */
-static void process_backpressure_queue(void) {
-    while (g_backpressure_queue.count > 0) {
-        struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.head];
-
-        ssize_t sent;
-        if (entry->dest_len > 0) {
-            /* UDP sendto */
-            sent = sendto(entry->sock, entry->data, entry->len, 0,
-                          (struct sockaddr *)&entry->dest_addr, entry->dest_len);
-        } else {
-            /* Connected UDP send */
-            sent = send(entry->sock, entry->data, entry->len, 0);
-        }
-
-        if (sent < 0) {
-            if (is_wouldblock(errno)) {
-                /* Still blocked, stop processing */
-                break;
-            }
-            /* Other error, drop this packet and continue */
-        }
-
-        /* Move to next entry */
-        g_backpressure_queue.head = (g_backpressure_queue.head + 1) % BACKPRESSURE_QUEUE_SIZE;
-        g_backpressure_queue.count--;
-    }
-}
-#endif /* ENABLE_BACKPRESSURE_QUEUE */
 
 #ifdef __linux__
 #if ENABLE_ADAPTIVE_BATCHING
@@ -1222,13 +1093,13 @@ static void handle_client_data(int lsn_sock, int epfd) {
                         log_if_unexpected_errno("send(server)");
                     }
                 } else {
-                    tls_stats.bytes_processed += (size_t)wr;
+                    g_stats.bytes_processed += (size_t)wr;
                 }
                 proxy_conn_put(conn, epfd);
             }
 
             record_batch_stats(n);
-            tls_stats.packets_processed += n;
+            g_stats.packets_processed += n;
 
             if (n < ncap)
                 break;
@@ -1292,7 +1163,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
             log_if_unexpected_errno("send(server)");
         }
     } else {
-        tls_stats.bytes_processed += (size_t)wr;
+        g_stats.bytes_processed += (size_t)wr;
     }
 
     proxy_conn_put(conn, epfd);
@@ -1832,10 +1703,6 @@ int main(int argc, char *argv[]) {
             proxy_conn_walk_continue(epfd);
             segmented_update_lru();
             
-            /* Process any queued backpressure packets */
-#if ENABLE_BACKPRESSURE_QUEUE
-            process_backpressure_queue();
-#endif
             last_check = current_ts;
             
             /* Check shutdown flag after maintenance tasks */
@@ -1941,41 +1808,24 @@ cleanup:
     free(conn_tbl_hbase);
     conn_tbl_hbase = NULL;
     conn_pool_destroy(&g_conn_pool);
-#if ENABLE_BACKPRESSURE_QUEUE
-    destroy_backpressure_queue();
-#endif
 #ifdef __linux__
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs);
 #endif
 
-    /* Aggregate thread-local statistics */
-    uint64_t total_packets = 0, total_bytes = 0, total_hash_collisions = 0;
-    for (int i = 0; i < MAX_THREAD_STATS; i++) {
-        total_packets += g_thread_stats[i].packets_processed;
-        total_bytes += g_thread_stats[i].bytes_processed;
-        total_hash_collisions += g_thread_stats[i].hash_collisions;
-    }
-
     /* Print performance statistics */
-    uint64_t hash_collisions = g_stat_hash_collisions + total_hash_collisions;
-    uint64_t lru_immediate = g_stat_lru_immediate_updates;
-    uint64_t lru_deferred = g_stat_lru_deferred_updates;
-
     P_LOG_INFO("Performance statistics:");
-    P_LOG_INFO("  Total packets processed: %" PRIu64, total_packets);
-    P_LOG_INFO("  Total bytes processed: %" PRIu64, total_bytes);
-    P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", hash_collisions,
-               total_packets > 0 ? (double)hash_collisions / total_packets : 0.0);
-    P_LOG_INFO("  LRU updates: immediate=%" PRIu64 ", deferred=%" PRIu64,
-               lru_immediate, lru_deferred);
+    P_LOG_INFO("  Total packets processed: %" PRIu64, g_stats.packets_processed);
+    P_LOG_INFO("  Total bytes processed: %" PRIu64, g_stats.bytes_processed);
+    P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", g_stats.hash_collisions,
+               g_stats.packets_processed > 0 ? (double)g_stats.hash_collisions / g_stats.packets_processed : 0.0);
 
-    if (total_packets > 0 && hash_collisions > total_packets / 2) {
+    if (g_stats.packets_processed > 0 && g_stats.hash_collisions > g_stats.packets_processed / 2) {
         P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash "
                    "table size or connection distribution",
-                   (double)hash_collisions * 100.0 / total_packets);
+                   (double)g_stats.hash_collisions * 100.0 / g_stats.packets_processed);
     }
-    if (total_packets > 0) {
-        double throughput_pps = (double)total_packets / (time(NULL) - last_check + 1);
+    if (g_stats.packets_processed > 0) {
+        double throughput_pps = (double)g_stats.packets_processed / (time(NULL) - last_check + 1);
         P_LOG_INFO("  Estimated throughput: %.0f packets/sec", throughput_pps);
     }
     
