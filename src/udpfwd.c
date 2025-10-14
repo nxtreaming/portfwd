@@ -42,31 +42,17 @@
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
 #define DEFAULT_HASH_TABLE_SIZE 4096  /* Power-of-two for fast bitwise indexing; sized ~ max conns */
-#define MIN_BATCH_SIZE 128             /* Increased from 64 for better performance */
-#define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
-#define BATCH_ADJUST_INTERVAL_SEC 60 /* Reduced frequency from 30 to 60 seconds */
 
 /* Hash function constants */
 #define FNV_PRIME_32 0x01000193
 #define FNV_OFFSET_32 0x811c9dc5
 #define GOLDEN_RATIO_32 0x9e3779b9
 
-/* Adaptive batch sizing thresholds - less aggressive */
-#define BATCH_HIGH_UTILIZATION_RATIO 0.95 /* Increased from 0.9 */
-#define BATCH_LOW_UTILIZATION_RATIO 0.05  /* Decreased from 0.1 */
-
 /* Connection logging and monitoring constants */
 #define LOG_EVERY_NTH_CONNECTION 50  /* Log every Nth connection to reduce spam */
 #define HIGH_WATER_MARK_PERCENT 95    /* Warn at 95% capacity */
 #define MAX_EVICTION_ATTEMPTS 5       /* Prevent infinite eviction loops */
 #define TIME_GAP_WARNING_THRESHOLD_SEC 120  /* Warn on time gaps > 120 seconds */
-
-/* Performance optimization flags */
-#ifndef DISABLE_ADAPTIVE_BATCHING
-#define ENABLE_ADAPTIVE_BATCHING 1
-#else
-#define ENABLE_ADAPTIVE_BATCHING 0
-#endif
 
 /* Compiler optimization hints */
 #ifndef likely
@@ -75,7 +61,6 @@
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #endif
-
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
@@ -135,27 +120,6 @@ static int g_sockbuf_cap_runtime = UDP_PROXY_SOCKBUF_CAP;
 static int g_conn_pool_capacity = UDP_PROXY_MAX_CONNS;
 #ifdef __linux__
 static int g_batch_sz_runtime = UDP_PROXY_BATCH_SZ;
-
-#if ENABLE_ADAPTIVE_BATCHING
-/* Dynamic batch sizing */
-struct adaptive_batch {
-    int current_size;
-    int min_size;
-    int max_size;
-    uint64_t total_packets;
-    uint64_t total_batches;
-    time_t last_adjust;
-};
-
-static struct adaptive_batch g_adaptive_batch = {
-    .current_size = UDP_PROXY_BATCH_SZ, /* Start with full batch size */
-    .min_size = MIN_BATCH_SIZE,
-    .max_size = MAX_BATCH_SIZE,
-    .total_packets = 0,
-    .total_batches = 0,
-    .last_adjust = 0
-};
-#endif /* ENABLE_ADAPTIVE_BATCHING */
 #endif
 
 /* Global LRU list for O(1) oldest selection */
@@ -426,66 +390,6 @@ static inline bool validate_packet(const char *data, size_t len, const union soc
     /* Basic sanity check: packet must be non-empty and within MTU limits */
     return (len > 0 && len <= UDP_PROXY_DGRAM_CAP);
 }
-
-
-#ifdef __linux__
-#if ENABLE_ADAPTIVE_BATCHING
-/* Adjust batch size based on recent performance */
-static void adjust_batch_size(void) {
-    time_t now = time(NULL);
-    if (now - g_adaptive_batch.last_adjust < BATCH_ADJUST_INTERVAL_SEC) {
-        /* Don't adjust too frequently */
-        return;
-    }
-
-    uint64_t packets = g_adaptive_batch.total_packets;
-    uint64_t batches = g_adaptive_batch.total_batches;
-
-    if (batches > 0) {
-        double avg_batch_size = (double)packets / batches;
-
-        if (avg_batch_size > g_adaptive_batch.current_size * BATCH_HIGH_UTILIZATION_RATIO) {
-            /* High utilization - increase batch size */
-            if (g_adaptive_batch.current_size < g_adaptive_batch.max_size) {
-                unsigned long new_size = (unsigned long)g_adaptive_batch.current_size * 12 / 10; /* BATCH_INCREASE_FACTOR 1.2 */
-                if (new_size > (unsigned long)g_adaptive_batch.max_size) {
-                    new_size = g_adaptive_batch.max_size;
-                }
-                g_adaptive_batch.current_size = (int)new_size;
-                P_LOG_INFO("Increased batch size to %d (avg=%.1f)", g_adaptive_batch.current_size,
-                           avg_batch_size);
-            }
-        } else if (avg_batch_size < g_adaptive_batch.current_size * BATCH_LOW_UTILIZATION_RATIO) {
-            /* Low utilization - decrease batch size */
-            if (g_adaptive_batch.current_size > g_adaptive_batch.min_size) {
-                unsigned long new_size = (unsigned long)g_adaptive_batch.current_size * 8 / 10; /* BATCH_DECREASE_FACTOR 0.8 */
-                if (new_size < (unsigned long)g_adaptive_batch.min_size) {
-                    new_size = g_adaptive_batch.min_size;
-                }
-                g_adaptive_batch.current_size = (int)new_size;
-                P_LOG_INFO("Decreased batch size to %d (avg=%.1f)", g_adaptive_batch.current_size,
-                           avg_batch_size);
-            }
-        }
-    }
-
-    /* Reset counters */
-    g_adaptive_batch.total_packets = 0;
-    g_adaptive_batch.total_batches = 0;
-    g_adaptive_batch.last_adjust = now;
-}
-#endif /* ENABLE_ADAPTIVE_BATCHING */
-
-/* Record batch statistics */
-static void record_batch_stats(int packets_in_batch) {
-#if ENABLE_ADAPTIVE_BATCHING
-    g_adaptive_batch.total_packets += packets_in_batch;
-    g_adaptive_batch.total_batches += 1;
-#else
-    (void)packets_in_batch; /* Suppress unused parameter warning */
-#endif
-}
-#endif
 
 /**
  * @brief Improved hash function with better distribution using FNV-1a
@@ -1098,21 +1002,11 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 proxy_conn_put(conn, epfd);
             }
 
-            record_batch_stats(n);
             g_stats.packets_processed += n;
 
             if (n < ncap)
                 break;
         }
-
-#if ENABLE_ADAPTIVE_BATCHING
-        static time_t last_adjust_check = 0;
-        time_t now = time(NULL);
-        if (now - last_adjust_check >= BATCH_ADJUST_INTERVAL_SEC) {
-            adjust_batch_size();
-            last_adjust_check = now;
-        }
-#endif
 
         return;
     }
