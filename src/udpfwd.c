@@ -93,12 +93,6 @@
 #define PREFETCH_READ(addr) __builtin_prefetch((addr), 0, 3)
 #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
 
-#ifndef DISABLE_LRU_LOCKS
-#define ENABLE_LRU_LOCKS 1
-#else
-#define ENABLE_LRU_LOCKS 0
-#endif
-
 #ifndef DISABLE_BACKPRESSURE_QUEUE
 /* Disabled by default for better performance */
 #define ENABLE_BACKPRESSURE_QUEUE 0
@@ -189,22 +183,8 @@ static struct adaptive_batch g_adaptive_batch = {
 #endif /* ENABLE_ADAPTIVE_BATCHING */
 #endif
 
-/* Global LRU list for O(1) oldest selection - protected by mutex */
+/* Global LRU list for O(1) oldest selection */
 static LIST_HEAD(g_lru_list);
-static pthread_mutex_t g_lru_lock = PTHREAD_MUTEX_INITIALIZER;
-
-#if ENABLE_LRU_LOCKS
-struct lru_segment_state {
-    unsigned next_bucket;
-    unsigned buckets_per_segment;
-    time_t last_segment_update;
-};
-static struct lru_segment_state g_lru_segment_state = {
-    .next_bucket = 0,
-    .buckets_per_segment = 0,
-    .last_segment_update = 0,
-};
-#endif
 
 /* Cached current timestamp (monotonic seconds on Linux) for hot paths */
 static atomic_long g_now_ts; /**< Atomic timestamp cache */
@@ -867,11 +847,6 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
                        gap, old_active, now);
         }
     }
-
-#if ENABLE_LRU_LOCKS
-    conn->needs_lru_update = true;
-    atomic_fetch_add_explicit(&g_stat_lru_deferred_updates, 1, memory_order_relaxed);
-#endif
 }
 
 /**
@@ -882,82 +857,12 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
  * This amortizes the cost of LRU updates across multiple maintenance cycles.
  */
 static inline void apply_lru_update_batch(struct proxy_conn **batch, size_t count) {
-#if ENABLE_LRU_LOCKS
-    if (!count)
-        return;
-
-    pthread_mutex_lock(&g_lru_lock);
-    for (size_t i = 0; i < count; ++i) {
-        struct proxy_conn *conn = batch[i];
-        if (!conn)
-            continue;
-        if (!list_empty(&conn->lru)) {
-            list_move_tail(&conn->lru, &g_lru_list);
-        }
-    }
-    pthread_mutex_unlock(&g_lru_lock);
-#else
     (void)batch;
     (void)count;
-#endif
 }
 
 static void segmented_update_lru(void) {
-#if ENABLE_LRU_LOCKS
-    if (g_conn_tbl_hash_size == 0) {
-        return;
-    }
-
-    time_t now = monotonic_seconds();
-    if (now - g_lru_segment_state.last_segment_update < 1) {
-        return;
-    }
-    g_lru_segment_state.last_segment_update = now;
-
-    /* Initialize buckets_per_segment on first call */
-    if (g_lru_segment_state.buckets_per_segment == 0) {
-        /* Process ~1/32 of hash table per second, capped at 256 buckets */
-        unsigned buckets = (g_conn_tbl_hash_size / 32) + 1;
-        const unsigned MAX_BUCKETS_PER_SEGMENT = 256;
-        if (buckets > MAX_BUCKETS_PER_SEGMENT) {
-            buckets = MAX_BUCKETS_PER_SEGMENT;
-        }
-        g_lru_segment_state.buckets_per_segment = buckets;
-    }
-
-    unsigned start_bucket = g_lru_segment_state.next_bucket;
-    unsigned end_bucket = start_bucket + g_lru_segment_state.buckets_per_segment;
-    if (end_bucket > g_conn_tbl_hash_size) {
-        end_bucket = g_conn_tbl_hash_size;
-    }
-
-    struct proxy_conn *update_batch[LRU_UPDATE_BATCH_SIZE];
-
-    for (unsigned i = start_bucket; i < end_bucket; ++i) {
-        struct proxy_conn *conn;
-        struct proxy_conn *tmp;
-        size_t batch_count = 0;
-        list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
-            if (!conn->needs_lru_update) {
-                continue;
-            }
-            conn->needs_lru_update = false;
-            update_batch[batch_count++] = conn;
-
-            if (batch_count == countof(update_batch)) {
-                apply_lru_update_batch(update_batch, batch_count);
-                batch_count = 0;
-            }
-        }
-        apply_lru_update_batch(update_batch, batch_count);
-        batch_count = 0;
-    }
-
-    g_lru_segment_state.next_bucket = end_bucket;
-    if (g_lru_segment_state.next_bucket >= g_conn_tbl_hash_size) {
-        g_lru_segment_state.next_bucket = 0;
-    }
-#endif
+    /* LRU updates disabled in single-threaded mode */
 }
 
 /**
@@ -1075,14 +980,8 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     /* Add to hash table */
     list_add_tail(&conn->list, chain);
 
-    /* Add to LRU list with global lock */
-#if ENABLE_LRU_LOCKS
-    pthread_mutex_lock(&g_lru_lock);
-#endif
+    /* Add to LRU list */
     list_add_tail(&conn->lru, &g_lru_list);
-#if ENABLE_LRU_LOCKS
-    pthread_mutex_unlock(&g_lru_lock);
-#endif
 
     /* We already reserved the connection count via CAS earlier; read it for logging */
     unsigned new_count = atomic_load(&conn_tbl_len);
@@ -1140,17 +1039,10 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     /* Update global connection count atomically */
     atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
 
-    /* Remove from LRU list with global LRU lock */
-#if ENABLE_LRU_LOCKS
-    pthread_mutex_lock(&g_lru_lock);
-#endif
-    /* Check if the entry is actually in a list before deleting */
+    /* Remove from LRU list */
     if (!list_empty(&conn->lru)) {
         list_del(&conn->lru);
     }
-#if ENABLE_LRU_LOCKS
-    pthread_mutex_unlock(&g_lru_lock);
-#endif
 
     /* Remove from epoll and close socket */
     if (conn->svr_sock >= 0) {
@@ -1205,9 +1097,7 @@ static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
 static void proxy_conn_walk_continue(int epfd) {
     time_t now = cached_now_seconds();
 
-    pthread_mutex_lock(&g_lru_lock);
     if (list_empty(&g_lru_list)) {
-        pthread_mutex_unlock(&g_lru_lock);
         return;
     }
 
@@ -1225,7 +1115,6 @@ static void proxy_conn_walk_continue(int epfd) {
     list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
         /* Check shutdown flag to allow fast exit */
         if (g_shutdown_requested) {
-            pthread_mutex_unlock(&g_lru_lock);
             return;
         }
         
@@ -1260,10 +1149,7 @@ static void proxy_conn_walk_continue(int epfd) {
         }
     }
 
-    /* Release lock BEFORE logging or doing I/O */
-    pthread_mutex_unlock(&g_lru_lock);
-    
-    /* Now process the reap_list without holding the lock */
+    /* Now process the reap_list */
     list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
         /* Log connection recycling with detailed info */
         char s_addr[INET6_ADDRSTRLEN] = "";
@@ -1297,9 +1183,7 @@ static void proxy_conn_walk_continue(int epfd) {
  * @return true if a connection was evicted, false if LRU list was empty
  */
 static bool proxy_conn_evict_one(int epfd) {
-    pthread_mutex_lock(&g_lru_lock);
     if (list_empty(&g_lru_list)) {
-        pthread_mutex_unlock(&g_lru_lock);
         return false;
     }
 
@@ -1309,9 +1193,6 @@ static bool proxy_conn_evict_one(int epfd) {
 
     /* CRITICAL: Hold reference before unlocking to prevent use-after-free */
     proxy_conn_hold(oldest);
-
-    /* Unlock before calling release_proxy_conn to avoid deadlock */
-    pthread_mutex_unlock(&g_lru_lock);
 
     /* Release the temporary hold (connection will be freed if ref_count reaches 0) */
     proxy_conn_put(oldest, epfd);
