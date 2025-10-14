@@ -35,8 +35,6 @@
 #include <netdb.h>
 #include <time.h>
 #include <stdbool.h>
-#include <pthread.h>
-#include <stdatomic.h>
 #include <stdint.h>
 
 #ifdef __linux__
@@ -168,7 +166,6 @@ struct adaptive_batch {
     uint64_t total_packets;
     uint64_t total_batches;
     time_t last_adjust;
-    pthread_mutex_t lock;
 };
 
 static struct adaptive_batch g_adaptive_batch = {
@@ -177,8 +174,7 @@ static struct adaptive_batch g_adaptive_batch = {
     .max_size = MAX_BATCH_SIZE,
     .total_packets = 0,
     .total_batches = 0,
-    .last_adjust = 0,
-    .lock = PTHREAD_MUTEX_INITIALIZER
+    .last_adjust = 0
 };
 #endif /* ENABLE_ADAPTIVE_BATCHING */
 #endif
@@ -228,7 +224,6 @@ struct backpressure_queue {
     int head;
     int tail;
     int count;
-    pthread_mutex_t lock;
 };
 
 static struct backpressure_queue g_backpressure_queue;
@@ -506,26 +501,18 @@ static bool validate_packet(const char *data, size_t len, const union sockaddr_i
 /* Initialize backpressure queue */
 static int init_backpressure_queue(void) {
     memset(&g_backpressure_queue, 0, sizeof(g_backpressure_queue));
-    if (pthread_mutex_init(&g_backpressure_queue.lock, NULL) != 0) {
-        P_LOG_ERR("Failed to initialize backpressure queue mutex");
-        return -1;
-    }
     return 0;
 }
 
 /* Destroy backpressure queue */
 static void destroy_backpressure_queue(void) {
-    pthread_mutex_destroy(&g_backpressure_queue.lock);
     memset(&g_backpressure_queue, 0, sizeof(g_backpressure_queue));
 }
 
 /* Add entry to backpressure queue */
 static bool enqueue_backpressure(int sock, const char *data, size_t len,
                                  const union sockaddr_inx *dest_addr, socklen_t dest_len) {
-    pthread_mutex_lock(&g_backpressure_queue.lock);
-
     if (g_backpressure_queue.count >= BACKPRESSURE_QUEUE_SIZE) {
-        pthread_mutex_unlock(&g_backpressure_queue.lock);
         return false; /* Queue full */
     }
 
@@ -543,14 +530,11 @@ static bool enqueue_backpressure(int sock, const char *data, size_t len,
     g_backpressure_queue.tail = (g_backpressure_queue.tail + 1) % BACKPRESSURE_QUEUE_SIZE;
     g_backpressure_queue.count++;
 
-    pthread_mutex_unlock(&g_backpressure_queue.lock);
     return true;
 }
 
 /* Process backpressure queue */
 static void process_backpressure_queue(void) {
-    pthread_mutex_lock(&g_backpressure_queue.lock);
-
     while (g_backpressure_queue.count > 0) {
         struct backpressure_entry *entry = &g_backpressure_queue.entries[g_backpressure_queue.head];
 
@@ -576,8 +560,6 @@ static void process_backpressure_queue(void) {
         g_backpressure_queue.head = (g_backpressure_queue.head + 1) % BACKPRESSURE_QUEUE_SIZE;
         g_backpressure_queue.count--;
     }
-
-    pthread_mutex_unlock(&g_backpressure_queue.lock);
 }
 #endif /* ENABLE_BACKPRESSURE_QUEUE */
 
@@ -585,12 +567,9 @@ static void process_backpressure_queue(void) {
 #if ENABLE_ADAPTIVE_BATCHING
 /* Adjust batch size based on recent performance */
 static void adjust_batch_size(void) {
-    pthread_mutex_lock(&g_adaptive_batch.lock);
-
     time_t now = time(NULL);
     if (now - g_adaptive_batch.last_adjust < BATCH_ADJUST_INTERVAL_SEC) {
         /* Don't adjust too frequently */
-        pthread_mutex_unlock(&g_adaptive_batch.lock);
         return;
     }
 
@@ -629,8 +608,6 @@ static void adjust_batch_size(void) {
     g_adaptive_batch.total_packets = 0;
     g_adaptive_batch.total_batches = 0;
     g_adaptive_batch.last_adjust = now;
-
-    pthread_mutex_unlock(&g_adaptive_batch.lock);
 }
 #endif /* ENABLE_ADAPTIVE_BATCHING */
 
@@ -766,24 +743,17 @@ static inline void format_client_addr(const union sockaddr_inx *addr, char *buf,
  * 
  * CRITICAL PERFORMANCE REQUIREMENT:
  * This function is in the HOT PATH - called for EVERY packet (both inbound 
- * and outbound). It MUST NOT acquire locks directly (especially g_lru_lock).
- * 
- * LESSON LEARNED (commit 4418a784):
- * Adding pthread_mutex_lock(&g_lru_lock) here caused catastrophic performance
- * degradation and multi-second freeze/hang symptoms under load. The lock 
- * contention between packet processing and maintenance cycles serialized all
- * traffic, even at low PPS.
+ * and outbound). Single-threaded design ensures minimal overhead.
  * 
  * DESIGN PRINCIPLE:
- * Use deferred updates via needs_lru_update flag. The maintenance cycle
- * (segmented_update_lru) batches LRU list updates outside the hot path,
- * keeping packet processing lock-free and fast.
+ * Single-threaded design ensures no lock contention. All updates are
+ * performed directly in the packet processing path.
  * 
  * @param conn The connection to touch
  */
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
     /* When timeout is disabled (proxy_conn_timeo == 0), skip all timestamp
-     * and LRU updates to eliminate lock contention and improve performance.
+     * and LRU updates to improve performance.
      * UDP is connectionless - we don't need timestamps to track "liveness". */
     if (g_cfg.proxy_conn_timeo == 0) {
         return;  /* Fast path: no timeout checking needed */
