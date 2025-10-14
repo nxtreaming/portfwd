@@ -93,18 +93,6 @@
 #define PREFETCH_READ(addr) __builtin_prefetch((addr), 0, 3)
 #define PREFETCH_WRITE(addr) __builtin_prefetch((addr), 1, 3)
 
-#ifndef DISABLE_PACKET_VALIDATION
-#define ENABLE_PACKET_VALIDATION 1
-#else
-#define ENABLE_PACKET_VALIDATION 0
-#endif
-
-#ifndef DISABLE_FINE_GRAINED_LOCKS
-#define ENABLE_FINE_GRAINED_LOCKS 1
-#else
-#define ENABLE_FINE_GRAINED_LOCKS 0
-#endif
-
 #ifndef DISABLE_LRU_LOCKS
 #define ENABLE_LRU_LOCKS 1
 #else
@@ -163,16 +151,10 @@
 #define UDP_PROXY_MAX_CONNS 2048
 #endif
 
-
-/* Connection hash table - protected by fine-grained locks */
+/* Connection hash table */
 static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
 static atomic_uint conn_tbl_len; /**< Atomic connection count */
-
-#if ENABLE_FINE_GRAINED_LOCKS
-/* Hash table bucket locks for fine-grained locking */
-static pthread_spinlock_t *conn_tbl_locks;
-#endif
 
 /* Connection pool */
 static struct conn_pool g_conn_pool;
@@ -955,9 +937,6 @@ static void segmented_update_lru(void) {
         struct proxy_conn *conn;
         struct proxy_conn *tmp;
         size_t batch_count = 0;
-#if ENABLE_FINE_GRAINED_LOCKS
-        pthread_spin_lock(&conn_tbl_locks[i]);
-#endif
         list_for_each_entry_safe(conn, tmp, &conn_tbl_hbase[i], list) {
             if (!conn->needs_lru_update) {
                 continue;
@@ -972,9 +951,6 @@ static void segmented_update_lru(void) {
         }
         apply_lru_update_batch(update_batch, batch_count);
         batch_count = 0;
-#if ENABLE_FINE_GRAINED_LOCKS
-        pthread_spin_unlock(&conn_tbl_locks[i]);
-#endif
     }
 
     g_lru_segment_state.next_bucket = end_bucket;
@@ -1096,15 +1072,8 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     }
     /* ------------------------------------------ */
 
-    /* Add to hash table with bucket lock */
-#if ENABLE_FINE_GRAINED_LOCKS
-    unsigned bucket = bucket_index_fun(cli_addr);
-    pthread_spin_lock(&conn_tbl_locks[bucket]);
-#endif
+    /* Add to hash table */
     list_add_tail(&conn->list, chain);
-#if ENABLE_FINE_GRAINED_LOCKS
-    pthread_spin_unlock(&conn_tbl_locks[bucket]);
-#endif
 
     /* Add to LRU list with global lock */
 #if ENABLE_LRU_LOCKS
@@ -1165,15 +1134,8 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
         return;
     }
 
-    /* Remove from hash table with bucket lock */
-#if ENABLE_FINE_GRAINED_LOCKS
-    unsigned bucket = bucket_index_fun(&conn->cli_addr);
-    pthread_spin_lock(&conn_tbl_locks[bucket]);
-#endif
+    /* Remove from hash table */
     list_del(&conn->list);
-#if ENABLE_FINE_GRAINED_LOCKS
-    pthread_spin_unlock(&conn_tbl_locks[bucket]);
-#endif
 
     /* Update global connection count atomically */
     atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
@@ -2000,24 +1962,6 @@ int main(int argc, char *argv[]) {
         INIT_LIST_HEAD(&conn_tbl_hbase[i]);
     }
 
-#if ENABLE_FINE_GRAINED_LOCKS
-    conn_tbl_locks = malloc(sizeof(pthread_spinlock_t) * g_conn_tbl_hash_size);
-    if (!conn_tbl_locks) {
-        P_LOG_ERR("malloc(conn_tbl_locks): failed");
-        goto cleanup;
-    }
-    for (i = 0; (unsigned)i < g_conn_tbl_hash_size; i++) {
-        if (pthread_spin_init(&conn_tbl_locks[i], PTHREAD_PROCESS_PRIVATE) != 0) {
-            P_LOG_ERR("pthread_spin_init(lock %d): failed", i);
-            /* Clean up already initialized spinlocks */
-            for (int j = 0; j < i; j++) {
-                pthread_spin_destroy(&conn_tbl_locks[j]);
-            }
-            rc = 1;
-            goto cleanup;
-        }
-    }
-#endif
     atomic_store(&conn_tbl_len, 0);
 
     last_check = monotonic_seconds();
@@ -2158,17 +2102,6 @@ cleanup:
         }
     }
     epoll_close_comp(epfd);
-
-    /* Destroy hash table locks */
-#if ENABLE_FINE_GRAINED_LOCKS
-    if (conn_tbl_locks) {
-        for (unsigned i = 0; i < g_conn_tbl_hash_size; i++) {
-            pthread_spin_destroy(&conn_tbl_locks[i]);
-        }
-        free((void *)conn_tbl_locks);
-        conn_tbl_locks = NULL;
-    }
-#endif
 
     free(conn_tbl_hbase);
     conn_tbl_hbase = NULL;
