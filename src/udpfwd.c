@@ -2,12 +2,6 @@
  * @file udpfwd.c
  * @brief High-performance UDP port forwarding proxy with connection tracking
  *
- * This implementation provides:
- * - Thread-safe connection pooling and hash table management
- * - Adaptive batch processing for optimal throughput
- * - Zero-copy forwarding using recvmmsg/sendmmsg on Linux
- * - Fine-grained locking for scalability
- * - Comprehensive security validation
  */
 
 #define _GNU_SOURCE 1
