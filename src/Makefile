@@ -9,10 +9,10 @@ BUILD_DIR = build
 NO_EPOLL_O =
 ifeq ($(shell uname), Linux)
 #LDFLAGS += -levent
-LDFLAGS += -lpthread
+LDFLAGS_PTHREAD = -lpthread
 else
 NO_EPOLL_O = $(BUILD_DIR)/no-epoll.o
-LDFLAGS += -lpthread
+LDFLAGS_PTHREAD = -lpthread
 endif
 
 all: $(BUILD_DIR) tcpfwd udpfwd kcptcp-client kcptcp-server
@@ -25,19 +25,20 @@ $(BUILD_DIR):
 FWD_OBJS = $(BUILD_DIR)/tcpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
 
 tcpfwd: $(FWD_OBJS)
-	$(CC) $(CFLAGS) -o tcpfwd $(FWD_OBJS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o tcpfwd $(FWD_OBJS) $(LDFLAGS) $(LDFLAGS_PTHREAD)
 
+# udpfwd is single-threaded and does not need pthread
 udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
-# High-performance version with optimizations disabled
+# High-performance version with optimizations disabled (single-threaded, no pthread)
 udpfwd-fast: $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd-fast $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
 $(BUILD_DIR)/udpfwd-fast.o: udpfwd.c
 	$(CC) $(CFLAGS) -DDISABLE_ADAPTIVE_BATCHING -DDISABLE_RATE_LIMITING -DDISABLE_PACKET_VALIDATION -c -o $@ $<
 
-# Ultra-fast version with minimal locking
+# Ultra-fast version with minimal locking (single-threaded, no pthread)
 udpfwd-ultra: $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd-ultra $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
@@ -50,10 +51,10 @@ AEADOBJS = $(BUILD_DIR)/anti_replay.o $(BUILD_DIR)/secure_random.o $(BUILD_DIR)/
 KCPTCPOBJS = $(BUILD_DIR)/kcptcp_common.o
 
 kcptcp-client: $(BUILD_DIR)/kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o kcptcp-client $(BUILD_DIR)/kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o kcptcp-client $(BUILD_DIR)/kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O) $(LDFLAGS) $(LDFLAGS_PTHREAD)
 
 kcptcp-server: $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o kcptcp-server $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o kcptcp-server $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O) $(LDFLAGS) $(LDFLAGS_PTHREAD)
 
 # Convenience aliases: allow underscored targets too
 .PHONY: kcptcp_client kcptcp_server
