@@ -39,6 +39,8 @@
 #include "no-epoll.h"
 #endif
 
+#define KEEPALIVE_LOG_INTERVAL_SEC 60
+
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
 #define DEFAULT_HASH_TABLE_SIZE 4096  /* Power-of-two for fast bitwise indexing; sized ~ max conns */
@@ -1516,6 +1518,11 @@ int main(int argc, char *argv[]) {
         goto cleanup;
     }
 
+    /* Keep-alive statistics logging */
+    static time_t last_keepalive_log = 0;
+    static uint64_t last_packets_count = 0;
+    static uint64_t last_bytes_count = 0;
+
     /* Main event loop */
     for (;;) {
         int nfds;
@@ -1534,6 +1541,38 @@ int main(int argc, char *argv[]) {
             /* Check shutdown flag after maintenance tasks */
             if (g_shutdown_requested)
                 break;
+        }
+
+        /* Keep-alive: Log UDP session statistics every 60 seconds */
+        if (last_keepalive_log == 0) {
+            last_keepalive_log = current_ts;
+            last_packets_count = g_stats.packets_processed;
+            last_bytes_count = g_stats.bytes_processed;
+        }
+        /* Defensive: handle time going backwards (e.g., system clock adjustment) */
+        if (current_ts < last_keepalive_log) {
+            P_LOG_WARN("Time went backwards (current=%ld, last=%ld). Resetting keep-alive timer.",
+                       (long)current_ts, (long)last_keepalive_log);
+            last_keepalive_log = current_ts;
+        }
+        if ((long)(current_ts - last_keepalive_log) >= KEEPALIVE_LOG_INTERVAL_SEC) {
+            uint64_t packets_delta = g_stats.packets_processed - last_packets_count;
+            uint64_t bytes_delta = g_stats.bytes_processed - last_bytes_count;
+            time_t interval = current_ts - last_keepalive_log;
+            
+            P_LOG_INFO("[Keep-Alive] Active sessions: %u/%u, "
+                       "Packets: %" PRIu64 " (%.1f pps), "
+                       "Bytes: %" PRIu64 " (%.2f KB/s)",
+                       conn_tbl_len, 
+                       (unsigned)g_conn_pool.capacity,
+                       packets_delta,
+                       interval > 0 ? (double)packets_delta / interval : 0.0,
+                       bytes_delta,
+                       interval > 0 ? (double)bytes_delta / interval / 1024.0 : 0.0);
+            
+            last_keepalive_log = current_ts;
+            last_packets_count = g_stats.packets_processed;
+            last_bytes_count = g_stats.bytes_processed;
         }
 
         /* Check shutdown flag before blocking */
