@@ -5,7 +5,6 @@
  * This implementation provides:
  * - Thread-safe connection pooling and hash table management
  * - Adaptive batch processing for optimal throughput
- * - Rate limiting and DoS protection
  * - Zero-copy forwarding using recvmmsg/sendmmsg on Linux
  * - Fine-grained locking for scalability
  * - Comprehensive security validation
@@ -54,7 +53,6 @@
 #define MIN_BATCH_SIZE 128             /* Increased from 64 for better performance */
 #define MAX_BATCH_SIZE UDP_PROXY_BATCH_SZ
 #define BATCH_ADJUST_INTERVAL_SEC 60 /* Reduced frequency from 30 to 60 seconds */
-#define RATE_LIMIT_WINDOW_SEC 2
 
 /* Hash function constants */
 #define FNV_PRIME_32 0x01000193
@@ -76,19 +74,6 @@
 #define ENABLE_ADAPTIVE_BATCHING 1
 #else
 #define ENABLE_ADAPTIVE_BATCHING 0
-#endif
-
-/* Rate limiting compile-time switch
- * Default: disabled for maximum performance.
- * You can enable with -DENABLE_RATE_LIMITING=1 or force disable with -DDISABLE_RATE_LIMITING.
- */
-#ifdef DISABLE_RATE_LIMITING
-#  undef ENABLE_RATE_LIMITING
-#  define ENABLE_RATE_LIMITING 0
-#else
-#  ifndef ENABLE_RATE_LIMITING
-#    define ENABLE_RATE_LIMITING 0
-#  endif
 #endif
 
 /* Stats atomics control: default off (0) to reduce overhead in single-threaded mode */
@@ -178,25 +163,6 @@
 #define UDP_PROXY_MAX_CONNS 2048
 #endif
 
-/**
- * @brief Rate limiting structure for DoS protection
- */
-#define RATE_LIMIT_HASH_SIZE 1024
-struct rate_limit_entry {
-    union sockaddr_inx addr;
-    uint64_t packet_count;
-    uint64_t byte_count;
-    time_t window_start;
-    unsigned connection_count;
-};
-
-struct rate_limiter {
-    struct rate_limit_entry entries[RATE_LIMIT_HASH_SIZE];
-    pthread_mutex_t bucket_locks[RATE_LIMIT_HASH_SIZE];
-    unsigned max_pps;
-    unsigned max_bps;
-    unsigned max_per_ip;
-};
 
 /* Connection hash table - protected by fine-grained locks */
 static struct list_head *conn_tbl_hbase;
@@ -283,9 +249,6 @@ static struct thread_stats g_thread_stats[MAX_THREAD_STATS] __attribute__((align
 
 /* Global config */
 static struct fwd_config g_cfg;
-
-/* Global rate limiter for security */
-static struct rate_limiter g_rate_limiter;
 
 #if ENABLE_BACKPRESSURE_QUEUE
 /* Simple backpressure queue for handling EAGAIN */
@@ -545,159 +508,6 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP]);
 #endif
 
-#if ENABLE_RATE_LIMITING
-/* Simple hash function for IP addresses */
-static inline uint32_t addr_hash_for_rate_limit(const union sockaddr_inx *addr) {
-    if (addr->sa.sa_family != AF_INET && addr->sa.sa_family != AF_INET6) {
-        P_LOG_WARN("Unsupported address family: %d", addr->sa.sa_family);
-        return 0;
-    }
-    if (addr->sa.sa_family == AF_INET) {
-        return ntohl(addr->sin.sin_addr.s_addr) % RATE_LIMIT_HASH_SIZE;
-    } else if (addr->sa.sa_family == AF_INET6) {
-        const uint32_t *p = (const uint32_t *)&addr->sin6.sin6_addr;
-        return (ntohl(p[0]) ^ ntohl(p[1]) ^ ntohl(p[2]) ^ ntohl(p[3])) % RATE_LIMIT_HASH_SIZE;
-    }
-    return 0;
-}
-#endif
-
-/* Initialize rate limiter */
-static int init_rate_limiter(unsigned max_per_ip, unsigned max_pps, unsigned max_bps) {
-    memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
-    for (unsigned i = 0; i < RATE_LIMIT_HASH_SIZE; ++i) {
-        if (pthread_mutex_init(&g_rate_limiter.bucket_locks[i], NULL) != 0) {
-            P_LOG_ERR("Failed to initialize rate limiter bucket mutex %u", i);
-            /* Roll back already initialized locks */
-            for (unsigned j = 0; j < i; ++j) {
-                pthread_mutex_destroy(&g_rate_limiter.bucket_locks[j]);
-            }
-            return -1;
-        }
-    }
-    g_rate_limiter.max_per_ip = max_per_ip;
-    g_rate_limiter.max_pps = max_pps;
-    g_rate_limiter.max_bps = max_bps;
-    return 0;
-}
-
-/* Update connection_count in rate limiter for a given client address */
-static inline void rate_limiter_inc_conn(const union sockaddr_inx *addr) {
-#if ENABLE_RATE_LIMITING
-    uint32_t hash = addr_hash_for_rate_limit(addr);
-    pthread_mutex_t *lock = &g_rate_limiter.bucket_locks[hash];
-    pthread_mutex_lock(lock);
-    struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
-    if (entry->packet_count > 0 && !is_sockaddr_inx_equal(&entry->addr, addr)) {
-        memset(entry, 0, sizeof(*entry));
-    }
-    if (entry->packet_count == 0) {
-        entry->addr = *addr;
-        entry->window_start = cached_now_seconds();
-    }
-    entry->connection_count++;
-    pthread_mutex_unlock(lock);
-#else
-    (void)addr;
-#endif
-}
-
-static inline void rate_limiter_dec_conn(const union sockaddr_inx *addr) {
-#if ENABLE_RATE_LIMITING
-    uint32_t hash = addr_hash_for_rate_limit(addr);
-    pthread_mutex_t *lock = &g_rate_limiter.bucket_locks[hash];
-    pthread_mutex_lock(lock);
-    struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
-    if (entry->packet_count > 0 && is_sockaddr_inx_equal(&entry->addr, addr)) {
-        if (entry->connection_count > 0) entry->connection_count--;
-    }
-    pthread_mutex_unlock(lock);
-#else
-    (void)addr;
-#endif
-}
-
-/* Destroy rate limiter */
-static void destroy_rate_limiter(void) {
-    for (unsigned i = 0; i < RATE_LIMIT_HASH_SIZE; ++i) {
-        pthread_mutex_destroy(&g_rate_limiter.bucket_locks[i]);
-    }
-    memset(&g_rate_limiter, 0, sizeof(g_rate_limiter));
-}
-
-/**
- * @brief Check if packet is allowed by rate limiter
- * @param addr Source address
- * @param packet_size Size of packet in bytes
- * @return true if packet is allowed, false if rate limit exceeded
- */
-static bool check_rate_limit(const union sockaddr_inx *addr, size_t packet_size) {
-#if !ENABLE_RATE_LIMITING
-    (void)addr;
-    (void)packet_size;
-    return true; /* Rate limiting disabled at compile time */
-#else
-    if (g_rate_limiter.max_pps == 0 && g_rate_limiter.max_bps == 0 &&
-        g_rate_limiter.max_per_ip == 0) {
-        return true; /* No limits configured */
-    }
-
-    uint32_t hash = addr_hash_for_rate_limit(addr);
-    pthread_mutex_t *lock = &g_rate_limiter.bucket_locks[hash];
-    pthread_mutex_lock(lock);
-
-    struct rate_limit_entry *entry = &g_rate_limiter.entries[hash];
-    /* Use cached timestamp to avoid frequent time() syscalls */
-    time_t now = cached_now_seconds();
-
-    /* Check if this is the same IP or a hash collision */
-    if (entry->packet_count > 0 && !is_sockaddr_inx_equal(&entry->addr, addr)) {
-        /* Hash collision - reset entry for new IP */
-        memset(entry, 0, sizeof(*entry));
-    }
-
-    /* Initialize or reset time window */
-    if (entry->packet_count == 0 || now - entry->window_start >= RATE_LIMIT_WINDOW_SEC) {
-        entry->addr = *addr;
-        entry->packet_count = 1;
-        entry->byte_count = packet_size;
-        entry->window_start = now;
-        pthread_mutex_unlock(lock);
-        return true;
-    }
-
-    /* Check packet rate limit */
-    if (g_rate_limiter.max_pps > 0 && entry->packet_count >= g_rate_limiter.max_pps) {
-        pthread_mutex_unlock(lock);
-        P_LOG_WARN("Packet rate limit exceeded for %s (%lu pps)", sockaddr_to_string(addr),
-                   entry->packet_count);
-        return false;
-    }
-
-    /* Check byte rate limit */
-    if (g_rate_limiter.max_bps > 0 && entry->byte_count + packet_size > g_rate_limiter.max_bps) {
-        pthread_mutex_unlock(lock);
-        P_LOG_WARN("Byte rate limit exceeded for %s (%lu bps)", sockaddr_to_string(addr),
-                   entry->byte_count);
-        return false;
-    }
-
-    /* Check per-IP connection limit */
-    if (g_rate_limiter.max_per_ip > 0 && entry->connection_count >= g_rate_limiter.max_per_ip) {
-        pthread_mutex_unlock(lock);
-        P_LOG_WARN("Per-IP connection limit exceeded for %s (%u connections)",
-                   sockaddr_to_string(addr), entry->connection_count);
-        return false;
-    }
-
-    /* Update counters */
-    entry->packet_count++;
-    entry->byte_count += packet_size;
-
-    pthread_mutex_unlock(lock);
-    return true;
-#endif
-}
 
 /**
  * @brief Validate packet size and content
@@ -1200,12 +1010,6 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         }
     }
 
-    /* Check rate limits before creating new connection */
-    if (unlikely(!check_rate_limit(cli_addr, 0))) {
-        /* Rate limit exceeded - drop the connection request */
-        return NULL;
-    }
-
     /* Reserve a connection slot atomically to avoid races under contention */
     bool reserved_slot = false;
     unsigned current_conn_count;
@@ -1311,9 +1115,6 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     pthread_mutex_unlock(&g_lru_lock);
 #endif
 
-    /* Update per-IP connection count for rate limiting */
-    rate_limiter_inc_conn(cli_addr);
-
     /* We already reserved the connection count via CAS earlier; read it for logging */
     unsigned new_count = atomic_load(&conn_tbl_len);
 
@@ -1373,9 +1174,6 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
 #if ENABLE_FINE_GRAINED_LOCKS
     pthread_spin_unlock(&conn_tbl_locks[bucket]);
 #endif
-
-    /* Update per-IP connection count for rate limiting */
-    rate_limiter_dec_conn(&conn->cli_addr);
 
     /* Update global connection count atomically */
     atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
@@ -1597,9 +1395,6 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 if (unlikely(!validate_packet(c_bufs[i], packet_len, sa))) {
                     continue;
                 }
-                if (unlikely(!check_rate_limit(sa, packet_len))) {
-                    continue;
-                }
 
                 conn = proxy_conn_get_or_create(sa, epfd);
                 if (!conn)
@@ -1669,9 +1464,6 @@ static void handle_client_data(int lsn_sock, int epfd) {
     atomic_store(&g_now_ts, monotonic_seconds());
 
     if (!validate_packet(buffer, (size_t)r, &cli_addr)) {
-        return;
-    }
-    if (!check_rate_limit(&cli_addr, (size_t)r)) {
         return;
     }
 
@@ -2235,12 +2027,6 @@ int main(int argc, char *argv[]) {
     init_batching_resources(&c_msgs, &c_iov, &c_addrs, &c_bufs);
 #endif
 
-    if (init_rate_limiter(g_cfg.max_per_ip_connections, 0, 0) != 0) {
-        P_LOG_ERR("Failed to initialize rate limiter");
-        rc = 1;
-        goto cleanup;
-    }
-
     /* epoll loop */
     ev.data.ptr = &magic_listener;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
@@ -2387,7 +2173,6 @@ cleanup:
     free(conn_tbl_hbase);
     conn_tbl_hbase = NULL;
     conn_pool_destroy(&g_conn_pool);
-    destroy_rate_limiter();
 #if ENABLE_BACKPRESSURE_QUEUE
     destroy_backpressure_queue();
 #endif
