@@ -433,28 +433,14 @@ static inline uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
     return hash;
 }
 
-/**
- * @brief Check if an unsigned value is a power of two
- * @param v Value to check
- * @return true if v is a power of two, false otherwise
- */
 static inline bool is_power_of_two(unsigned v) {
     return v && ((v & (v - 1)) == 0);
 }
 
-/**
- * @brief Increment reference count for a proxy connection
- * @param conn Connection to hold a reference to
- */
 static inline void proxy_conn_hold(struct proxy_conn *conn) {
     conn->ref_count++;
 }
 
-/**
- * @brief Initialize a newly allocated proxy connection
- * @param conn Pointer to the connection object from the pool
- * @return The initialized connection object, or NULL on failure
- */
 static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
     if (!conn) {
         return NULL;
@@ -469,21 +455,11 @@ static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
     return conn;
 }
 
-/**
- * @brief Compute bucket index using bitwise AND (for power-of-2 table sizes)
- * @param sa Socket address
- * @return Bucket index
- */
 static inline unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h & (g_conn_tbl_hash_size - 1);
 }
 
-/**
- * @brief Compute bucket index using modulo (for non-power-of-2 table sizes)
- * @param sa Socket address
- * @return Bucket index
- */
 static inline unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h % g_conn_tbl_hash_size;
@@ -494,12 +470,6 @@ static inline uint32_t hash_addr(const union sockaddr_inx *a) {
     return improved_hash_addr(a);
 }
 
-/**
- * @brief Format client address for logging (reduces code duplication)
- * @param addr The address to format
- * @param buf Output buffer
- * @param bufsize Size of output buffer
- */
 static inline void format_client_addr(const union sockaddr_inx *addr, char *buf, size_t bufsize) {
     if (!addr || !buf || bufsize == 0) {
         return;
@@ -507,23 +477,7 @@ static inline void format_client_addr(const union sockaddr_inx *addr, char *buf,
     inet_ntop(addr->sa.sa_family, addr_of_sockaddr(addr), buf, bufsize);
 }
 
-/**
- * @brief Touch a proxy connection to update its last-active timestamp.
- * 
- * CRITICAL PERFORMANCE REQUIREMENT:
- * This function is in the HOT PATH - called for EVERY packet (both inbound 
- * and outbound). Single-threaded design ensures minimal overhead.
- * 
- * DESIGN PRINCIPLE:
- * Single-threaded design ensures no lock contention. All updates are
- * performed directly in the packet processing path.
- * 
- * @param conn The connection to touch
- */
 static inline void touch_proxy_conn(struct proxy_conn *conn) {
-    /* When timeout is disabled (proxy_conn_timeo == 0), skip all timestamp
-     * and LRU updates to improve performance.
-     * UDP is connectionless - we don't need timestamps to track "liveness". */
     if (g_cfg.proxy_conn_timeo == 0) {
         return;  /* Fast path: no timeout checking needed */
     }
@@ -575,22 +529,6 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
                        gap, old_active, now);
         }
     }
-}
-
-/**
- * @brief Update LRU list in segments to reduce lock contention
- * 
- * This function processes a segment of hash table buckets per call,
- * updating the LRU list for connections that have been touched.
- * This amortizes the cost of LRU updates across multiple maintenance cycles.
- */
-static inline void apply_lru_update_batch(struct proxy_conn **batch, size_t count) {
-    (void)batch;
-    (void)count;
-}
-
-static void segmented_update_lru(void) {
-    /* LRU updates disabled in single-threaded mode */
 }
 
 /**
@@ -1590,7 +1528,6 @@ int main(int argc, char *argv[]) {
             g_now_ts = current_ts;
             
             proxy_conn_walk_continue(epfd);
-            segmented_update_lru();
             
             last_check = current_ts;
             
