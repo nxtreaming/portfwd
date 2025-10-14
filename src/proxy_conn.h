@@ -33,7 +33,7 @@ enum proxy_state {
 
 struct proxy_conn {
     /* Common fields */
-    atomic_uint ref_count;   /* Atomic reference counter */
+    unsigned ref_count;   /* Reference counter */
     enum proxy_state state;
     struct list_head list;   /* For linking into different lists */
     struct proxy_conn *next; /* For freelist in conn_pool */

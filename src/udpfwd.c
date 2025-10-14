@@ -148,7 +148,7 @@
 /* Connection hash table */
 static struct list_head *conn_tbl_hbase;
 static unsigned g_conn_tbl_hash_size;
-static atomic_uint conn_tbl_len; /**< Atomic connection count */
+static unsigned conn_tbl_len; /**< Connection count */
 
 /* Connection pool */
 static struct conn_pool g_conn_pool;
@@ -165,8 +165,8 @@ struct adaptive_batch {
     int current_size;
     int min_size;
     int max_size;
-    _Atomic uint64_t total_packets;
-    _Atomic uint64_t total_batches;
+    uint64_t total_packets;
+    uint64_t total_batches;
     time_t last_adjust;
     pthread_mutex_t lock;
 };
@@ -187,15 +187,15 @@ static struct adaptive_batch g_adaptive_batch = {
 static LIST_HEAD(g_lru_list);
 
 /* Cached current timestamp (monotonic seconds on Linux) for hot paths */
-static atomic_long g_now_ts; /**< Atomic timestamp cache */
+static time_t g_now_ts; /**< Timestamp cache */
 
 /* Function pointer to compute bucket index from a 32-bit hash */
 static unsigned int (*bucket_index_fun)(const union sockaddr_inx *);
 
 /* Additional performance statistics */
-static _Atomic uint64_t g_stat_hash_collisions;
-static _Atomic uint64_t g_stat_lru_immediate_updates;
-static _Atomic uint64_t g_stat_lru_deferred_updates;
+static uint64_t g_stat_hash_collisions;
+static uint64_t g_stat_lru_immediate_updates;
+static uint64_t g_stat_lru_deferred_updates;
 
 /* Per-thread statistics to reduce atomic contention */
 #define MAX_THREAD_STATS 64
@@ -266,10 +266,10 @@ static inline time_t monotonic_seconds(void) {
 
 /* Load cached time with monotonic fallback for hot paths */
 static inline time_t cached_now_seconds(void) {
-    time_t now = atomic_load(&g_now_ts);
+    time_t now = g_now_ts;
     if (now == 0) {
         now = monotonic_seconds();
-        atomic_store(&g_now_ts, now);
+        g_now_ts = now;
     }
     return now;
 }
@@ -470,7 +470,6 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP]);
 #endif
 
-
 /**
  * @brief Validate packet size and content
  * @param data Packet data buffer
@@ -595,8 +594,8 @@ static void adjust_batch_size(void) {
         return;
     }
 
-    uint64_t packets = atomic_load(&g_adaptive_batch.total_packets);
-    uint64_t batches = atomic_load(&g_adaptive_batch.total_batches);
+    uint64_t packets = g_adaptive_batch.total_packets;
+    uint64_t batches = g_adaptive_batch.total_batches;
 
     if (batches > 0) {
         double avg_batch_size = (double)packets / batches;
@@ -627,13 +626,8 @@ static void adjust_batch_size(void) {
     }
 
     /* Reset counters */
-    #if ENABLE_STATS_ATOMICS
-    atomic_store(&g_adaptive_batch.total_packets, 0);
-    atomic_store(&g_adaptive_batch.total_batches, 0);
-    #else
     g_adaptive_batch.total_packets = 0;
     g_adaptive_batch.total_batches = 0;
-    #endif
     g_adaptive_batch.last_adjust = now;
 
     pthread_mutex_unlock(&g_adaptive_batch.lock);
@@ -643,13 +637,8 @@ static void adjust_batch_size(void) {
 /* Record batch statistics */
 static void record_batch_stats(int packets_in_batch) {
 #if ENABLE_ADAPTIVE_BATCHING
-    #if ENABLE_STATS_ATOMICS
-    atomic_fetch_add(&g_adaptive_batch.total_packets, packets_in_batch);
-    atomic_fetch_add(&g_adaptive_batch.total_batches, 1);
-    #else
     g_adaptive_batch.total_packets += packets_in_batch;
     g_adaptive_batch.total_batches += 1;
-    #endif
 #else
     (void)packets_in_batch; /* Suppress unused parameter warning */
 #endif
@@ -712,7 +701,7 @@ static inline bool is_power_of_two(unsigned v) {
  * @param conn Connection to hold a reference to
  */
 static inline void proxy_conn_hold(struct proxy_conn *conn) {
-    atomic_fetch_add_explicit(&conn->ref_count, 1, memory_order_relaxed);
+    conn->ref_count++;
 }
 
 /**
@@ -727,7 +716,7 @@ static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
 
     /* Zero out the memory and set default values */
     memset(conn, 0, sizeof(*conn));
-    atomic_init(&conn->ref_count, 1);
+    conn->ref_count = 1;
     conn->svr_sock = -1;
     /* Initialize other fields as needed */
 
@@ -897,7 +886,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     int eviction_attempts = 0;
     
     for (;;) {
-        current_conn_count = atomic_load(&conn_tbl_len);
+        current_conn_count = conn_tbl_len;
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
             /* Prevent excessive eviction attempts */
             if (eviction_attempts >= MAX_EVICTION_ATTEMPTS) {
@@ -927,7 +916,8 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
             continue;
         }
         unsigned expected = current_conn_count;
-        if (atomic_compare_exchange_weak_explicit(&conn_tbl_len, &expected, current_conn_count + 1, memory_order_acq_rel, memory_order_acquire)) {
+        if (conn_tbl_len == expected) {
+            conn_tbl_len = current_conn_count + 1;
             reserved_slot = true;
             break; /* reserved successfully */
         }
@@ -937,10 +927,10 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     /* High-water one-time warning at configured threshold */
     static bool warned_high_water = false;
     if (!warned_high_water && g_conn_pool.capacity > 0 &&
-        atomic_load(&conn_tbl_len) >= (unsigned)((g_conn_pool.capacity * HIGH_WATER_MARK_PERCENT) / 100)) {
+        conn_tbl_len >= (unsigned)((g_conn_pool.capacity * HIGH_WATER_MARK_PERCENT) / 100)) {
         P_LOG_WARN("UDP conn table high-water: %u/%u (~%d%%). Consider raising -C or reducing -t.",
-                   atomic_load(&conn_tbl_len), (unsigned)g_conn_pool.capacity,
-                   (int)((atomic_load(&conn_tbl_len) * 100) / (unsigned)g_conn_pool.capacity));
+                   conn_tbl_len, (unsigned)g_conn_pool.capacity,
+                   (int)((conn_tbl_len * 100) / (unsigned)g_conn_pool.capacity));
         warned_high_water = true;
     }
 
@@ -984,7 +974,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     list_add_tail(&conn->lru, &g_lru_list);
 
     /* We already reserved the connection count via CAS earlier; read it for logging */
-    unsigned new_count = atomic_load(&conn_tbl_len);
+    unsigned new_count = conn_tbl_len;
 
     /* Log every new connection for better debugging visibility */
     format_client_addr(cli_addr, s_addr, sizeof(s_addr));
@@ -1012,7 +1002,7 @@ err_unlock:
 err:
     /* Roll back reserved connection slot on failure */
     if (reserved_slot) {
-        atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
+        conn_tbl_len--;
     }
     return NULL;
 }
@@ -1036,8 +1026,8 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
     /* Remove from hash table */
     list_del(&conn->list);
 
-    /* Update global connection count atomically */
-    atomic_fetch_sub_explicit(&conn_tbl_len, 1, memory_order_acq_rel);
+    /* Update global connection count */
+    conn_tbl_len--;
 
     /* Remove from LRU list */
     if (!list_empty(&conn->lru)) {
@@ -1074,7 +1064,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
  * @param epfd Epoll file descriptor
  */
 static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
-    if (atomic_fetch_sub_explicit(&conn->ref_count, 1, memory_order_acq_rel) == 1) {
+    if (--conn->ref_count == 0) {
         release_proxy_conn(conn, epfd);
     }
 }
@@ -1130,7 +1120,7 @@ static void proxy_conn_walk_continue(int epfd) {
             diff = 0;
         
         if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
-            unsigned ref = atomic_load_explicit(&conn->ref_count, memory_order_acquire);
+            unsigned ref = conn->ref_count;
             if (unlikely(ref != 1)) {
                 if (unlikely(ref == 0)) {
                     P_LOG_WARN("Skipping expired conn with ref_count=0 for %s:%d", sockaddr_to_string(&conn->cli_addr), ntohs(*port_of_sockaddr(&conn->cli_addr)));
@@ -1198,7 +1188,7 @@ static bool proxy_conn_evict_one(int epfd) {
     proxy_conn_put(oldest, epfd);
     format_client_addr(&addr, s_addr, sizeof(s_addr));
     P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)),
-               atomic_load(&conn_tbl_len));
+               conn_tbl_len);
 
     return true;
 }
@@ -1229,7 +1219,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 break;
             }
 
-            atomic_store(&g_now_ts, monotonic_seconds());
+            g_now_ts = monotonic_seconds();
 
             for (int i = 0; i < n; i++) {
                 union sockaddr_inx *sa = (union sockaddr_inx *)c_msgs[i].msg_hdr.msg_name;
@@ -1304,7 +1294,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
         return;
     }
 
-    atomic_store(&g_now_ts, monotonic_seconds());
+    g_now_ts = monotonic_seconds();
 
     if (!validate_packet(buffer, (size_t)r, &cli_addr)) {
         return;
@@ -1398,7 +1388,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
             return;
         }
 
-        atomic_store(&g_now_ts, monotonic_seconds());
+        g_now_ts = monotonic_seconds();
 
         /* Prepare destination (original client) for each message */
         /* All packets are for the same connection, so touch it only once per batch. */
@@ -1463,7 +1453,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
         }
 
         /* r >= 0: forward even zero-length datagrams */
-        atomic_store(&g_now_ts, monotonic_seconds());
+        g_now_ts = monotonic_seconds();
         conn->server_packets++;  /* Count server packets */
         touch_proxy_conn(conn);
 
@@ -1843,7 +1833,7 @@ int main(int argc, char *argv[]) {
         INIT_LIST_HEAD(&conn_tbl_hbase[i]);
     }
 
-    atomic_store(&conn_tbl_len, 0);
+    conn_tbl_len = 0;
 
     last_check = monotonic_seconds();
 
@@ -1873,7 +1863,7 @@ int main(int argc, char *argv[]) {
         /* Skip maintenance cycle if timeout is disabled (proxy_conn_timeo == 0) */
         if (g_cfg.proxy_conn_timeo != 0 && (long)(current_ts - last_check) >= MAINT_INTERVAL_SEC) {
             /* Ensure maintenance walkers observe the real current time. */
-            atomic_store(&g_now_ts, current_ts);
+            g_now_ts = current_ts;
             
             proxy_conn_walk_continue(epfd);
             segmented_update_lru();
@@ -1900,7 +1890,7 @@ int main(int argc, char *argv[]) {
          * packet handlers see the time at which we woke up, not the time at which we
          * went to sleep in epoll_wait(). */
         current_ts = monotonic_seconds();
-        atomic_store(&g_now_ts, current_ts);
+        g_now_ts = current_ts;
         
         /* Check shutdown flag after epoll_wait (handles timeout and EINTR cases) */
         if (g_shutdown_requested)
@@ -1938,7 +1928,7 @@ int main(int argc, char *argv[]) {
                 conn = evp->data.ptr;
                 
                 /* Check if connection is still valid (ref_count > 0) */
-                int ref = atomic_load_explicit(&conn->ref_count, memory_order_acquire);
+                int ref = conn->ref_count;
                 if (ref <= 0) {
                     /* Connection was recycled but epoll event was already queued.
                      * This can happen when:
@@ -2003,9 +1993,9 @@ cleanup:
     }
 
     /* Print performance statistics */
-    uint64_t hash_collisions = atomic_load(&g_stat_hash_collisions) + total_hash_collisions;
-    uint64_t lru_immediate = atomic_load(&g_stat_lru_immediate_updates);
-    uint64_t lru_deferred = atomic_load(&g_stat_lru_deferred_updates);
+    uint64_t hash_collisions = g_stat_hash_collisions + total_hash_collisions;
+    uint64_t lru_immediate = g_stat_lru_immediate_updates;
+    uint64_t lru_deferred = g_stat_lru_deferred_updates;
 
     P_LOG_INFO("Performance statistics:");
     P_LOG_INFO("  Total packets processed: %" PRIu64, total_packets);
