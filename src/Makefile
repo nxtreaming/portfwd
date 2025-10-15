@@ -31,20 +31,6 @@ tcpfwd: $(FWD_OBJS)
 udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
 
-# High-performance version with optimizations disabled (single-threaded, no pthread)
-udpfwd-fast: $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o udpfwd-fast $(BUILD_DIR)/udpfwd-fast.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
-
-$(BUILD_DIR)/udpfwd-fast.o: udpfwd.c
-	$(CC) $(CFLAGS) -DDISABLE_ADAPTIVE_BATCHING -DDISABLE_RATE_LIMITING -DDISABLE_PACKET_VALIDATION -c -o $@ $<
-
-# Ultra-fast version with minimal locking (single-threaded, no pthread)
-udpfwd-ultra: $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o udpfwd-ultra $(BUILD_DIR)/udpfwd-ultra.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
-
-$(BUILD_DIR)/udpfwd-ultra.o: udpfwd.c
-	$(CC) $(CFLAGS) -DDISABLE_ADAPTIVE_BATCHING -DDISABLE_RATE_LIMITING -DDISABLE_PACKET_VALIDATION -DDISABLE_FINE_GRAINED_LOCKS -DDISABLE_LRU_LOCKS -DDISABLE_BACKPRESSURE_QUEUE -c -o $@ $<
-
 # KCP-based TCP-over-UDP binaries with AEAD support
 KCPOBJS = $(BUILD_DIR)/kcp_common.o $(BUILD_DIR)/3rd/kcp/ikcp.o
 AEADOBJS = $(BUILD_DIR)/anti_replay.o $(BUILD_DIR)/secure_random.o $(BUILD_DIR)/outer_obfs.o $(BUILD_DIR)/3rd/chacha20poly1305/chacha20poly1305.o
