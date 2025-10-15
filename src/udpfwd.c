@@ -5,6 +5,7 @@
  */
 
 #define _GNU_SOURCE 1
+#define UDPFWD_ONLY 1  /* Enable lightweight UDP-only proxy_conn structure */
 
 #include "common.h"
 #include "conn_pool.h"

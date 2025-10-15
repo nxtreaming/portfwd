@@ -6,7 +6,9 @@
 #define EV_MAGIC_SERVER ((uintptr_t)0xfeedfacefeedface)
 
 #include "list.h"
+#ifndef UDPFWD_ONLY
 #include "anti_replay.h"
+#endif
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -23,6 +25,7 @@ struct buffer_info {
     size_t capacity;
 };
 
+#ifndef UDPFWD_ONLY
 enum proxy_state {
     S_INITIAL = 0,
     S_CONNECTING,
@@ -30,7 +33,40 @@ enum proxy_state {
     S_FORWARDING,
     S_CLOSING,
 };
+#endif
 
+#ifdef UDPFWD_ONLY
+/* Lightweight UDP-only connection structure (~200-250 bytes vs ~1000+ bytes) */
+struct proxy_conn {
+    /* Reference counting */
+    unsigned ref_count;
+    
+    /* List linkage */
+    struct list_head list;         /* For hash table linkage */
+    struct proxy_conn *next;       /* For freelist in conn_pool */
+    
+    /* Connection endpoints */
+    int svr_sock;                  /* Server-side UDP socket */
+    union sockaddr_inx cli_addr;   /* Client address */
+    
+    /* Timing and state */
+    time_t last_active;
+    time_t last_addr_warn;
+    
+    /* LRU management */
+    struct list_head lru;
+    bool needs_lru_update;
+    bool udp_send_blocked;
+    
+    /* Statistics */
+    unsigned long client_packets;
+    unsigned long server_packets;
+    
+    /* UDP backlog buffer */
+    struct buffer_info udp_backlog;
+};
+#else
+/* Full-featured connection structure for TCP/KCP */
 struct proxy_conn {
     /* Common fields */
     unsigned ref_count;   /* Reference counter */
@@ -155,6 +191,7 @@ struct proxy_conn {
     uint32_t last_rekeys_initiated;
     uint32_t last_rekeys_completed;
 };
+#endif /* UDPFWD_ONLY */
 
 /* Epoll event tag to disambiguate fd source */
 struct ep_tag {
