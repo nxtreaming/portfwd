@@ -143,10 +143,6 @@ static struct {
 /* Global config */
 static struct fwd_config g_cfg;
 
-/* Hash functions */
-static uint32_t hash_addr(const union sockaddr_inx *sa);
-static inline void format_client_addr(const union sockaddr_inx *addr, char *buf, size_t bufsize);
-
 /* Connection management */
 static void proxy_conn_walk_continue(int epfd);
 static bool proxy_conn_evict_one(int epfd);
@@ -195,7 +191,6 @@ static int safe_close(int fd) {
     }
 }
  
-/* Returns true if errno indicates a transient, non-fatal condition. */
 static inline bool is_wouldblock(int e) {
     return likely(e == EAGAIN) || e == EWOULDBLOCK;
 }
@@ -204,12 +199,10 @@ static inline bool is_temporary_errno(int e) {
     return likely(e == EINTR) || is_wouldblock(e);
 }
 
-/* Align up to a given power-of-two alignment (e.g., 64). */
 static inline size_t align_up(size_t n, size_t align) {
     return (n + (align - 1)) & ~(align - 1);
 }
 
-/* Log helper for unexpected (non-transient) errno after a failed syscall */
 static inline void log_if_unexpected_errno(const char *what) {
     int e = errno;
     if (!is_temporary_errno(e)) {
@@ -372,20 +365,6 @@ static bool udp_flush_backlog(struct proxy_conn *conn, int epfd) {
     return false;
 }
 
-/* Linux batching support */
-#ifdef __linux__
-static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
-                                    struct sockaddr_storage **c_addrs,
-                                    char (**c_bufs)[UDP_PROXY_DGRAM_CAP]);
-#endif
-
-/**
- * @brief Validate packet size (basic check)
- * @param data Packet data buffer (unused)
- * @param len Packet length
- * @param src Source address (unused)
- * @return true if packet size is valid, false otherwise
- */
 static inline bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
     (void)data;
     (void)src;
@@ -393,12 +372,29 @@ static inline bool validate_packet(const char *data, size_t len, const union soc
     return (len > 0 && len <= UDP_PROXY_DGRAM_CAP);
 }
 
-/**
- * @brief Improved hash function with better distribution using FNV-1a
- * @param sa Socket address to hash
- * @return 32-bit hash value, or 0 if address family is unsupported
- */
-static inline uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
+static inline bool is_power_of_two(unsigned v) {
+    return v && ((v & (v - 1)) == 0);
+}
+
+static inline void proxy_conn_hold(struct proxy_conn *conn) {
+    conn->ref_count++;
+}
+
+static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
+    if (!conn) {
+        return NULL;
+    }
+
+    /* Zero out the memory and set default values */
+    memset(conn, 0, sizeof(*conn));
+    conn->ref_count = 1;
+    conn->svr_sock = -1;
+    /* Initialize other fields as needed */
+
+    return conn;
+}
+
+static inline uint32_t hash_addr(const union sockaddr_inx *sa) {
     uint32_t hash = 0;
 
     if (sa->sa.sa_family != AF_INET && sa->sa.sa_family != AF_INET6) {
@@ -435,28 +431,6 @@ static inline uint32_t improved_hash_addr(const union sockaddr_inx *sa) {
     return hash;
 }
 
-static inline bool is_power_of_two(unsigned v) {
-    return v && ((v & (v - 1)) == 0);
-}
-
-static inline void proxy_conn_hold(struct proxy_conn *conn) {
-    conn->ref_count++;
-}
-
-static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
-    if (!conn) {
-        return NULL;
-    }
-
-    /* Zero out the memory and set default values */
-    memset(conn, 0, sizeof(*conn));
-    conn->ref_count = 1;
-    conn->svr_sock = -1;
-    /* Initialize other fields as needed */
-
-    return conn;
-}
-
 static inline unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h & (g_conn_tbl_hash_size - 1);
@@ -465,11 +439,6 @@ static inline unsigned int proxy_conn_hash_bitwise(const union sockaddr_inx *sa)
 static inline unsigned int proxy_conn_hash_mod(const union sockaddr_inx *sa) {
     uint32_t h = hash_addr(sa);
     return h % g_conn_tbl_hash_size;
-}
-
-static inline uint32_t hash_addr(const union sockaddr_inx *a) {
-    /* Use the improved hash function for better distribution */
-    return improved_hash_addr(a);
 }
 
 static inline void format_client_addr(const union sockaddr_inx *addr, char *buf, size_t bufsize) {
