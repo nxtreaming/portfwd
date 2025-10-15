@@ -32,7 +32,7 @@ Written in pure C.
       -o                 for IPv6 listener, set IPV6_V6ONLY
       -r                 set SO_REUSEADDR before binding listener
       -R                 set SO_REUSEPORT before binding listener
-      -H <size>          hash table size for UDP connection tracking (default: 4093)
+      -H <size>          hash table size for UDP connection tracking (default: 256)
       -p <pidfile>       write PID to file
       -h                 show help
 
@@ -318,10 +318,10 @@ Limitations:
 
 The UDP forwarder (`udpfwd`) supports kernel/userspace buffer and batching tunables. Set via CFLAGS at build time:
 
-- UDP_PROXY_SOCKBUF_CAP: kernel SO_RCVBUF/SO_SNDBUF size (default 262144)
-- UDP_PROXY_BATCH_SZ: Linux-only `recvmmsg()` batch size (default 16)
-- UDP_PROXY_DGRAM_CAP: per-datagram buffer capacity (default 65536)
-- UDP_PROXY_MAX_CONNS: maximum tracked UDP connections (default 8192)
+- UDP_PROXY_SOCKBUF_CAP: kernel SO_RCVBUF/SO_SNDBUF size (default 1048576)
+- UDP_PROXY_BATCH_SZ: Linux-only `recvmmsg()` batch size (default 64)
+- UDP_PROXY_DGRAM_CAP: per-datagram buffer capacity (default 1472)
+- UDP_PROXY_MAX_CONNS: maximum tracked UDP connections (default 128, optimized for ≤64 concurrent users)
 
 Example:
 

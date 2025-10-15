@@ -43,7 +43,7 @@
 
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
-#define DEFAULT_HASH_TABLE_SIZE 4096  /* Power-of-two for fast bitwise indexing; sized ~ max conns */
+#define DEFAULT_HASH_TABLE_SIZE 256  /* Power-of-two for fast bitwise indexing; sized 2x max conns for good distribution */
 
 /* Hash function constants */
 #define FNV_PRIME_32 0x01000193
@@ -106,7 +106,7 @@
 
 /* Connection pool size */
 #ifndef UDP_PROXY_MAX_CONNS
-#define UDP_PROXY_MAX_CONNS 2048
+#define UDP_PROXY_MAX_CONNS 128  /* Optimized for typical ≤64 concurrent users with 2x headroom */
 #endif
 
 /* Connection hash table */
