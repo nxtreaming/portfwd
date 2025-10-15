@@ -43,7 +43,7 @@
 
 /* Performance and security constants */
 #define DEFAULT_CONN_TIMEOUT_SEC 300
-#define DEFAULT_HASH_TABLE_SIZE 256  /* Power-of-two for fast bitwise indexing; sized 2x max conns for good distribution */
+#define DEFAULT_HASH_TABLE_SIZE 128  /* Power-of-two for fast bitwise indexing; sized 2:1 with max conns for safe distribution */
 
 /* Hash function constants */
 #define FNV_PRIME_32 0x01000193
@@ -51,7 +51,6 @@
 #define GOLDEN_RATIO_32 0x9e3779b9
 
 /* Connection logging and monitoring constants */
-#define LOG_EVERY_NTH_CONNECTION 50  /* Log every Nth connection to reduce spam */
 #define HIGH_WATER_MARK_PERCENT 95    /* Warn at 95% capacity */
 #define MAX_EVICTION_ATTEMPTS 5       /* Prevent infinite eviction loops */
 #define TIME_GAP_WARNING_THRESHOLD_SEC 120  /* Warn on time gaps > 120 seconds */
@@ -74,7 +73,6 @@
 /* Maintenance tick interval (seconds) */
 #define MAINT_INTERVAL_SEC 2
 /* Limit the amount of work done while holding global locks */
-#define LRU_UPDATE_BATCH_SIZE 32
 #define MAX_EXPIRE_PER_SWEEP 64
 #define MAX_SCAN_PER_SWEEP 128  /* Limit LRU list traversal to prevent long lock holds */
 /* Socket buffer size */
@@ -88,8 +86,8 @@
 /* Linux-specific batching parameters */
 #ifdef __linux__
 #ifndef UDP_PROXY_BATCH_SZ
-/* Increased from 16 for much better performance */
-#define UDP_PROXY_BATCH_SZ 64
+/* Optimized for memory efficiency while maintaining good throughput */
+#define UDP_PROXY_BATCH_SZ 32
 #endif
 
 #ifndef UDP_PROXY_DGRAM_CAP
@@ -106,7 +104,7 @@
 
 /* Connection pool size */
 #ifndef UDP_PROXY_MAX_CONNS
-#define UDP_PROXY_MAX_CONNS 128  /* Optimized for typical ≤64 concurrent users with 2x headroom */
+#define UDP_PROXY_MAX_CONNS 64  /* Optimized for typical ≤32 concurrent users with 2x headroom */
 #endif
 
 /* Connection hash table */
