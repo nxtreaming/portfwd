@@ -48,7 +48,9 @@ int do_daemonize(void) {
                 P_LOG_WARN("close(/dev/null): %s", strerror(errno));
             }
         }
-        chdir("/");
+        if (chdir("/") < 0) {
+            P_LOG_WARN("chdir(/): %s", strerror(errno));
+        }
         g_state.daemonized = true;
     }
     return 0;
