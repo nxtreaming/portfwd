@@ -16,8 +16,6 @@
 #include <stdatomic.h>
 #include "common.h"
 
-
-/* Shared buffer structure */
 struct buffer_info {
     char *data;
     size_t dlen; /* Data length */
@@ -36,7 +34,6 @@ enum proxy_state {
 #endif
 
 #ifdef UDPFWD_ONLY
-/* Lightweight UDP-only connection structure (~200-250 bytes vs ~1000+ bytes) */
 struct proxy_conn {
     /* Reference counting */
     unsigned ref_count;
@@ -66,7 +63,6 @@ struct proxy_conn {
     struct buffer_info udp_backlog;
 };
 #else
-/* Full-featured connection structure for TCP/KCP */
 struct proxy_conn {
     /* Common fields */
     unsigned ref_count;   /* Reference counter */
@@ -193,7 +189,6 @@ struct proxy_conn {
 };
 #endif /* UDPFWD_ONLY */
 
-/* Epoll event tag to disambiguate fd source */
 struct ep_tag {
     struct proxy_conn *conn;
     int which; /* 1 = TCP client socket, 2 = UDP socket, 3 = TCP server socket
