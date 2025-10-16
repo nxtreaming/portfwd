@@ -1,10 +1,29 @@
 CC ?= $(CROSS_COMPILE)gcc
 PREFIX ?= /usr/local
-CFLAGS += -Wall -Wextra
-# CFLAGS += -g
+
+# Build mode: debug or release (default: release)
+BUILD_MODE ?= release
+
+# Base flags
+CFLAGS_BASE = -Wall -Wextra
+
+# Debug flags: enable debugging symbols, disable optimizations, enable assertions
+CFLAGS_DEBUG = $(CFLAGS_BASE) -g -O0 -DDEBUG
+
+# Release flags: optimize for performance, strip debug info, disable assertions
+CFLAGS_RELEASE = $(CFLAGS_BASE) -O2 -DNDEBUG
+
+# Select flags based on build mode
+ifeq ($(BUILD_MODE),debug)
+    CFLAGS += $(CFLAGS_DEBUG)
+    BUILD_SUFFIX = _debug
+else
+    CFLAGS += $(CFLAGS_RELEASE)
+    BUILD_SUFFIX =
+endif
 
 # Build directory
-BUILD_DIR = build
+BUILD_DIR = build$(BUILD_SUFFIX)
 
 NO_EPOLL_O =
 ifeq ($(shell uname), Linux)
@@ -41,6 +60,14 @@ kcptcp-client: $(BUILD_DIR)/kcptcp_client.o $(KCPTCPOBJS) $(KCPOBJS) $(AEADOBJS)
 
 kcptcp-server: $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O)
 	$(CC) $(CFLAGS) -o kcptcp-server $(BUILD_DIR)/kcptcp_server.o $(BUILD_DIR)/kcptcp_common.o $(BUILD_DIR)/kcp_map.o $(KCPOBJS) $(AEADOBJS) $(BUILD_DIR)/common.o $(BUILD_DIR)/conn_pool.o $(BUILD_DIR)/fwd_util.o $(NO_EPOLL_O) $(LDFLAGS) $(LDFLAGS_PTHREAD)
+
+# Build mode targets
+.PHONY: debug release
+debug:
+	@$(MAKE) BUILD_MODE=debug all
+
+release:
+	@$(MAKE) BUILD_MODE=release all
 
 # Convenience aliases: allow underscored targets too
 .PHONY: kcptcp_client kcptcp_server
@@ -79,6 +106,6 @@ install: all
 
 clean:
 	rm -f tcpfwd udpfwd kcptcp-client kcptcp-server
-	rm -rf $(BUILD_DIR)
+	rm -rf build build_debug
 	rm -f 3rd/kcp/*.o 3rd/chacha20poly1305/*.o
 
