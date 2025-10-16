@@ -1,5 +1,3 @@
-/* udpfwd.c - High-performance UDP port forwarding proxy with connection tracking */
-
 #define _GNU_SOURCE 1
 #define UDPFWD_ONLY 1  /* Enable lightweight UDP-only proxy_conn structure */
 
@@ -868,7 +866,8 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
     void *block = aligned_alloc(64, align_up(total, 64));
     if (!block) {
         P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
-        *c_msgs = *c_iov = NULL;
+        *c_msgs = NULL;
+        *c_iov = NULL;
         *c_addrs = NULL;
         *c_bufs = NULL;
         return;
