@@ -53,14 +53,10 @@ struct proxy_conn {
     /* LRU management */
     struct list_head lru;
     bool needs_lru_update;
-    bool udp_send_blocked;
     
     /* Statistics */
     unsigned long client_packets;
     unsigned long server_packets;
-    
-    /* UDP backlog buffer */
-    struct buffer_info udp_backlog;
 };
 #else
 struct proxy_conn {

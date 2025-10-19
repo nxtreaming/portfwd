@@ -66,9 +66,6 @@
 #define UDP_PROXY_SOCKBUF_CAP (1024 * 1024)
 #endif
 
-#define UDP_BACKLOG_FLUSH_LIMIT 64
-#define UDP_BACKLOG_MAX_SIZE (256 * 1024)  /* 256KB max per connection */
-
 #ifdef __linux__
 #ifndef UDP_PROXY_BATCH_SZ
 #define UDP_PROXY_BATCH_SZ 32
@@ -107,7 +104,7 @@ static struct {
     uint64_t connections_created;
     uint64_t connections_evicted;
     uint64_t connections_expired;
-    uint64_t backlog_drops;
+    uint64_t packets_dropped;  /* Packets dropped due to send failures */
 } g_stats = {0};
 static struct fwd_config g_cfg;
 
@@ -163,167 +160,6 @@ static inline void log_if_unexpected_errno(const char *what) {
     int e = errno;
     if (!is_temporary_errno(e))
         P_LOG_WARN("%s: %s", what, strerror(e));
-}
-
-static inline bool udp_backlog_empty(const struct proxy_conn *conn) {
-    return conn->udp_backlog.dlen == 0;
-}
-
-static void udp_backlog_clear(struct proxy_conn *conn) {
-    conn->udp_backlog.rpos = conn->udp_backlog.dlen = 0;
-}
-
-static int update_server_epoll_interest(struct proxy_conn *conn, int epfd, bool want_write) {
-    if (!conn || conn->svr_sock < 0)
-        return -1;
-    if (conn->udp_send_blocked == want_write)
-        return 0;
-
-    struct epoll_event ev = {
-        .data.ptr = conn,
-        .events = EPOLLIN | EPOLLERR | EPOLLHUP | (want_write ? EPOLLOUT : 0),
-    };
-
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, conn->svr_sock, &ev) < 0) {
-        P_LOG_WARN("epoll_ctl(MOD, svr_sock=%d): %s", conn->svr_sock, strerror(errno));
-        return -1;
-    }
-    conn->udp_send_blocked = want_write;
-    return 0;
-}
-
-static bool udp_backlog_reserve(struct proxy_conn *conn, size_t additional) {
-    if (!conn)
-        return false;
-
-    size_t in_queue = conn->udp_backlog.dlen - conn->udp_backlog.rpos;
-    
-    /* Compact buffer if read position is beyond halfway point */
-    if (conn->udp_backlog.rpos > conn->udp_backlog.capacity / 2 && in_queue > 0) {
-        memmove(conn->udp_backlog.data, conn->udp_backlog.data + conn->udp_backlog.rpos, in_queue);
-        conn->udp_backlog.dlen = in_queue;
-        conn->udp_backlog.rpos = 0;
-    }
-
-    size_t required = conn->udp_backlog.dlen + additional;
-    if (required == 0 || conn->udp_backlog.capacity >= required)
-        return true;
-
-    /* Enforce maximum backlog size to prevent OOM */
-    if (required > UDP_BACKLOG_MAX_SIZE) {
-        P_LOG_WARN("UDP backlog size limit reached (%zu bytes), dropping packets", required);
-        g_stats.backlog_drops++;
-        return false;
-    }
-
-    /* Calculate new capacity with better growth strategy */
-    size_t new_cap;
-    if (conn->udp_backlog.capacity == 0) {
-        new_cap = align_up(required, 1024);  /* Start with 1KB aligned */
-    } else {
-        /* Grow by 1.5x instead of 2x to reduce memory waste */
-        new_cap = conn->udp_backlog.capacity + (conn->udp_backlog.capacity >> 1);
-        if (new_cap < required)
-            new_cap = required;
-    }
-    
-    /* Cap at maximum size */
-    if (new_cap > UDP_BACKLOG_MAX_SIZE)
-        new_cap = UDP_BACKLOG_MAX_SIZE;
-
-    char *np = (char *)realloc(conn->udp_backlog.data, new_cap);
-    if (!np) {
-        P_LOG_WARN("Failed to allocate UDP backlog buffer (%zu bytes)", new_cap);
-        return false;
-    }
-    conn->udp_backlog.data = np;
-    conn->udp_backlog.capacity = new_cap;
-    return true;
-}
-
-static bool udp_queue_datagram(struct proxy_conn *conn, int epfd, const char *buf, size_t len) {
-    if (!conn || !buf || len == 0)
-        return false;
-
-    if (len > UINT16_MAX) {
-        P_LOG_WARN("Dropping oversized UDP datagram (%zu bytes)", len);
-        return false;
-    }
-
-    size_t need = sizeof(uint16_t) + len;
-    if (!udp_backlog_reserve(conn, need)) {
-        P_LOG_WARN("Failed to allocate UDP backlog buffer (%zu bytes)", need);
-        return false;
-    }
-
-    uint16_t pkt_len = (uint16_t)len;
-    memcpy(conn->udp_backlog.data + conn->udp_backlog.dlen, &pkt_len, sizeof(pkt_len));
-    conn->udp_backlog.dlen += sizeof(pkt_len);
-    memcpy(conn->udp_backlog.data + conn->udp_backlog.dlen, buf, len);
-    conn->udp_backlog.dlen += len;
-
-    update_server_epoll_interest(conn, epfd, true);
-    return true;
-}
-
-static bool udp_flush_backlog(struct proxy_conn *conn, int epfd) {
-    if (!conn || conn->svr_sock < 0)
-        return true;
-
-    if (udp_backlog_empty(conn))
-        return true;
-
-    int sent_packets = 0;
-
-    while (conn->udp_backlog.dlen - conn->udp_backlog.rpos >= sizeof(uint16_t) &&
-           sent_packets < UDP_BACKLOG_FLUSH_LIMIT) {
-        uint16_t pkt_len;
-        memcpy(&pkt_len, conn->udp_backlog.data + conn->udp_backlog.rpos, sizeof(pkt_len));
-
-        if (conn->udp_backlog.dlen - conn->udp_backlog.rpos < sizeof(uint16_t) + pkt_len) {
-            /* Corrupted backlog entry; drop remaining data. */
-            P_LOG_WARN("Corrupted UDP backlog entry (len=%u, available=%zu)", pkt_len,
-                       conn->udp_backlog.dlen - conn->udp_backlog.rpos);
-            udp_backlog_clear(conn);
-            update_server_epoll_interest(conn, epfd, false);
-            return true;
-        }
-
-        const char *payload = conn->udp_backlog.data + conn->udp_backlog.rpos + sizeof(uint16_t);
-        ssize_t wr = send(conn->svr_sock, payload, pkt_len, 0);
-        if (wr < 0) {
-            if (errno == EINTR)
-                continue;
-            if (is_wouldblock(errno)) {
-                update_server_epoll_interest(conn, epfd, true);
-                return false;
-            }
-            P_LOG_WARN("send(server backlog) failed: %s", strerror(errno));
-            conn->udp_backlog.rpos += sizeof(uint16_t) + pkt_len;
-            sent_packets++;
-            continue;
-        }
-
-        if ((size_t)wr != pkt_len) {
-            P_LOG_WARN("Partial UDP datagram send: expected %u, sent %zd", pkt_len, wr);
-            conn->udp_backlog.rpos += sizeof(uint16_t) + pkt_len;
-        } else {
-            conn->udp_backlog.rpos += sizeof(uint16_t) + pkt_len;
-            sent_packets++;
-        }
-    }
-
-    if (conn->udp_backlog.rpos >= conn->udp_backlog.dlen) {
-        udp_backlog_clear(conn);
-    }
-
-    if (udp_backlog_empty(conn)) {
-        update_server_epoll_interest(conn, epfd, false);
-        return true;
-    }
-
-    update_server_epoll_interest(conn, epfd, true);
-    return false;
 }
 
 static inline bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
@@ -580,15 +416,6 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
         conn->svr_sock = -1;
     }
 
-    if (conn->udp_backlog.data) {
-        free(conn->udp_backlog.data);
-        conn->udp_backlog.data = NULL;
-    }
-    conn->udp_backlog.capacity = 0;
-    conn->udp_backlog.dlen = 0;
-    conn->udp_backlog.rpos = 0;
-    conn->udp_send_blocked = false;
-
     conn_pool_release(&g_conn_pool, conn);
 }
 
@@ -714,24 +541,19 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 conn->client_packets++;
                 touch_proxy_conn(conn);
 
-                if (!udp_flush_backlog(conn, epfd)) {
-                    if (!udp_queue_datagram(conn, epfd, c_bufs[i], packet_len))
-                        P_LOG_WARN("Dropping UDP datagram (%zu bytes) due to backlog overflow", packet_len);
-                    proxy_conn_put(conn, epfd);
-                    continue;
-                }
-
+                /* Direct send, no backlog buffering */
                 ssize_t wr;
                 do {
                     wr = send(conn->svr_sock, c_bufs[i], packet_len, 0);
                 } while (wr < 0 && errno == EINTR);
 
                 if (wr < 0) {
+                    /* Drop packet if send fails */
                     if (is_wouldblock(errno)) {
-                        if (!udp_queue_datagram(conn, epfd, c_bufs[i], packet_len))
-                            P_LOG_WARN("Dropping UDP datagram (%zu bytes) due to backlog allocation failure", packet_len);
+                        g_stats.packets_dropped++;
                     } else {
                         log_if_unexpected_errno("send(server)");
+                        g_stats.packets_dropped++;
                     }
                 } else {
                     g_stats.bytes_processed += (size_t)wr;
@@ -773,23 +595,18 @@ static void handle_client_data(int lsn_sock, int epfd) {
     conn->client_packets++;
     touch_proxy_conn(conn);
 
-    if (!udp_flush_backlog(conn, epfd)) {
-        if (!udp_queue_datagram(conn, epfd, buffer, (size_t)r))
-            P_LOG_WARN("Dropping UDP datagram (%d bytes) due to backlog overflow", r);
-        proxy_conn_put(conn, epfd);
-        return;
-    }
-
+    /* Direct send, no backlog buffering */
     ssize_t wr;
     do {
         wr = send(conn->svr_sock, buffer, r, 0);
     } while (wr < 0 && errno == EINTR);
     if (wr < 0) {
+        /* Drop packet if send fails */
         if (is_wouldblock(errno)) {
-            if (!udp_queue_datagram(conn, epfd, buffer, (size_t)r))
-                P_LOG_WARN("Dropping UDP datagram (%d bytes) due to backlog allocation failure", r);
+            g_stats.packets_dropped++;
         } else {
             log_if_unexpected_errno("send(server)");
+            g_stats.packets_dropped++;
         }
     } else {
         g_stats.bytes_processed += (size_t)wr;
@@ -1333,13 +1150,9 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
 
-                /* Process EPOLLIN first to read data, then EPOLLOUT to flush */
+                /* Process server data */
                 if (evp->events & EPOLLIN)
                     handle_server_data(conn, listen_sock, epfd);
-
-                /* Only flush if connection is still valid */
-                if (conn->ref_count >= 1 && (evp->events & EPOLLOUT))
-                    udp_flush_backlog(conn, epfd);
             }
         }
     }
@@ -1363,16 +1176,16 @@ cleanup:
     P_LOG_INFO("  Connections created: %" PRIu64, g_stats.connections_created);
     P_LOG_INFO("  Connections expired: %" PRIu64, g_stats.connections_expired);
     P_LOG_INFO("  Connections evicted: %" PRIu64, g_stats.connections_evicted);
-    P_LOG_INFO("  Backlog drops: %" PRIu64, g_stats.backlog_drops);
+    P_LOG_INFO("  Packets dropped: %" PRIu64, g_stats.packets_dropped);
     P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", g_stats.hash_collisions,
                g_stats.packets_processed > 0 ? (double)g_stats.hash_collisions / g_stats.packets_processed : 0.0);
 
     if (g_stats.packets_processed > 0 && g_stats.hash_collisions > g_stats.packets_processed / 2)
         P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash table size (-H)",
                    (double)g_stats.hash_collisions * 100.0 / g_stats.packets_processed);
-    if (g_stats.backlog_drops > 0)
-        P_LOG_WARN("Backlog drops detected (%" PRIu64 "), consider increasing socket buffers (-S) or reducing load",
-                   g_stats.backlog_drops);
+    if (g_stats.packets_dropped > 0)
+        P_LOG_WARN("Packets dropped (%" PRIu64 ") due to send failures. Network may be congested or buffers insufficient.",
+                   g_stats.packets_dropped);
     
     time_t runtime = time(NULL) - last_check + 1;
     if (g_stats.packets_processed > 0 && runtime > 0) {
