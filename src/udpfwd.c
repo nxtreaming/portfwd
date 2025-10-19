@@ -57,8 +57,8 @@
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
 #define MAX_EVENTS 1024
 #define EPOLL_WAIT_TIMEOUT_MS 500
-#define CLIENT_MAX_ITERATIONS 64
-#define SERVER_MAX_ITERATIONS 64
+#define CLIENT_MAX_ITERATIONS 128
+#define SERVER_MAX_ITERATIONS 128
 #define MAINT_INTERVAL_SEC 2
 #define MAX_EXPIRE_PER_SWEEP 64
 #define MAX_SCAN_PER_SWEEP 128
@@ -66,7 +66,8 @@
 #define UDP_PROXY_SOCKBUF_CAP (1024 * 1024)
 #endif
 
-#define UDP_BACKLOG_FLUSH_LIMIT 16
+#define UDP_BACKLOG_FLUSH_LIMIT 64
+#define UDP_BACKLOG_MAX_SIZE (256 * 1024)  /* 256KB max per connection */
 
 #ifdef __linux__
 #ifndef UDP_PROXY_BATCH_SZ
@@ -103,6 +104,10 @@ static struct {
     uint64_t packets_processed;
     uint64_t bytes_processed;
     uint64_t hash_collisions;
+    uint64_t connections_created;
+    uint64_t connections_evicted;
+    uint64_t connections_expired;
+    uint64_t backlog_drops;
 } g_stats = {0};
 static struct fwd_config g_cfg;
 
@@ -192,9 +197,10 @@ static bool udp_backlog_reserve(struct proxy_conn *conn, size_t additional) {
         return false;
 
     size_t in_queue = conn->udp_backlog.dlen - conn->udp_backlog.rpos;
-    if (conn->udp_backlog.rpos > 0) {
-        if (in_queue > 0)
-            memmove(conn->udp_backlog.data, conn->udp_backlog.data + conn->udp_backlog.rpos, in_queue);
+    
+    /* Compact buffer if read position is beyond halfway point */
+    if (conn->udp_backlog.rpos > conn->udp_backlog.capacity / 2 && in_queue > 0) {
+        memmove(conn->udp_backlog.data, conn->udp_backlog.data + conn->udp_backlog.rpos, in_queue);
         conn->udp_backlog.dlen = in_queue;
         conn->udp_backlog.rpos = 0;
     }
@@ -203,18 +209,33 @@ static bool udp_backlog_reserve(struct proxy_conn *conn, size_t additional) {
     if (required == 0 || conn->udp_backlog.capacity >= required)
         return true;
 
-    size_t new_cap = conn->udp_backlog.capacity ? conn->udp_backlog.capacity : align_up(required, 256);
-    while (new_cap < required) {
-        if (new_cap >= SIZE_MAX / 2) {
-            new_cap = required;
-            break;
-        }
-        new_cap *= 2;
+    /* Enforce maximum backlog size to prevent OOM */
+    if (required > UDP_BACKLOG_MAX_SIZE) {
+        P_LOG_WARN("UDP backlog size limit reached (%zu bytes), dropping packets", required);
+        g_stats.backlog_drops++;
+        return false;
     }
 
+    /* Calculate new capacity with better growth strategy */
+    size_t new_cap;
+    if (conn->udp_backlog.capacity == 0) {
+        new_cap = align_up(required, 1024);  /* Start with 1KB aligned */
+    } else {
+        /* Grow by 1.5x instead of 2x to reduce memory waste */
+        new_cap = conn->udp_backlog.capacity + (conn->udp_backlog.capacity >> 1);
+        if (new_cap < required)
+            new_cap = required;
+    }
+    
+    /* Cap at maximum size */
+    if (new_cap > UDP_BACKLOG_MAX_SIZE)
+        new_cap = UDP_BACKLOG_MAX_SIZE;
+
     char *np = (char *)realloc(conn->udp_backlog.data, new_cap);
-    if (!np)
+    if (!np) {
+        P_LOG_WARN("Failed to allocate UDP backlog buffer (%zu bytes)", new_cap);
         return false;
+    }
     conn->udp_backlog.data = np;
     conn->udp_backlog.capacity = new_cap;
     return true;
@@ -393,6 +414,18 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 
     time_t now = cached_now_seconds();
     time_t old_active = conn->last_active;
+    
+    /* Handle time going backwards (system clock adjustment) */
+    if (now < old_active) {
+        char s_addr[INET6_ADDRSTRLEN];
+        format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
+        P_LOG_WARN("Time went backwards for %s:%d: old=%ld, now=%ld. Resetting timestamp.",
+                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
+                   (long)old_active, (long)now);
+        conn->last_active = now;
+        return;
+    }
+    
     conn->last_active = now;
 
     if (old_active != now && (now - old_active) > TIME_GAP_WARNING_THRESHOLD_SEC) {
@@ -401,7 +434,7 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
         P_LOG_WARN("Large time gap for %s:%d: gap=%ld sec (last_active=%ld, now=%ld). "
                    "System may have been suspended or heavily loaded.",
                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                   (long)(now - old_active), old_active, now);
+                   (long)(now - old_active), (long)old_active, (long)now);
     }
 }
 
@@ -412,13 +445,26 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     struct epoll_event ev;
     char s_addr[INET6_ADDRSTRLEN] = "";
 
+    /* Track hash collisions for performance monitoring */
+    int chain_len = 0;
     list_for_each_entry(conn, chain, list) {
+        chain_len++;
         if (is_sockaddr_inx_equal(cli_addr, &conn->cli_addr)) {
-            proxy_conn_hold(conn);
+            if (chain_len > 1)
+                g_stats.hash_collisions += (chain_len - 1);
             touch_proxy_conn(conn);
+            /* Move to end of LRU list (most recently used) */
+            if (!list_empty(&conn->lru)) {
+                list_del(&conn->lru);
+                list_add_tail(&conn->lru, &g_lru_list);
+            }
             return conn;
         }
     }
+    
+    /* Track collisions for new connection insertion */
+    if (chain_len > 0)
+        g_stats.hash_collisions += chain_len;
 
     bool reserved_slot = false;
     int eviction_attempts = 0;
@@ -490,7 +536,8 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
                ntohs(*port_of_sockaddr(cli_addr)), conn_tbl_len);
 
     conn->last_active = cached_now_seconds();
-    proxy_conn_hold(conn);
+    g_stats.connections_created++;
+    /* ref_count is already 1 from init_proxy_conn */
     return conn;
 
 err_unlock:
@@ -556,11 +603,17 @@ static void proxy_conn_walk_continue(int epfd) {
         if (++scanned >= MAX_SCAN_PER_SWEEP)
             break;
         
-        long diff = (long)(now - conn->last_active);
-        if (diff < 0)
-            diff = 0;
+        /* Handle time going backwards - reset last_active to current time */
+        if (now < conn->last_active) {
+            P_LOG_WARN("Time went backwards during sweep (conn last_active=%ld, now=%ld), resetting",
+                       (long)conn->last_active, (long)now);
+            conn->last_active = now;
+            continue;
+        }
         
-        if (g_cfg.proxy_conn_timeo != 0 && (unsigned)diff > g_cfg.proxy_conn_timeo) {
+        unsigned long diff = (unsigned long)(now - conn->last_active);
+        
+        if (g_cfg.proxy_conn_timeo != 0 && diff > g_cfg.proxy_conn_timeo) {
             if (unlikely(conn->ref_count != 1))
                 continue;
             list_move_tail(&conn->lru, &reap_list);
@@ -587,6 +640,7 @@ static void proxy_conn_walk_continue(int epfd) {
                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)), conn_type,
                    conn->last_active, now, (long)(now - conn->last_active), g_cfg.proxy_conn_timeo,
                    conn->client_packets, conn->server_packets);
+        g_stats.connections_expired++;
         proxy_conn_put(conn, epfd);
     }
 }
@@ -603,6 +657,7 @@ static bool proxy_conn_evict_one(int epfd) {
     proxy_conn_put(oldest, epfd);
     format_client_addr(&addr, s_addr, sizeof(s_addr));
     P_LOG_WARN("Evicted LRU %s:%d [%u]", s_addr, ntohs(*port_of_sockaddr(&addr)), conn_tbl_len);
+    g_stats.connections_evicted++;
     return true;
 }
 
@@ -646,6 +701,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 if (!conn)
                     continue;
 
+                proxy_conn_hold(conn);  /* Hold reference for this operation */
                 conn->client_packets++;
                 touch_proxy_conn(conn);
 
@@ -704,6 +760,7 @@ static void handle_client_data(int lsn_sock, int epfd) {
     if (!conn)
         return;
 
+    proxy_conn_hold(conn);  /* Hold reference for this operation */
     conn->client_packets++;
     touch_proxy_conn(conn);
 
@@ -1252,25 +1309,29 @@ int main(int argc, char *argv[]) {
             } else {
                 conn = evp->data.ptr;
                 
-                if (conn->ref_count <= 0) {
+                /* Safety check: connection should have ref_count >= 1 */
+                if (unlikely(conn->ref_count < 1)) {
                     char s_addr[INET6_ADDRSTRLEN] = "unknown";
                     if (conn->svr_sock >= 0)
                         format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
-                    P_LOG_INFO("Server data arrived for recycled connection %s (ref_count=%d). "
-                               "Discarding. Client must send new data to re-establish.", s_addr, conn->ref_count);
+                    P_LOG_WARN("Event for connection with invalid ref_count=%d (%s). Skipping.",
+                               conn->ref_count, s_addr);
                     continue;
                 }
                 
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
+                    proxy_conn_hold(conn);
                     proxy_conn_put(conn, epfd);
                     continue;
                 }
 
-                if (evp->events & EPOLLOUT)
-                    udp_flush_backlog(conn, epfd);
-
+                /* Process EPOLLIN first to read data, then EPOLLOUT to flush */
                 if (evp->events & EPOLLIN)
                     handle_server_data(conn, listen_sock, epfd);
+
+                /* Only flush if connection is still valid */
+                if (conn->ref_count >= 1 && (evp->events & EPOLLOUT))
+                    udp_flush_backlog(conn, epfd);
             }
         }
     }
@@ -1289,16 +1350,28 @@ cleanup:
 
     P_LOG_INFO("Performance statistics:");
     P_LOG_INFO("  Total packets processed: %" PRIu64, g_stats.packets_processed);
-    P_LOG_INFO("  Total bytes processed: %" PRIu64, g_stats.bytes_processed);
+    P_LOG_INFO("  Total bytes processed: %" PRIu64 " (%.2f MB)",
+               g_stats.bytes_processed, (double)g_stats.bytes_processed / (1024.0 * 1024.0));
+    P_LOG_INFO("  Connections created: %" PRIu64, g_stats.connections_created);
+    P_LOG_INFO("  Connections expired: %" PRIu64, g_stats.connections_expired);
+    P_LOG_INFO("  Connections evicted: %" PRIu64, g_stats.connections_evicted);
+    P_LOG_INFO("  Backlog drops: %" PRIu64, g_stats.backlog_drops);
     P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", g_stats.hash_collisions,
                g_stats.packets_processed > 0 ? (double)g_stats.hash_collisions / g_stats.packets_processed : 0.0);
 
     if (g_stats.packets_processed > 0 && g_stats.hash_collisions > g_stats.packets_processed / 2)
-        P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash table size",
+        P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash table size (-H)",
                    (double)g_stats.hash_collisions * 100.0 / g_stats.packets_processed);
-    if (g_stats.packets_processed > 0)
-        P_LOG_INFO("  Estimated throughput: %.0f packets/sec",
-                   (double)g_stats.packets_processed / (time(NULL) - last_check + 1));
+    if (g_stats.backlog_drops > 0)
+        P_LOG_WARN("Backlog drops detected (%" PRIu64 "), consider increasing socket buffers (-S) or reducing load",
+                   g_stats.backlog_drops);
+    
+    time_t runtime = time(NULL) - last_check + 1;
+    if (g_stats.packets_processed > 0 && runtime > 0) {
+        P_LOG_INFO("  Average throughput: %.0f packets/sec, %.2f KB/sec",
+                   (double)g_stats.packets_processed / runtime,
+                   (double)g_stats.bytes_processed / runtime / 1024.0);
+    }
     
     if (g_state.log_file) {
         fclose(g_state.log_file);
