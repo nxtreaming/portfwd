@@ -507,6 +507,15 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
         goto err;
     }
+    
+    /* Always set socket buffer sizes for connection socket (same as listen socket) */
+    if (setsockopt(svr_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime,
+                   sizeof(g_sockbuf_cap_runtime)) < 0)
+        P_LOG_WARN("setsockopt(svr_sock SO_RCVBUF): %s", strerror(errno));
+    if (setsockopt(svr_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime,
+                   sizeof(g_sockbuf_cap_runtime)) < 0)
+        P_LOG_WARN("setsockopt(svr_sock SO_SNDBUF): %s", strerror(errno));
+    
     if (connect(svr_sock, (struct sockaddr *)&g_cfg.dst_addr, sizeof_sockaddr(&g_cfg.dst_addr)) != 0) {
         P_LOG_WARN("Connection failed: %s", strerror(errno));
         goto err;
@@ -966,7 +975,7 @@ static void show_help(const char *prog) {
     P_LOG_INFO("  %s [::]:10000 [2001:db8::1]:20000", prog);
     P_LOG_INFO("Options:");
     P_LOG_INFO("  -t <seconds>     proxy session timeout (default: %u)", DEFAULT_CONN_TIMEOUT_SEC);
-    P_LOG_INFO("  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d)",
+    P_LOG_INFO("  -S <bytes>       SO_RCVBUF/SO_SNDBUF for sockets (default: %d = 1MB)",
                UDP_PROXY_SOCKBUF_CAP);
     P_LOG_INFO("  -C <max_conns>   maximum tracked UDP sessions (default: %d)",
                UDP_PROXY_MAX_CONNS);
@@ -1173,14 +1182,13 @@ int main(int argc, char *argv[]) {
     }
 
     set_nonblock(listen_sock);
-    if (g_sockbuf_cap_runtime > 0) {
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime,
-                       sizeof(g_sockbuf_cap_runtime)) < 0)
-            P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
-        if (setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime,
-                       sizeof(g_sockbuf_cap_runtime)) < 0)
-            P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
-    }
+    /* Always set socket buffer sizes to optimized default (1MB) */
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime,
+                   sizeof(g_sockbuf_cap_runtime)) < 0)
+        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
+    if (setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime,
+                   sizeof(g_sockbuf_cap_runtime)) < 0)
+        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
 
 #ifdef EPOLL_CLOEXEC
     epfd = epoll_create1(EPOLL_CLOEXEC);
