@@ -2,13 +2,6 @@
  * @file tcpfwd.c
  * @brief High-performance TCP port forwarding proxy with connection pooling
  *
- * This implementation provides:
- * - Thread-safe connection pooling with dynamic expansion
- * - Connection rate limiting per IP and total
- * - Zero-copy forwarding using Linux splice() when available
- * - Robust error handling and graceful shutdown
- * - Dynamic epoll event array sizing for optimal performance
- * - Comprehensive security checks for transparent proxy mode
  */
 
 #define _GNU_SOURCE

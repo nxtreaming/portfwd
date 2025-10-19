@@ -182,12 +182,9 @@ static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
         return NULL;
     }
 
-    /* Zero out the memory and set default values */
     memset(conn, 0, sizeof(*conn));
     conn->ref_count = 1;
     conn->svr_sock = -1;
-    /* Initialize other fields as needed */
-
     return conn;
 }
 
@@ -463,6 +460,7 @@ static void proxy_conn_walk_continue(int epfd) {
     list_for_each_entry_safe(conn, tmp, &reap_list, lru) {
         char s_addr[INET6_ADDRSTRLEN];
         const char *conn_type = "";
+
         if (conn->client_packets == 0 && conn->server_packets > 0)
             conn_type = " [SERVER-ONLY]";
         else if (conn->client_packets > 0 && conn->server_packets == 0)
