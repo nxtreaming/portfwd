@@ -119,6 +119,113 @@ static void handle_client_data(int listen_sock, int epfd);
 #endif
 static void proxy_conn_put(struct proxy_conn *conn, int epfd);
 
+static inline ssize_t udp_send_retry(int sock, const void *buf, size_t len) {
+    ssize_t wr;
+    do {
+        wr = send(sock, buf, len, 0);
+    } while (wr < 0 && errno == EINTR);
+    return wr;
+}
+
+static inline void set_socket_buffers(int sock, int bufsize) {
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0)
+        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
+    if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0)
+        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
+}
+
+static bool parse_ulong_opt(const char *optarg, const char *opt_name, 
+                           unsigned long *out, unsigned long min, unsigned long max,
+                           unsigned long default_val) {
+    char *end = NULL;
+    unsigned long v = strtoul(optarg, &end, 10);
+    if (end == optarg || *end != '\0') {
+        P_LOG_WARN("invalid %s value '%s', keeping default %lu", opt_name, optarg, default_val);
+        return false;
+    }
+    if (v < min) v = min;
+    if (v > max) v = max;
+    *out = v;
+    return true;
+}
+
+static bool parse_long_opt(const char *optarg, const char *opt_name,
+                          long *out, long min, long max,
+                          long default_val) {
+    char *end = NULL;
+    long v = strtol(optarg, &end, 10);
+    if (end == optarg || *end != '\0' || (min > 0 && v <= 0)) {
+        P_LOG_WARN("invalid %s value '%s', keeping default %ld", opt_name, optarg, default_val);
+        return false;
+    }
+    if (v < min) v = min;
+    if (v > max) v = max;
+    *out = v;
+    return true;
+}
+
+static void print_keepalive_status(time_t *last_log, uint64_t *last_pkts, uint64_t *last_bytes, time_t now) {
+    if (*last_log == 0) {
+        *last_log = now;
+        *last_pkts = g_stats.packets_processed;
+        *last_bytes = g_stats.bytes_processed;
+        return;
+    }
+    
+    /* Handle time going backwards */
+    if (now < *last_log) {
+        *last_log = now;
+        return;
+    }
+    
+    if ((long)(now - *last_log) >= KEEPALIVE_LOG_INTERVAL_SEC) {
+        uint64_t packets_delta = g_stats.packets_processed - *last_pkts;
+        uint64_t bytes_delta = g_stats.bytes_processed - *last_bytes;
+        time_t interval = now - *last_log;
+        
+        P_LOG_INFO("[Keep-Alive] Active sessions: %u/%u, "
+                   "Packets: %" PRIu64 " (%.1f pps), "
+                   "Bytes: %" PRIu64 " (%.2f KB/s)",
+                   conn_tbl_len, 
+                   (unsigned)g_conn_pool.capacity,
+                   packets_delta,
+                   interval > 0 ? (double)packets_delta / interval : 0.0,
+                   bytes_delta,
+                   interval > 0 ? (double)bytes_delta / interval / 1024.0 : 0.0);
+        
+        *last_log = now;
+        *last_pkts = g_stats.packets_processed;
+        *last_bytes = g_stats.bytes_processed;
+    }
+}
+
+static void print_statistics(time_t start_time) {
+    P_LOG_INFO("Performance statistics:");
+    P_LOG_INFO("  Total packets processed: %" PRIu64, g_stats.packets_processed);
+    P_LOG_INFO("  Total bytes processed: %" PRIu64 " (%.2f MB)",
+               g_stats.bytes_processed, (double)g_stats.bytes_processed / (1024.0 * 1024.0));
+    P_LOG_INFO("  Connections created: %" PRIu64, g_stats.connections_created);
+    P_LOG_INFO("  Connections expired: %" PRIu64, g_stats.connections_expired);
+    P_LOG_INFO("  Connections evicted: %" PRIu64, g_stats.connections_evicted);
+    P_LOG_INFO("  Packets dropped: %" PRIu64, g_stats.packets_dropped);
+    P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", g_stats.hash_collisions,
+               g_stats.packets_processed > 0 ? (double)g_stats.hash_collisions / g_stats.packets_processed : 0.0);
+
+    if (g_stats.packets_processed > 0 && g_stats.hash_collisions > g_stats.packets_processed / 2)
+        P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash table size (-H)",
+                   (double)g_stats.hash_collisions * 100.0 / g_stats.packets_processed);
+    if (g_stats.packets_dropped > 0)
+        P_LOG_WARN("Packets dropped (%" PRIu64 ") due to send failures. Network may be congested or buffers insufficient.",
+                   g_stats.packets_dropped);
+    
+    time_t runtime = monotonic_seconds() - start_time;
+    if (g_stats.packets_processed > 0 && runtime > 0) {
+        P_LOG_INFO("  Average throughput: %.0f packets/sec, %.2f KB/sec",
+                   (double)g_stats.packets_processed / runtime,
+                   (double)g_stats.bytes_processed / runtime / 1024.0);
+    }
+}
+
 static inline time_t monotonic_seconds(void) {
 #ifdef __linux__
     struct timespec ts;
@@ -250,11 +357,6 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     
     /* Handle time going backwards (system clock adjustment) */
     if (now < old_active) {
-        char s_addr[INET6_ADDRSTRLEN];
-        format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
-        P_LOG_WARN("Time went backwards for %s:%d: old=%ld, now=%ld. Resetting timestamp.",
-                   s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                   (long)old_active, (long)now);
         conn->last_active = now;
         return;
     }
@@ -264,10 +366,9 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
     if (old_active != now && (now - old_active) > TIME_GAP_WARNING_THRESHOLD_SEC) {
         char s_addr[INET6_ADDRSTRLEN];
         format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
-        P_LOG_WARN("Large time gap for %s:%d: gap=%ld sec (last_active=%ld, now=%ld). "
-                   "System may have been suspended or heavily loaded.",
+        P_LOG_WARN("Large time gap for %s:%d: gap=%ld sec. System may have been suspended.",
                    s_addr, ntohs(*port_of_sockaddr(&conn->cli_addr)),
-                   (long)(now - old_active), (long)old_active, (long)now);
+                   (long)(now - old_active));
     }
 }
 
@@ -342,12 +443,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     }
     
     /* Always set socket buffer sizes for connection socket (same as listen socket) */
-    if (setsockopt(svr_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime,
-                   sizeof(g_sockbuf_cap_runtime)) < 0)
-        P_LOG_WARN("setsockopt(svr_sock SO_RCVBUF): %s", strerror(errno));
-    if (setsockopt(svr_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime,
-                   sizeof(g_sockbuf_cap_runtime)) < 0)
-        P_LOG_WARN("setsockopt(svr_sock SO_SNDBUF): %s", strerror(errno));
+    set_socket_buffers(svr_sock, g_sockbuf_cap_runtime);
     
     if (connect(svr_sock, (struct sockaddr *)&g_cfg.dst_addr, sizeof_sockaddr(&g_cfg.dst_addr)) != 0) {
         P_LOG_WARN("Connection failed: %s", strerror(errno));
@@ -438,8 +534,6 @@ static void proxy_conn_walk_continue(int epfd) {
         
         /* Handle time going backwards - reset last_active to current time */
         if (now < conn->last_active) {
-            P_LOG_WARN("Time went backwards during sweep (conn last_active=%ld, now=%ld), resetting",
-                       (long)conn->last_active, (long)now);
             conn->last_active = now;
             continue;
         }
@@ -540,19 +634,11 @@ static void handle_client_data(int lsn_sock, int epfd) {
                 touch_proxy_conn(conn);
 
                 /* Direct send, no backlog buffering */
-                ssize_t wr;
-                do {
-                    wr = send(conn->svr_sock, c_bufs[i], packet_len, 0);
-                } while (wr < 0 && errno == EINTR);
-
+                ssize_t wr = udp_send_retry(conn->svr_sock, c_bufs[i], packet_len);
                 if (wr < 0) {
-                    /* Drop packet if send fails */
-                    if (is_wouldblock(errno)) {
-                        g_stats.packets_dropped++;
-                    } else {
+                    g_stats.packets_dropped++;
+                    if (!is_wouldblock(errno))
                         log_if_unexpected_errno("send(server)");
-                        g_stats.packets_dropped++;
-                    }
                 } else {
                     g_stats.bytes_processed += (size_t)wr;
                 }
@@ -594,22 +680,14 @@ static void handle_client_data(int lsn_sock, int epfd) {
     touch_proxy_conn(conn);
 
     /* Direct send, no backlog buffering */
-    ssize_t wr;
-    do {
-        wr = send(conn->svr_sock, buffer, r, 0);
-    } while (wr < 0 && errno == EINTR);
+    ssize_t wr = udp_send_retry(conn->svr_sock, buffer, r);
     if (wr < 0) {
-        /* Drop packet if send fails */
-        if (is_wouldblock(errno)) {
-            g_stats.packets_dropped++;
-        } else {
+        g_stats.packets_dropped++;
+        if (!is_wouldblock(errno))
             log_if_unexpected_errno("send(server)");
-            g_stats.packets_dropped++;
-        }
     } else {
         g_stats.bytes_processed += (size_t)wr;
     }
-
     proxy_conn_put(conn, epfd);
 }
 
@@ -826,15 +904,9 @@ int main(int argc, char *argv[]) {
     while ((opt = getopt(argc, argv, "hdvRr6p:i:t:S:C:B:H:")) != -1) {
         switch (opt) {
         case 't': {
-            char *end = NULL;
-            unsigned long v = strtoul(optarg, &end, 10);
-            if (end == optarg || *end != '\0')
-                P_LOG_WARN("invalid -t value '%s', keeping default %u", optarg, g_cfg.proxy_conn_timeo);
-            else {
-                if (v > 86400UL)
-                    v = 86400UL;
+            unsigned long v;
+            if (parse_ulong_opt(optarg, "-t", &v, 0, 86400UL, g_cfg.proxy_conn_timeo))
                 g_cfg.proxy_conn_timeo = (unsigned)v;
-            }
             break;
         }
         case 'd':
@@ -856,64 +928,37 @@ int main(int argc, char *argv[]) {
             g_cfg.pidfile = optarg;
             break;
         case 'i': {
-            char *end = NULL;
-            unsigned long v = strtoul(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v == 0)
-                P_LOG_WARN("invalid -i value '%s', keeping default %u", optarg, g_cfg.max_per_ip_connections);
-            else
+            unsigned long v;
+            if (parse_ulong_opt(optarg, "-i", &v, 1, ULONG_MAX, g_cfg.max_per_ip_connections))
                 g_cfg.max_per_ip_connections = (unsigned)v;
             break;
         }
         case 'S': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v <= 0)
-                P_LOG_WARN("invalid -S value '%s', keeping default %d", optarg, g_sockbuf_cap_runtime);
-            else {
-                if (v < 4096) v = 4096;
-                if (v > (8 << 20)) v = (8 << 20);
+            long v;
+            if (parse_long_opt(optarg, "-S", &v, 4096, 8 << 20, g_sockbuf_cap_runtime))
                 g_sockbuf_cap_runtime = (int)v;
-            }
             break;
         }
         case 'C': {
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0' || v <= 0)
-                P_LOG_WARN("invalid -C value '%s', keeping default %d", optarg, g_conn_pool_capacity);
-            else {
-                if (v < 64) v = 64;
-                if (v > (1 << 20)) v = (1 << 20);
+            long v;
+            if (parse_long_opt(optarg, "-C", &v, 64, 1 << 20, g_conn_pool_capacity))
                 g_conn_pool_capacity = (int)v;
-            }
             break;
         }
         case 'B': {
 #ifdef __linux__
-            char *end = NULL;
-            long v = strtol(optarg, &end, 10);
-            if (end == optarg || *end != '\0')
-                P_LOG_WARN("invalid -B value '%s', keeping default %d", optarg, g_batch_sz_runtime);
-            else {
-                if (v < 1) v = 1;
-                if (v > UDP_PROXY_BATCH_SZ) v = UDP_PROXY_BATCH_SZ;
+            long v;
+            if (parse_long_opt(optarg, "-B", &v, 1, UDP_PROXY_BATCH_SZ, g_batch_sz_runtime))
                 g_batch_sz_runtime = (int)v;
-            }
 #else
             P_LOG_WARN("-B has no effect on non-Linux builds");
 #endif
             break;
         }
         case 'H': {
-            char *end = NULL;
-            unsigned long v = strtoul(optarg, &end, 10);
-            if (end == optarg || *end != '\0')
-                P_LOG_WARN("invalid -H value '%s', keeping default %u", optarg, g_cfg.conn_tbl_hash_size);
-            else {
-                if (v == 0) v = 4093UL;
-                if (v < 64UL) v = 64UL;
-                if (v > (1UL << 20)) v = (1UL << 20);
-                g_cfg.conn_tbl_hash_size = (unsigned)v;
+            unsigned long v;
+            if (parse_ulong_opt(optarg, "-H", &v, 64, 1UL << 20, g_cfg.conn_tbl_hash_size)) {
+                g_cfg.conn_tbl_hash_size = (v == 0) ? 4093 : (unsigned)v;
             }
             break;
         }
@@ -998,12 +1043,7 @@ int main(int argc, char *argv[]) {
 
     set_nonblock(listen_sock);
     /* Always set socket buffer sizes to optimized default (1MB) */
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_RCVBUF, &g_sockbuf_cap_runtime,
-                   sizeof(g_sockbuf_cap_runtime)) < 0)
-        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
-    if (setsockopt(listen_sock, SOL_SOCKET, SO_SNDBUF, &g_sockbuf_cap_runtime,
-                   sizeof(g_sockbuf_cap_runtime)) < 0)
-        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
+    set_socket_buffers(listen_sock, g_sockbuf_cap_runtime);
 
 #ifdef EPOLL_CLOEXEC
     epfd = epoll_create1(EPOLL_CLOEXEC);
@@ -1064,35 +1104,7 @@ int main(int argc, char *argv[]) {
                 break;
         }
 
-        if (last_keepalive_log == 0) {
-            last_keepalive_log = current_ts;
-            last_packets_count = g_stats.packets_processed;
-            last_bytes_count = g_stats.bytes_processed;
-        }
-        if (current_ts < last_keepalive_log) {
-            P_LOG_WARN("Time went backwards (current=%ld, last=%ld). Resetting keep-alive timer.",
-                       (long)current_ts, (long)last_keepalive_log);
-            last_keepalive_log = current_ts;
-        }
-        if ((long)(current_ts - last_keepalive_log) >= KEEPALIVE_LOG_INTERVAL_SEC) {
-            uint64_t packets_delta = g_stats.packets_processed - last_packets_count;
-            uint64_t bytes_delta = g_stats.bytes_processed - last_bytes_count;
-            time_t interval = current_ts - last_keepalive_log;
-            
-            P_LOG_INFO("[Keep-Alive] Active sessions: %u/%u, "
-                       "Packets: %" PRIu64 " (%.1f pps), "
-                       "Bytes: %" PRIu64 " (%.2f KB/s)",
-                       conn_tbl_len, 
-                       (unsigned)g_conn_pool.capacity,
-                       packets_delta,
-                       interval > 0 ? (double)packets_delta / interval : 0.0,
-                       bytes_delta,
-                       interval > 0 ? (double)bytes_delta / interval / 1024.0 : 0.0);
-            
-            last_keepalive_log = current_ts;
-            last_packets_count = g_stats.packets_processed;
-            last_bytes_count = g_stats.bytes_processed;
-        }
+        print_keepalive_status(&last_keepalive_log, &last_packets_count, &last_bytes_count, current_ts);
 
         if (g_shutdown_requested)
             break;
@@ -1167,30 +1179,7 @@ cleanup:
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs);
 #endif
 
-    P_LOG_INFO("Performance statistics:");
-    P_LOG_INFO("  Total packets processed: %" PRIu64, g_stats.packets_processed);
-    P_LOG_INFO("  Total bytes processed: %" PRIu64 " (%.2f MB)",
-               g_stats.bytes_processed, (double)g_stats.bytes_processed / (1024.0 * 1024.0));
-    P_LOG_INFO("  Connections created: %" PRIu64, g_stats.connections_created);
-    P_LOG_INFO("  Connections expired: %" PRIu64, g_stats.connections_expired);
-    P_LOG_INFO("  Connections evicted: %" PRIu64, g_stats.connections_evicted);
-    P_LOG_INFO("  Packets dropped: %" PRIu64, g_stats.packets_dropped);
-    P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", g_stats.hash_collisions,
-               g_stats.packets_processed > 0 ? (double)g_stats.hash_collisions / g_stats.packets_processed : 0.0);
-
-    if (g_stats.packets_processed > 0 && g_stats.hash_collisions > g_stats.packets_processed / 2)
-        P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash table size (-H)",
-                   (double)g_stats.hash_collisions * 100.0 / g_stats.packets_processed);
-    if (g_stats.packets_dropped > 0)
-        P_LOG_WARN("Packets dropped (%" PRIu64 ") due to send failures. Network may be congested or buffers insufficient.",
-                   g_stats.packets_dropped);
-    
-    time_t runtime = time(NULL) - last_check + 1;
-    if (g_stats.packets_processed > 0 && runtime > 0) {
-        P_LOG_INFO("  Average throughput: %.0f packets/sec, %.2f KB/sec",
-                   (double)g_stats.packets_processed / runtime,
-                   (double)g_stats.bytes_processed / runtime / 1024.0);
-    }
+    print_statistics(last_check);
     
     if (g_state.log_file) {
         fclose(g_state.log_file);
