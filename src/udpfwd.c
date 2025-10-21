@@ -25,6 +25,7 @@
 #include <time.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <limits.h>
 
 #ifdef __linux__
 #include <sys/epoll.h>
@@ -199,6 +200,15 @@ static void print_keepalive_status(time_t *last_log, uint64_t *last_pkts, uint64
     }
 }
 
+static inline time_t monotonic_seconds(void) {
+#ifdef __linux__
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (time_t)ts.tv_sec;
+#endif
+    return time(NULL);
+}
+
 static void print_statistics(time_t start_time) {
     P_LOG_INFO("Performance statistics:");
     P_LOG_INFO("  Total packets processed: %" PRIu64, g_stats.packets_processed);
@@ -224,15 +234,6 @@ static void print_statistics(time_t start_time) {
                    (double)g_stats.packets_processed / runtime,
                    (double)g_stats.bytes_processed / runtime / 1024.0);
     }
-}
-
-static inline time_t monotonic_seconds(void) {
-#ifdef __linux__
-    struct timespec ts;
-    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
-        return (time_t)ts.tv_sec;
-#endif
-    return time(NULL);
 }
 
 static inline time_t cached_now_seconds(void) {
