@@ -34,31 +34,39 @@ enum proxy_state {
 #endif
 
 #ifdef UDPFWD_ONLY
+/* Memory-optimized UDP-only proxy connection structure
+ * Fields ordered by size (largest first) to minimize alignment padding */
 struct proxy_conn {
-    /* Reference counting */
-    unsigned ref_count;
+    /* Connection endpoints (largest field first for natural alignment) */
+    union sockaddr_inx cli_addr;   /* Client address: 28 bytes (IPv4) / 128 bytes (IPv6) */
     
-    /* List linkage */
+    /* List linkage (16 bytes each) */
     struct list_head list;         /* For hash table linkage */
+    struct list_head lru;          /* LRU management */
+    
+    /* Pointers (8 bytes each) */
     struct proxy_conn *next;       /* For freelist in conn_pool */
     
-    /* Connection endpoints */
-    int svr_sock;                  /* Server-side UDP socket */
-    union sockaddr_inx cli_addr;   /* Client address */
-    
-    /* Timing and state */
+    /* Timing (8 bytes each) */
     time_t last_active;
     time_t last_addr_warn;
     
-    /* LRU management */
-    struct list_head lru;
-    bool needs_lru_update;
-    
-    /* Statistics */
+    /* Statistics (8 bytes each) */
     unsigned long client_packets;
     unsigned long server_packets;
+    
+    /* 4-byte fields */
+    int svr_sock;                  /* Server-side UDP socket */
+    unsigned ref_count;            /* Reference counting */
+    
+    /* 1-byte fields */
+    bool needs_lru_update;
+    
+    /* Explicit padding to 8-byte boundary for predictable size */
+    char _padding[3];
 };
 #else
+/* Full-featured proxy connection structure for TCP/KCP */
 struct proxy_conn {
     /* Common fields */
     unsigned ref_count;   /* Reference counter */

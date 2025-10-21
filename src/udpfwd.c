@@ -55,7 +55,7 @@
 #endif
 
 #define countof(arr) (sizeof(arr) / sizeof((arr)[0]))
-#define MAX_EVENTS 1024
+#define MAX_EVENTS 256
 #define EPOLL_WAIT_TIMEOUT_MS 500
 #define CLIENT_MAX_ITERATIONS 128
 #define SERVER_MAX_ITERATIONS 128
@@ -68,7 +68,7 @@
 
 #ifdef __linux__
 #ifndef UDP_PROXY_BATCH_SZ
-#define UDP_PROXY_BATCH_SZ 32
+#define UDP_PROXY_BATCH_SZ 16
 #endif
 
 #ifndef UDP_PROXY_DGRAM_CAP
@@ -794,9 +794,9 @@ static void show_help(const char *prog) {
                UDP_PROXY_SOCKBUF_CAP);
     P_LOG_INFO("  -C <max_conns>   maximum tracked UDP sessions (default: %d)",
                UDP_PROXY_MAX_CONNS);
-    P_LOG_INFO("  -B <batch>       Linux recvmmsg/sendmmsg batch size (1..%d, "
+    P_LOG_INFO("  -B <batch>       Linux recvmmsg/sendmmsg batch size (1..32, "
                "default: %d)",
-               UDP_PROXY_BATCH_SZ, UDP_PROXY_BATCH_SZ);
+               UDP_PROXY_BATCH_SZ);
     P_LOG_INFO("  -H <size>        hash table size (default: %d, recommend >= "
                "max_conns)",
                DEFAULT_HASH_TABLE_SIZE);
