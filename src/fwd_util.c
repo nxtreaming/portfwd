@@ -92,10 +92,6 @@ int init_signals(void) {
     return 0;
 }
 
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-/* PID File Management */
-/* -=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=- */
-
 void cleanup_pidfile(void) {
     if (g_pidfile_fd >= 0) {
         if (close(g_pidfile_fd) < 0) {

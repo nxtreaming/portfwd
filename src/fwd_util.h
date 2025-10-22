@@ -87,14 +87,6 @@ void cleanup_pidfile(void);
 int do_daemonize(void);
 void drop_privileges(const char *username);
 
-/**
- * @brief Parses common command-line arguments and populates the config.
- *
- * @param argc Argument count from main().
- * @param argv Argument vector from main().
- * @param cfg  The fwd_config struct to populate.
- * @return The updated optind value on success, -1 on error.
- */
 void init_fwd_config(struct fwd_config *cfg);
 int parse_common_args(int argc, char **argv, struct fwd_config *cfg);
 int get_sockaddr_inx(const char *str, union sockaddr_inx *addr, bool is_source);
