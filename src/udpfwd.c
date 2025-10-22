@@ -135,7 +135,7 @@ static inline void set_socket_buffers(int sock, int bufsize) {
         P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
 }
 
-static bool parse_ulong_opt(const char *optarg, const char *opt_name, 
+static bool parse_ulong_opt(const char *optarg, const char *opt_name,
                            unsigned long *out, unsigned long min, unsigned long max,
                            unsigned long default_val) {
     char *end = NULL;
@@ -172,28 +172,28 @@ static void print_keepalive_status(time_t *last_log, uint64_t *last_pkts, uint64
         *last_bytes = g_stats.bytes_processed;
         return;
     }
-    
+
     /* Handle time going backwards */
     if (now < *last_log) {
         *last_log = now;
         return;
     }
-    
+
     if ((long)(now - *last_log) >= KEEPALIVE_LOG_INTERVAL_SEC) {
         uint64_t packets_delta = g_stats.packets_processed - *last_pkts;
         uint64_t bytes_delta = g_stats.bytes_processed - *last_bytes;
         time_t interval = now - *last_log;
-        
+
         P_LOG_INFO("[Keep-Alive] Active sessions: %u/%u, "
                    "Packets: %" PRIu64 " (%.1f pps), "
                    "Bytes: %" PRIu64 " (%.2f KB/s)",
-                   conn_tbl_len, 
+                   conn_tbl_len,
                    (unsigned)g_conn_pool.capacity,
                    packets_delta,
                    interval > 0 ? (double)packets_delta / interval : 0.0,
                    bytes_delta,
                    interval > 0 ? (double)bytes_delta / interval / 1024.0 : 0.0);
-        
+
         *last_log = now;
         *last_pkts = g_stats.packets_processed;
         *last_bytes = g_stats.bytes_processed;
@@ -227,7 +227,7 @@ static void print_statistics(time_t start_time) {
     if (g_stats.packets_dropped > 0)
         P_LOG_WARN("Packets dropped (%" PRIu64 ") due to send failures. Network may be congested or buffers insufficient.",
                    g_stats.packets_dropped);
-    
+
     time_t runtime = monotonic_seconds() - start_time;
     if (g_stats.packets_processed > 0 && runtime > 0) {
         P_LOG_INFO("  Average throughput: %.0f packets/sec, %.2f KB/sec",
@@ -355,13 +355,13 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 
     time_t now = cached_now_seconds();
     time_t old_active = conn->last_active;
-    
+
     /* Handle time going backwards (system clock adjustment) */
     if (now < old_active) {
         conn->last_active = now;
         return;
     }
-    
+
     conn->last_active = now;
 
     if (old_active != now && (now - old_active) > TIME_GAP_WARNING_THRESHOLD_SEC) {
@@ -396,14 +396,14 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
             return conn;
         }
     }
-    
+
     /* Track collisions for new connection insertion */
     if (chain_len > 0)
         g_stats.hash_collisions += chain_len;
 
     bool reserved_slot = false;
     int eviction_attempts = 0;
-    
+
     for (;;) {
         unsigned current_conn_count = conn_tbl_len;
         if (current_conn_count >= (unsigned)g_conn_pool.capacity) {
@@ -414,7 +414,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
                 goto err;
             }
             eviction_attempts++;
-            
+
             if (!proxy_conn_evict_one(epfd)) {
                 format_client_addr(cli_addr, s_addr, sizeof(s_addr));
                 P_LOG_WARN("Conn table full but LRU empty, dropping %s:%d",
@@ -442,10 +442,10 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
         goto err;
     }
-    
+
     /* Always set socket buffer sizes for connection socket (same as listen socket) */
     set_socket_buffers(svr_sock, g_sockbuf_cap_runtime);
-    
+
     if (connect(svr_sock, (struct sockaddr *)&g_cfg.dst_addr, sizeof_sockaddr(&g_cfg.dst_addr)) != 0) {
         P_LOG_WARN("Connection failed: %s", strerror(errno));
         goto err;
@@ -503,7 +503,7 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
         list_del(&conn->lru);
 
     if (conn->svr_sock >= 0) {
-        if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 && 
+        if (epoll_ctl(epfd, EPOLL_CTL_DEL, conn->svr_sock, NULL) < 0 &&
             errno != EBADF && errno != ENOENT)
             P_LOG_WARN("epoll_ctl(DEL, svr_sock=%d): %s", conn->svr_sock, strerror(errno));
         safe_close(conn->svr_sock);
@@ -529,18 +529,18 @@ static void proxy_conn_walk_continue(int epfd) {
     list_for_each_entry_safe(conn, tmp, &g_lru_list, lru) {
         if (g_shutdown_requested)
             return;
-        
+
         if (++scanned >= MAX_SCAN_PER_SWEEP)
             break;
-        
+
         /* Handle time going backwards - reset last_active to current time */
         if (now < conn->last_active) {
             conn->last_active = now;
             continue;
         }
-        
+
         unsigned long diff = (unsigned long)(now - conn->last_active);
-        
+
         if (g_cfg.proxy_conn_timeo != 0 && diff > g_cfg.proxy_conn_timeo) {
             if (unlikely(conn->ref_count != 1))
                 continue;
@@ -562,7 +562,7 @@ static void proxy_conn_walk_continue(int epfd) {
             conn_type = " [CLIENT-ONLY]";
         else if (conn->client_packets > 0 && conn->server_packets > 0)
             conn_type = " [BIDIRECTIONAL]";
-        
+
         format_client_addr(&conn->cli_addr, s_addr, sizeof(s_addr));
         P_LOG_INFO("Recycling %s:%d%s - last_active=%ld, now=%ld, idle=%ld sec, timeout=%u sec, "
                    "client_pkts=%lu, server_pkts=%lu. Client must send new data to re-establish.",
@@ -984,11 +984,11 @@ int main(int argc, char *argv[]) {
     if (g_cfg.daemonize) {
         if (do_daemonize() != 0)
             return 1;
-        
+
         char log_path[256];
         unsigned short listen_port = ntohs(*port_of_sockaddr(&g_cfg.listen_addr));
         snprintf(log_path, sizeof(log_path), "/var/log/udpfwd_%u.log", listen_port);
-        
+
         g_state.log_file = fopen(log_path, "a");
         if (!g_state.log_file)
             syslog(LOG_WARNING, "Failed to open log file %s: %s, using syslog", log_path, strerror(errno));
@@ -1113,7 +1113,7 @@ int main(int argc, char *argv[]) {
         int nfds = epoll_wait(epfd, events, countof(events), EPOLL_WAIT_TIMEOUT_MS);
         current_ts = monotonic_seconds();
         g_now_ts = current_ts;
-        
+
         if (g_shutdown_requested)
             break;
 
@@ -1144,7 +1144,7 @@ int main(int argc, char *argv[]) {
 #endif
             } else {
                 conn = evp->data.ptr;
-                
+
                 /* Safety check: connection should have ref_count >= 1 */
                 if (unlikely(conn->ref_count < 1)) {
                     char s_addr[INET6_ADDRSTRLEN] = "unknown";
@@ -1154,7 +1154,7 @@ int main(int argc, char *argv[]) {
                                conn->ref_count, s_addr);
                     continue;
                 }
-                
+
                 if (evp->events & (EPOLLERR | EPOLLHUP)) {
                     proxy_conn_hold(conn);
                     proxy_conn_put(conn, epfd);
@@ -1181,7 +1181,7 @@ cleanup:
 #endif
 
     print_statistics(last_check);
-    
+
     if (g_state.log_file) {
         fclose(g_state.log_file);
         g_state.log_file = NULL;
