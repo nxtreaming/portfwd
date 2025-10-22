@@ -4,6 +4,7 @@
 #include <sys/file.h>
 #include <stdarg.h>
 #include <time.h>
+
 struct app_state g_state = {.daemonized = false, .log_file = NULL};
 
 /* Simple sanitizer: mask long hex-like sequences (potential keys) */
@@ -48,7 +49,7 @@ void log_msg(int level, const char *fmt, ...) {
             struct tm *tm_info = localtime(&now);
             char timestamp[64];
             strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
-            
+
             const char *level_str = "INFO";
             switch (level) {
                 case LOG_ERR: level_str = "ERROR"; break;
@@ -57,7 +58,7 @@ void log_msg(int level, const char *fmt, ...) {
                 case LOG_DEBUG: level_str = "DEBUG"; break;
                 case LOG_CRIT: level_str = "CRIT"; break;
             }
-            
+
             fprintf(g_state.log_file, "%s [%s] %s\n", timestamp, level_str, s_buf);
             fflush(g_state.log_file);  /* Ensure immediate write */
         } else {
@@ -67,7 +68,6 @@ void log_msg(int level, const char *fmt, ...) {
         fprintf(stderr, "%s\n", s_buf);
     }
 }
-
 
 void set_nonblock(int sockfd) {
     int flags;
