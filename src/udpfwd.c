@@ -106,6 +106,10 @@ static struct {
     uint64_t connections_evicted;
     uint64_t connections_expired;
     uint64_t packets_dropped;  /* Packets dropped due to send failures */
+    uint64_t send_errors;      /* Additional send error tracking */
+    uint64_t recv_errors;      /* Receive error tracking */
+    time_t start_time;         /* Process start time for metrics */
+    uint64_t last_stats_time;  /* Last time stats were printed */
 } g_stats = {0};
 static struct fwd_config g_cfg;
 
@@ -121,31 +125,95 @@ static void handle_client_data(int listen_sock, int epfd);
 static void proxy_conn_put(struct proxy_conn *conn, int epfd);
 
 static inline ssize_t udp_send_retry(int sock, const void *buf, size_t len) {
+    if (sock < 0) {
+        P_LOG_WARN("udp_send_retry: invalid socket descriptor %d", sock);
+        return -1;
+    }
+    
+    if (!buf || len == 0) {
+        P_LOG_WARN("udp_send_retry: invalid buffer parameters");
+        return -1;
+    }
+    
     ssize_t wr;
+    int retry_count = 0;
+    const int max_retries = 3;
+    
     do {
         wr = send(sock, buf, len, 0);
+        if (wr < 0 && errno == EINTR) {
+            retry_count++;
+            if (retry_count >= max_retries) {
+                P_LOG_WARN("udp_send_retry: too many interrupts (%d), giving up", max_retries);
+                break;
+            }
+        }
     } while (wr < 0 && errno == EINTR);
+    
     return wr;
 }
 
 static inline void set_socket_buffers(int sock, int bufsize) {
+    if (sock < 0) {
+        P_LOG_WARN("set_socket_buffers: invalid socket descriptor %d", sock);
+        return;
+    }
+    
+    if (bufsize <= 0) {
+        P_LOG_WARN("set_socket_buffers: invalid buffer size %d", bufsize);
+        return;
+    }
+    
     if (setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0)
-        P_LOG_WARN("setsockopt(SO_RCVBUF): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(SO_RCVBUF, fd=%d, size=%d): %s", sock, bufsize, strerror(errno));
     if (setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0)
-        P_LOG_WARN("setsockopt(SO_SNDBUF): %s", strerror(errno));
+        P_LOG_WARN("setsockopt(SO_SNDBUF, fd=%d, size=%d): %s", sock, bufsize, strerror(errno));
 }
 
 static bool parse_ulong_opt(const char *optarg, const char *opt_name,
                            unsigned long *out, unsigned long min, unsigned long max,
                            unsigned long default_val) {
-    char *end = NULL;
-    unsigned long v = strtoul(optarg, &end, 10);
-    if (end == optarg || *end != '\0') {
-        P_LOG_WARN("invalid %s value '%s', keeping default %lu", opt_name, optarg, default_val);
+    if (!optarg || !opt_name || !out) {
+        P_LOG_WARN("Invalid parameters passed to parse_ulong_opt");
         return false;
     }
-    if (v < min) v = min;
-    if (v > max) v = max;
+    
+    /* Check for empty string */
+    if (*optarg == '\0') {
+        P_LOG_WARN("Empty %s value, keeping default %lu", opt_name, default_val);
+        return false;
+    }
+    
+    char *end = NULL;
+    errno = 0; /* Clear errno to detect overflow */
+    unsigned long v = strtoul(optarg, &end, 10);
+    
+    /* Check for conversion errors */
+    if (end == optarg || *end != '\0') {
+        P_LOG_WARN("Invalid %s value '%s' (not a number), keeping default %lu", 
+                   opt_name, optarg, default_val);
+        return false;
+    }
+    
+    /* Check for overflow/underflow */
+    if (errno == ERANGE) {
+        P_LOG_WARN("%s value '%s' out of range, keeping default %lu", 
+                   opt_name, optarg, default_val);
+        return false;
+    }
+    
+    /* Apply bounds checking */
+    if (v < min) {
+        P_LOG_WARN("%s value %lu below minimum %lu, using minimum", 
+                   opt_name, v, min);
+        v = min;
+    }
+    if (v > max) {
+        P_LOG_WARN("%s value %lu above maximum %lu, using maximum", 
+                   opt_name, v, max);
+        v = max;
+    }
+    
     *out = v;
     return true;
 }
@@ -153,19 +221,64 @@ static bool parse_ulong_opt(const char *optarg, const char *opt_name,
 static bool parse_long_opt(const char *optarg, const char *opt_name,
                           long *out, long min, long max,
                           long default_val) {
-    char *end = NULL;
-    long v = strtol(optarg, &end, 10);
-    if (end == optarg || *end != '\0' || (min > 0 && v <= 0)) {
-        P_LOG_WARN("invalid %s value '%s', keeping default %ld", opt_name, optarg, default_val);
+    if (!optarg || !opt_name || !out) {
+        P_LOG_WARN("Invalid parameters passed to parse_long_opt");
         return false;
     }
-    if (v < min) v = min;
-    if (v > max) v = max;
+    
+    /* Check for empty string */
+    if (*optarg == '\0') {
+        P_LOG_WARN("Empty %s value, keeping default %ld", opt_name, default_val);
+        return false;
+    }
+    
+    char *end = NULL;
+    errno = 0; /* Clear errno to detect overflow */
+    long v = strtol(optarg, &end, 10);
+    
+    /* Check for conversion errors */
+    if (end == optarg || *end != '\0') {
+        P_LOG_WARN("Invalid %s value '%s' (not a number), keeping default %ld", 
+                   opt_name, optarg, default_val);
+        return false;
+    }
+    
+    /* Check for overflow/underflow */
+    if (errno == ERANGE) {
+        P_LOG_WARN("%s value '%s' out of range, keeping default %ld", 
+                   opt_name, optarg, default_val);
+        return false;
+    }
+    
+    /* Additional validation for positive-only parameters */
+    if (min > 0 && v <= 0) {
+        P_LOG_WARN("%s value %ld must be positive, keeping default %ld", 
+                   opt_name, v, default_val);
+        return false;
+    }
+    
+    /* Apply bounds checking */
+    if (v < min) {
+        P_LOG_WARN("%s value %ld below minimum %ld, using minimum", 
+                   opt_name, v, min);
+        v = min;
+    }
+    if (v > max) {
+        P_LOG_WARN("%s value %ld above maximum %ld, using maximum", 
+                   opt_name, v, max);
+        v = max;
+    }
+    
     *out = v;
     return true;
 }
 
 static void print_keepalive_status(time_t *last_log, uint64_t *last_pkts, uint64_t *last_bytes, time_t now) {
+    if (!last_log || !last_pkts || !last_bytes) {
+        P_LOG_WARN("print_keepalive_status: NULL parameters");
+        return;
+    }
+    
     if (*last_log == 0) {
         *last_log = now;
         *last_pkts = g_stats.packets_processed;
@@ -175,6 +288,7 @@ static void print_keepalive_status(time_t *last_log, uint64_t *last_pkts, uint64
 
     /* Handle time going backwards */
     if (now < *last_log) {
+        P_LOG_DEBUG("Time went backwards (%ld -> %ld), resetting keepalive timer", *last_log, now);
         *last_log = now;
         return;
     }
@@ -184,15 +298,27 @@ static void print_keepalive_status(time_t *last_log, uint64_t *last_pkts, uint64
         uint64_t bytes_delta = g_stats.bytes_processed - *last_bytes;
         time_t interval = now - *last_log;
 
-        P_LOG_INFO("[Keep-Alive] Active sessions: %u/%u, "
-                   "Packets: %" PRIu64 " (%.1f pps), "
-                   "Bytes: %" PRIu64 " (%.2f KB/s)",
-                   conn_tbl_len,
-                   (unsigned)g_conn_pool.capacity,
-                   packets_delta,
-                   interval > 0 ? (double)packets_delta / interval : 0.0,
-                   bytes_delta,
-                   interval > 0 ? (double)bytes_delta / interval / 1024.0 : 0.0);
+        double pps = interval > 0 ? (double)packets_delta / interval : 0.0;
+        double kbps = interval > 0 ? (double)bytes_delta / interval / 1024.0 : 0.0;
+        
+        /* Calculate memory usage efficiency */
+        double conn_efficiency = g_conn_pool.capacity > 0 ? 
+            (double)conn_tbl_len * 100.0 / g_conn_pool.capacity : 0.0;
+        
+        P_LOG_INFO("[Keep-Alive] Status Update:");
+        P_LOG_INFO("  Runtime: %ld sec, Active sessions: %u/%u (%.1f%% used)",
+                   interval, conn_tbl_len, (unsigned)g_conn_pool.capacity, conn_efficiency);
+        P_LOG_INFO("  Packets: %" PRIu64 " (%.1f pps), Bytes: %" PRIu64 " (%.2f KB/s)",
+                   packets_delta, pps, bytes_delta, kbps);
+        
+        /* Health indicators */
+        if (pps > 1000) {
+            P_LOG_INFO("  Status: HEALTHY (high throughput)");
+        } else if (pps > 100) {
+            P_LOG_INFO("  Status: NORMAL (moderate throughput)");
+        } else {
+            P_LOG_INFO("  Status: IDLE (low throughput)");
+        }
 
         *last_log = now;
         *last_pkts = g_stats.packets_processed;
@@ -210,7 +336,10 @@ static inline time_t monotonic_seconds(void) {
 }
 
 static void print_statistics(time_t start_time) {
-    P_LOG_INFO("Performance statistics:");
+    time_t runtime = monotonic_seconds() - start_time;
+    
+    P_LOG_INFO("=== UDP Forwarder Performance Statistics ===");
+    P_LOG_INFO("Runtime: %ld seconds", runtime);
     P_LOG_INFO("  Total packets processed: %" PRIu64, g_stats.packets_processed);
     P_LOG_INFO("  Total bytes processed: %" PRIu64 " (%.2f MB)",
                g_stats.bytes_processed, (double)g_stats.bytes_processed / (1024.0 * 1024.0));
@@ -218,22 +347,69 @@ static void print_statistics(time_t start_time) {
     P_LOG_INFO("  Connections expired: %" PRIu64, g_stats.connections_expired);
     P_LOG_INFO("  Connections evicted: %" PRIu64, g_stats.connections_evicted);
     P_LOG_INFO("  Packets dropped: %" PRIu64, g_stats.packets_dropped);
+    P_LOG_INFO("  Send errors: %" PRIu64, g_stats.send_errors);
+    P_LOG_INFO("  Receive errors: %" PRIu64, g_stats.recv_errors);
     P_LOG_INFO("  Hash collisions: %" PRIu64 " (avg probe: %.2f)", g_stats.hash_collisions,
                g_stats.packets_processed > 0 ? (double)g_stats.hash_collisions / g_stats.packets_processed : 0.0);
+    P_LOG_INFO("  Active connections: %u/%u", conn_tbl_len, (unsigned)g_conn_pool.capacity);
+    P_LOG_INFO("  Hash table size: %u buckets", g_conn_tbl_hash_size);
 
-    if (g_stats.packets_processed > 0 && g_stats.hash_collisions > g_stats.packets_processed / 2)
-        P_LOG_WARN("High hash collision rate detected (%.1f%%), consider adjusting hash table size (-H)",
-                   (double)g_stats.hash_collisions * 100.0 / g_stats.packets_processed);
-    if (g_stats.packets_dropped > 0)
-        P_LOG_WARN("Packets dropped (%" PRIu64 ") due to send failures. Network may be congested or buffers insufficient.",
-                   g_stats.packets_dropped);
-
-    time_t runtime = monotonic_seconds() - start_time;
-    if (g_stats.packets_processed > 0 && runtime > 0) {
-        P_LOG_INFO("  Average throughput: %.0f packets/sec, %.2f KB/sec",
-                   (double)g_stats.packets_processed / runtime,
-                   (double)g_stats.bytes_processed / runtime / 1024.0);
+    /* Performance warnings and recommendations */
+    if (g_stats.packets_processed > 0) {
+        double collision_rate = (double)g_stats.hash_collisions * 100.0 / g_stats.packets_processed;
+        if (collision_rate > 50.0) {
+            P_LOG_WARN("High hash collision rate detected (%.1f%%). Consider increasing hash table size (-H).",
+                       collision_rate);
+        }
+        
+        double drop_rate = (double)g_stats.packets_dropped * 100.0 / g_stats.packets_processed;
+        if (drop_rate > 1.0) {
+            P_LOG_WARN("High packet drop rate detected (%.1f%%). Network may be congested or buffers insufficient.",
+                       drop_rate);
+        }
+        
+        double error_rate = (double)(g_stats.send_errors + g_stats.recv_errors) * 100.0 / g_stats.packets_processed;
+        if (error_rate > 0.1) {
+            P_LOG_WARN("High error rate detected (%.1f%%). Check system resources and network stability.",
+                       error_rate);
+        }
     }
+    
+    if (g_stats.packets_dropped > 0) {
+        P_LOG_WARN("Packets dropped (%" PRIu64 ") due to send failures. Check network connectivity and buffer sizes.",
+                   g_stats.packets_dropped);
+    }
+    
+    if (g_stats.send_errors > 0 || g_stats.recv_errors > 0) {
+        P_LOG_WARN("Network errors detected - Send: %" PRIu64 ", Receive: %" PRIu64 ". Consider network diagnostics.",
+                   g_stats.send_errors, g_stats.recv_errors);
+    }
+
+    /* Throughput calculations */
+    if (g_stats.packets_processed > 0 && runtime > 0) {
+        double pps = (double)g_stats.packets_processed / runtime;
+        double kbps = (double)g_stats.bytes_processed / runtime / 1024.0;
+        
+        P_LOG_INFO("  Average throughput: %.0f packets/sec, %.2f KB/sec", pps, kbps);
+        
+        /* Performance classification */
+        if (pps > 10000) {
+            P_LOG_INFO("  Performance: EXCELLENT (>10K pps)");
+        } else if (pps > 5000) {
+            P_LOG_INFO("  Performance: GOOD (>5K pps)");
+        } else if (pps > 1000) {
+            P_LOG_INFO("  Performance: FAIR (>1K pps)");
+        } else {
+            P_LOG_INFO("  Performance: POOR (<1K pps) - consider optimization");
+        }
+        
+        /* Calculate success rate */
+        double success_rate = (double)(g_stats.packets_processed - g_stats.packets_dropped) * 100.0 / g_stats.packets_processed;
+        P_LOG_INFO("  Success rate: %.2f%% (%" PRIu64 "/%" PRIu64 ")",
+                   success_rate, g_stats.packets_processed - g_stats.packets_dropped, g_stats.packets_processed);
+    }
+    
+    P_LOG_INFO("=== End Statistics ===");
 }
 
 static inline time_t cached_now_seconds(void) {
@@ -243,12 +419,27 @@ static inline time_t cached_now_seconds(void) {
 }
 
 static int safe_close(int fd) {
-    if (fd < 0)
+    if (fd < 0) {
+        P_LOG_DEBUG("safe_close: invalid file descriptor %d", fd);
         return 0;
-    while (close(fd) != 0) {
-        if (errno != EINTR)
-            return -1;
     }
+    
+    int retry_count = 0;
+    const int max_retries = 3;
+    
+    while (close(fd) != 0) {
+        if (errno != EINTR) {
+            P_LOG_WARN("safe_close(fd=%d): %s", fd, strerror(errno));
+            return -1;
+        }
+        
+        retry_count++;
+        if (retry_count >= max_retries) {
+            P_LOG_WARN("safe_close: too many interrupts (%d) for fd=%d, giving up", max_retries, fd);
+            return -1;
+        }
+    }
+    
     return 0;
 }
 
@@ -266,15 +457,43 @@ static inline size_t align_up(size_t n, size_t align) {
 
 static inline void log_if_unexpected_errno(const char *what) {
     int e = errno;
-    if (!is_temporary_errno(e))
+    if (!is_temporary_errno(e)) {
         P_LOG_WARN("%s: %s", what, strerror(e));
+        
+        /* Track error statistics */
+        if (strstr(what, "send") || strstr(what, "sendmmsg")) {
+            g_stats.send_errors++;
+        } else if (strstr(what, "recv") || strstr(what, "recvmmsg")) {
+            g_stats.recv_errors++;
+        }
+    }
 }
 
 static inline bool validate_packet(const char *data, size_t len, const union sockaddr_inx *src) {
-    (void)data;
-    (void)src;
+    /* Validate input parameters */
+    if (!data || !src) {
+        P_LOG_WARN("validate_packet: NULL data or src pointer");
+        return false;
+    }
+    
     /* Basic sanity check: packet must be non-empty and within MTU limits */
-    return (len > 0 && len <= UDP_PROXY_DGRAM_CAP);
+    if (len == 0) {
+        P_LOG_DEBUG("validate_packet: empty packet discarded");
+        return false;
+    }
+    
+    if (len > UDP_PROXY_DGRAM_CAP) {
+        P_LOG_WARN("validate_packet: oversized packet (%zu bytes) discarded", len);
+        return false;
+    }
+    
+    /* Validate address family */
+    if (src->sa.sa_family != AF_INET && src->sa.sa_family != AF_INET6) {
+        P_LOG_WARN("validate_packet: unsupported address family %d", src->sa.sa_family);
+        return false;
+    }
+    
+    return true;
 }
 
 static inline bool is_power_of_two(unsigned v) {
@@ -282,11 +501,20 @@ static inline bool is_power_of_two(unsigned v) {
 }
 
 static inline void proxy_conn_hold(struct proxy_conn *conn) {
+    if (!conn) {
+        P_LOG_WARN("proxy_conn_hold: NULL connection pointer");
+        return;
+    }
+    if (conn->ref_count == UINT_MAX) {
+        P_LOG_WARN("proxy_conn_hold: reference count overflow detected");
+        return;
+    }
     conn->ref_count++;
 }
 
 static struct proxy_conn *init_proxy_conn(struct proxy_conn *conn) {
     if (!conn) {
+        P_LOG_WARN("init_proxy_conn: NULL connection pointer");
         return NULL;
     }
 
@@ -374,6 +602,16 @@ static inline void touch_proxy_conn(struct proxy_conn *conn) {
 }
 
 static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli_addr, int epfd) {
+    if (!cli_addr) {
+        P_LOG_WARN("proxy_conn_get_or_create: NULL client address");
+        return NULL;
+    }
+    
+    if (epfd < 0) {
+        P_LOG_WARN("proxy_conn_get_or_create: invalid epoll fd %d", epfd);
+        return NULL;
+    }
+    
     struct list_head *chain = &conn_tbl_hbase[bucket_index_fun(cli_addr)];
     struct proxy_conn *conn = NULL;
     int svr_sock = -1;
@@ -438,7 +676,10 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
                    (int)((conn_tbl_len * 100) / (unsigned)g_conn_pool.capacity));
         warned_high_water = true;
     }
-    if ((svr_sock = socket(g_cfg.dst_addr.sa.sa_family, SOCK_DGRAM, 0)) < 0) {
+
+    /* Create server socket with proper error handling */
+    svr_sock = socket(g_cfg.dst_addr.sa.sa_family, SOCK_DGRAM, 0);
+    if (svr_sock < 0) {
         P_LOG_ERR("socket(svr_sock): %s", strerror(errno));
         goto err;
     }
@@ -452,14 +693,21 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     }
     set_nonblock(svr_sock);
 
-    if (!(conn = init_proxy_conn(conn_pool_alloc(&g_conn_pool)))) {
+    /* Initialize connection structure */
+    conn = init_proxy_conn(conn_pool_alloc(&g_conn_pool));
+    if (!conn) {
         P_LOG_ERR("conn_pool_alloc: failed");
         goto err_unlock;
     }
+    
     conn->svr_sock = svr_sock;
     conn->cli_addr = *cli_addr;
+    conn->last_active = cached_now_seconds();
+    
+    /* Initialize LRU list head - required for list_empty() checks */
     INIT_LIST_HEAD(&conn->lru);
 
+    /* Add to epoll */
     ev.data.ptr = conn;
     ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn->svr_sock, &ev) < 0) {
@@ -467,6 +715,7 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
         goto err_unlock;
     }
 
+    /* Add to hash table and LRU */
     list_add_tail(&conn->list, chain);
     list_add_tail(&conn->lru, &g_lru_list);
 
@@ -474,7 +723,6 @@ static struct proxy_conn *proxy_conn_get_or_create(const union sockaddr_inx *cli
     P_LOG_INFO("New UDP session [%s]:%d, total %u", s_addr,
                ntohs(*port_of_sockaddr(cli_addr)), conn_tbl_len);
 
-    conn->last_active = cached_now_seconds();
     g_stats.connections_created++;
     /* ref_count is already 1 from init_proxy_conn */
     return conn;
@@ -514,8 +762,19 @@ static void release_proxy_conn(struct proxy_conn *conn, int epfd) {
 }
 
 static void proxy_conn_put(struct proxy_conn *conn, int epfd) {
-    if (--conn->ref_count == 0)
+    if (!conn) {
+        P_LOG_WARN("proxy_conn_put: NULL connection pointer");
+        return;
+    }
+    
+    if (conn->ref_count == 0) {
+        P_LOG_WARN("proxy_conn_put: reference count already zero");
+        return;
+    }
+    
+    if (--conn->ref_count == 0) {
         release_proxy_conn(conn, epfd);
+    }
 }
 
 static void proxy_conn_walk_continue(int epfd) {
@@ -816,21 +1075,30 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
                                     struct sockaddr_storage **c_addrs,
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP]) {
     const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
+    
+    /* Validate batch size */
+    if (ncap <= 0 || ncap > UDP_PROXY_BATCH_SZ) {
+        P_LOG_WARN("init_batching_resources: invalid batch size %d, using default %d", 
+                   ncap, UDP_PROXY_BATCH_SZ);
+        ncap = UDP_PROXY_BATCH_SZ;
+    }
 
     size_t size_c_msgs = (size_t)ncap * sizeof(**c_msgs);
     size_t size_c_iov  = (size_t)ncap * sizeof(**c_iov);
     size_t size_c_addrs= (size_t)ncap * sizeof(**c_addrs);
     size_t size_c_bufs = (size_t)ncap * sizeof(**c_bufs);
     size_t total = size_c_msgs + size_c_iov + size_c_addrs + size_c_bufs;
+    
+    /* Check for potential overflow */
+    if (total < size_c_msgs || total < size_c_iov || total < size_c_addrs || total < size_c_bufs) {
+        P_LOG_ERR("init_batching_resources: size calculation overflow");
+        goto fail;
+    }
 
     void *block = aligned_alloc(64, align_up(total, 64));
     if (!block) {
-        P_LOG_WARN("Failed to allocate UDP batching buffers; proceeding without batching.");
-        *c_msgs = NULL;
-        *c_iov = NULL;
-        *c_addrs = NULL;
-        *c_bufs = NULL;
-        return;
+        P_LOG_WARN("Failed to allocate UDP batching buffers (%zu bytes); proceeding without batching.", total);
+        goto fail;
     }
 
     char *p = (char *)block;
@@ -849,14 +1117,34 @@ static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_io
         (*c_msgs)[i].msg_hdr.msg_iovlen = 1;
         (*c_msgs)[i].msg_hdr.msg_name = &(*c_addrs)[i];
         (*c_msgs)[i].msg_hdr.msg_namelen = sizeof((*c_addrs)[i]);
+        /* Initialize control fields to prevent uninitialized memory */
+        (*c_msgs)[i].msg_hdr.msg_control = NULL;
+        (*c_msgs)[i].msg_hdr.msg_controllen = 0;
+        (*c_msgs)[i].msg_hdr.msg_flags = 0;
     }
+    
+    P_LOG_DEBUG("UDP batching resources initialized: batch_size=%d, total_allocated=%zu bytes", 
+                ncap, total);
+    return;
+    
+fail:
+    *c_msgs = NULL;
+    *c_iov = NULL;
+    *c_addrs = NULL;
+    *c_bufs = NULL;
 }
 
 static void destroy_batching_resources(struct mmsghdr *c_msgs, struct iovec *c_iov,
                                        struct sockaddr_storage *c_addrs,
                                        char (*c_bufs)[UDP_PROXY_DGRAM_CAP]) {
     (void)c_iov; (void)c_addrs; (void)c_bufs;
-    free(c_msgs);
+    
+    if (c_msgs) {
+        P_LOG_DEBUG("Destroying UDP batching resources");
+        free(c_msgs);
+    } else {
+        P_LOG_DEBUG("UDP batching resources already NULL, nothing to destroy");
+    }
 }
 #endif
 
@@ -889,6 +1177,7 @@ int main(int argc, char *argv[]) {
     time_t last_check = 0;
     struct epoll_event ev, events[MAX_EVENTS];
     uintptr_t magic_listener = EV_MAGIC_LISTENER;
+    bool resources_initialized = false;
 
 #ifdef __linux__
     struct mmsghdr *c_msgs = NULL;
@@ -897,10 +1186,18 @@ int main(int argc, char *argv[]) {
     char (*c_bufs)[UDP_PROXY_DGRAM_CAP] = {0};
 #endif
 
+    /* Initialize statistics */
+    g_stats.start_time = monotonic_seconds();
+    g_stats.last_stats_time = g_stats.start_time;
+
+    /* Initialize configuration with defaults */
     memset(&g_cfg, 0, sizeof(g_cfg));
     g_cfg.proxy_conn_timeo = DEFAULT_CONN_TIMEOUT_SEC;
     g_cfg.conn_tbl_hash_size = DEFAULT_HASH_TABLE_SIZE;
 
+    P_LOG_INFO("UDP Forwarder starting up...");
+
+    /* Parse command line arguments */
     int opt;
     while ((opt = getopt(argc, argv, "hdvRr6p:i:t:S:C:B:H:")) != -1) {
         switch (opt) {
@@ -969,21 +1266,32 @@ int main(int argc, char *argv[]) {
         }
     }
 
+    /* Validate arguments */
     if (optind > argc - 2) {
+        P_LOG_ERR("Missing required arguments");
         show_help(argv[0]);
         return 1;
     }
 
-    if (get_sockaddr_inx(argv[optind], &g_cfg.listen_addr, true) != 0)
+    /* Parse addresses */
+    if (get_sockaddr_inx(argv[optind], &g_cfg.listen_addr, true) != 0) {
+        P_LOG_ERR("Failed to parse listen address: %s", argv[optind]);
         return 1;
-    if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0)
+    }
+    if (get_sockaddr_inx(argv[optind + 1], &g_cfg.dst_addr, false) != 0) {
+        P_LOG_ERR("Failed to parse destination address: %s", argv[optind + 1]);
         return 1;
+    }
 
+    /* Initialize logging */
     openlog("udpfwd", LOG_PID | LOG_PERROR, LOG_DAEMON);
 
+    /* Daemonize if requested */
     if (g_cfg.daemonize) {
-        if (do_daemonize() != 0)
+        if (do_daemonize() != 0) {
+            P_LOG_ERR("Failed to daemonize");
             return 1;
+        }
 
         char log_path[256];
         unsigned short listen_port = ntohs(*port_of_sockaddr(&g_cfg.listen_addr));
@@ -996,19 +1304,24 @@ int main(int argc, char *argv[]) {
             P_LOG_INFO("UDP forwarder started, logging to %s", log_path);
     }
 
+    /* Create PID file if requested */
     if (g_cfg.pidfile) {
-        if (create_pid_file(g_cfg.pidfile) != 0)
-            return 1;
+        if (create_pid_file(g_cfg.pidfile) != 0) {
+            P_LOG_ERR("Failed to create PID file: %s", g_cfg.pidfile);
+            goto cleanup;
+        }
     }
 
+    /* Initialize connection pool */
     if (conn_pool_init(&g_conn_pool, g_conn_pool_capacity, sizeof(struct proxy_conn)) < 0) {
         P_LOG_ERR("conn_pool_init: failed");
         goto cleanup;
     }
+    resources_initialized = true;
 
+    /* Setup signal handlers */
     if (init_signals() != 0) {
         P_LOG_ERR("setup_shutdown_signals: failed");
-        rc = 1;
         goto cleanup;
     }
 
@@ -1169,24 +1482,63 @@ int main(int argc, char *argv[]) {
     }
 
 cleanup:
-    if (listen_sock >= 0)
+    P_LOG_INFO("UDP Forwarder shutting down...");
+    
+    /* Print final statistics before cleanup */
+    if (resources_initialized) {
+        print_statistics(g_stats.start_time);
+    }
+    
+    /* Close listening socket */
+    if (listen_sock >= 0) {
+        P_LOG_DEBUG("Closing listening socket (fd=%d)", listen_sock);
         safe_close(listen_sock);
-    epoll_close_comp(epfd);
+        listen_sock = -1;
+    }
+    
+    /* Close epoll instance */
+    if (epfd >= 0) {
+        P_LOG_DEBUG("Closing epoll instance (fd=%d)", epfd);
+        epoll_close_comp(epfd);
+        epfd = -1;
+    }
 
-    free(conn_tbl_hbase);
-    conn_tbl_hbase = NULL;
-    conn_pool_destroy(&g_conn_pool);
+    /* Clean up hash table */
+    if (conn_tbl_hbase) {
+        P_LOG_DEBUG("Cleaning up connection hash table");
+        free(conn_tbl_hbase);
+        conn_tbl_hbase = NULL;
+    }
+    
+    /* Clean up connection pool */
+    if (resources_initialized) {
+        P_LOG_DEBUG("Destroying connection pool");
+        conn_pool_destroy(&g_conn_pool);
+    }
+    
 #ifdef __linux__
+    /* Clean up batching resources */
     destroy_batching_resources(c_msgs, c_iov, c_addrs, c_bufs);
+    c_msgs = NULL;
+    c_iov = NULL;
+    c_addrs = NULL;
+    c_bufs = NULL;
 #endif
 
-    print_statistics(last_check);
-
+    /* Clean up logging */
     if (g_state.log_file) {
+        P_LOG_DEBUG("Closing log file");
         fclose(g_state.log_file);
         g_state.log_file = NULL;
     }
+    
+    /* Clean up PID file */
+    if (g_cfg.pidfile) {
+        cleanup_pidfile();
+    }
+    
     closelog();
-
+    
+    P_LOG_INFO("UDP Forwarder shutdown complete");
     return rc;
 }
