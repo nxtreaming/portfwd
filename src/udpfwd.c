@@ -1074,7 +1074,7 @@ static void handle_server_data(struct proxy_conn *conn, int lsn_sock, int epfd) 
 static void init_batching_resources(struct mmsghdr **c_msgs, struct iovec **c_iov,
                                     struct sockaddr_storage **c_addrs,
                                     char (**c_bufs)[UDP_PROXY_DGRAM_CAP]) {
-    const int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
+    int ncap = g_batch_sz_runtime > 0 ? g_batch_sz_runtime : UDP_PROXY_BATCH_SZ;
     
     /* Validate batch size */
     if (ncap <= 0 || ncap > UDP_PROXY_BATCH_SZ) {
