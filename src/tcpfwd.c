@@ -896,7 +896,7 @@ int main(int argc, char **argv) {
     init_signals();
 
     if (g_cfg.pidfile) {
-        cleanup_pidfile();
+        create_pidfile();
     }
 
     if (init_stats() != 0) {
