@@ -67,11 +67,6 @@
 #define UDP_PROXY_SOCKBUF_CAP (1024 * 1024)
 #endif
 
-#ifdef __linux__
-#ifndef UDP_PROXY_BATCH_SZ
-#define UDP_PROXY_BATCH_SZ 16
-#endif
-
 #ifndef UDP_PROXY_DGRAM_CAP
 /* Max safe UDP payload size: 1500 - 8 (UDP header) - 20 (IPv4 header) */
 #define UDP_PROXY_DGRAM_CAP 1472
@@ -80,6 +75,9 @@
 #if (UDP_PROXY_DGRAM_CAP <= 0) || (UDP_PROXY_DGRAM_CAP > 1472)
 #error "UDP_PROXY_DGRAM_CAP must be between 1 and 1472."
 #endif
+
+#ifndef UDP_PROXY_BATCH_SZ
+#define UDP_PROXY_BATCH_SZ 16
 #endif
 
 #ifndef UDP_PROXY_MAX_CONNS

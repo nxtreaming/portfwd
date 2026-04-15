@@ -47,8 +47,9 @@ tcpfwd: $(FWD_OBJS)
 	$(CC) $(CFLAGS) -o tcpfwd $(FWD_OBJS) $(LDFLAGS) $(LDFLAGS_PTHREAD)
 
 # udpfwd is single-threaded and does not need pthread
-udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O)
-	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool.o $(NO_EPOLL_O) $(LDFLAGS)
+# Uses conn_pool_st.o (compiled with CONN_POOL_NO_MUTEX) to avoid mutex overhead
+udpfwd: $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool_st.o $(NO_EPOLL_O)
+	$(CC) $(CFLAGS) -o udpfwd $(BUILD_DIR)/udpfwd.o $(BUILD_DIR)/common.o $(BUILD_DIR)/fwd_util.o $(BUILD_DIR)/conn_pool_st.o $(NO_EPOLL_O) $(LDFLAGS)
 
 # KCP-based TCP-over-UDP binaries with AEAD support
 KCPOBJS = $(BUILD_DIR)/kcp_common.o $(BUILD_DIR)/3rd/kcp/ikcp.o
@@ -82,6 +83,11 @@ $(BUILD_DIR)/%.o: %.c
 
 $(BUILD_DIR)/tcpfwd.o: tcpfwd.c common.h proxy_conn.h
 $(BUILD_DIR)/udpfwd.o: udpfwd.c common.h proxy_conn.h
+	$(CC) $(CFLAGS) -DCONN_POOL_NO_MUTEX -c -o $@ $<
+
+# Single-threaded conn_pool variant (no mutex) for udpfwd
+$(BUILD_DIR)/conn_pool_st.o: conn_pool.c conn_pool.h common.h
+	$(CC) $(CFLAGS) -DCONN_POOL_NO_MUTEX -c -o $@ $<
 $(BUILD_DIR)/common.o: common.c common.h
 $(BUILD_DIR)/no-epoll.o: no-epoll.c no-epoll.h
 $(BUILD_DIR)/kcptcp_client.o: kcptcp_client.c common.h proxy_conn.h kcptcp_common.h

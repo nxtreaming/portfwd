@@ -2,13 +2,16 @@
 #define __PORTFWD_CONN_POOL_H__
 
 #include <stddef.h>
+#ifndef CONN_POOL_NO_MUTEX
 #include <pthread.h>
+#endif
 
 /**
  * @brief A generic fixed-size object pool.
  *
  * This structure manages a pre-allocated pool of fixed-size memory blocks.
- * It is thread-safe through a mutex lock.
+ * When compiled without CONN_POOL_NO_MUTEX, it is thread-safe through a mutex lock.
+ * Define CONN_POOL_NO_MUTEX for single-threaded callers to avoid mutex overhead.
  */
 struct conn_pool {
     void *pool_mem;         /**< Pointer to the contiguous block of memory for all objects. */
@@ -17,7 +20,9 @@ struct conn_pool {
     size_t item_size;       /**< Size of a single object in the pool. */
     size_t used_count;      /**< Number of objects currently in use. */
     size_t high_water_mark; /**< Peak number of used objects for monitoring. */
+#ifndef CONN_POOL_NO_MUTEX
     pthread_mutex_t lock;   /**< Mutex for thread-safe operations. */
+#endif
 };
 
 /**

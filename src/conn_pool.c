@@ -5,6 +5,14 @@
 #include <errno.h>
 #include <stdint.h>
 
+#ifdef CONN_POOL_NO_MUTEX
+#define POOL_LOCK(p)   ((void)(p))
+#define POOL_UNLOCK(p) ((void)(p))
+#else
+#define POOL_LOCK(p)   pthread_mutex_lock(&(p)->lock)
+#define POOL_UNLOCK(p) pthread_mutex_unlock(&(p)->lock)
+#endif
+
 /* Validate that the item pointer belongs to this pool and is properly aligned */
 static int is_valid_pool_item(const struct conn_pool *pool, const void *item) {
     if (!pool || !item || !pool->pool_mem || pool->item_size == 0 || pool->capacity == 0)
@@ -55,6 +63,7 @@ int conn_pool_init(struct conn_pool *pool, size_t capacity, size_t item_size) {
     pool->used_count = 0;
     pool->high_water_mark = 0;
 
+#ifndef CONN_POOL_NO_MUTEX
     if (pthread_mutex_init(&pool->lock, NULL) != 0) {
         P_LOG_ERR("Failed to initialize connection pool mutex: %s", strerror(errno));
         free(pool->pool_mem);
@@ -62,6 +71,7 @@ int conn_pool_init(struct conn_pool *pool, size_t capacity, size_t item_size) {
         errno = EBUSY;
         return -1;
     }
+#endif
 
     return 0;
 }
@@ -70,7 +80,9 @@ void conn_pool_destroy(struct conn_pool *pool) {
     if (!pool) {
         return;
     }
+#ifndef CONN_POOL_NO_MUTEX
     pthread_mutex_destroy(&pool->lock);
+#endif
     free(pool->pool_mem);
     free(pool->freelist);
     memset(pool, 0, sizeof(*pool));
@@ -82,10 +94,10 @@ void *conn_pool_alloc(struct conn_pool *pool) {
         return NULL;
     }
 
-    pthread_mutex_lock(&pool->lock);
+    POOL_LOCK(pool);
 
     if (pool->used_count >= pool->capacity) {
-        pthread_mutex_unlock(&pool->lock);
+        POOL_UNLOCK(pool);
         errno = ENOSPC; /* Pool is full */
         return NULL;
     }
@@ -98,7 +110,7 @@ void *conn_pool_alloc(struct conn_pool *pool) {
         pool->high_water_mark = pool->used_count;
     }
 
-    pthread_mutex_unlock(&pool->lock);
+    POOL_UNLOCK(pool);
 
     return item;
 }
@@ -117,12 +129,12 @@ void conn_pool_release(struct conn_pool *pool, void *item) {
         return;
     }
 
-    pthread_mutex_lock(&pool->lock);
+    POOL_LOCK(pool);
 
     if (pool->used_count == 0) {
         /* Underflow detected: nothing to release */
         P_LOG_WARN("Pool underflow in release");
-        pthread_mutex_unlock(&pool->lock);
+        POOL_UNLOCK(pool);
         errno = EOVERFLOW;
         return;
     }
@@ -134,5 +146,5 @@ void conn_pool_release(struct conn_pool *pool, void *item) {
     pool->used_count--;
     pool->freelist[pool->used_count] = item;
 
-    pthread_mutex_unlock(&pool->lock);
+    POOL_UNLOCK(pool);
 }

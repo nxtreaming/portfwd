@@ -406,7 +406,10 @@ static void release_proxy_conn(struct proxy_conn *conn, struct epoll_event *even
     free(conn->response.data);
 
     release_connection_limit(&conn->cli_addr);
-    __sync_fetch_and_sub(&g_stats.current_active, 1);
+    /* Only decrement current_active if connection was fully established */
+    if (conn->state == S_FORWARDING) {
+        __sync_fetch_and_sub(&g_stats.current_active, 1);
+    }
     conn_pool_release(&g_conn_pool, conn);
 }
 
@@ -483,7 +486,7 @@ static void set_conn_epoll_fds(struct proxy_conn *conn, int epfd) {
 static int do_forward(struct proxy_conn *conn, int src_fd, int dst_fd, struct buffer_info *buf) {
     ssize_t n;
     if (buf->dlen > 0) {
-        n = write(dst_fd, buf->data + buf->rpos, buf->dlen);
+        n = write(dst_fd, buf->data + buf->rpos, buf->dlen - buf->rpos);
         if (n > 0) {
             buf->rpos += n;
             if (buf->rpos == buf->dlen) {
@@ -669,6 +672,22 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         conn->last_active = time(NULL);
         memcpy(&conn->cli_addr, &cli_addr, sizeof(cli_addr));
 
+        /* Allocate forwarding buffers */
+        conn->request.data = (char *)malloc(TCP_PROXY_USERBUF_CAP);
+        conn->response.data = (char *)malloc(TCP_PROXY_USERBUF_CAP);
+        if (!conn->request.data || !conn->response.data) {
+            P_LOG_ERR("malloc(forwarding buffers) failed");
+            free(conn->request.data);
+            free(conn->response.data);
+            conn->request.data = conn->response.data = NULL;
+            release_connection_limit(&cli_addr);
+            close(cli_sock);
+            conn_pool_release(&g_conn_pool, conn);
+            continue;
+        }
+        conn->request.capacity = TCP_PROXY_USERBUF_CAP;
+        conn->response.capacity = TCP_PROXY_USERBUF_CAP;
+
         set_sock_buffers(conn->cli_sock);
         set_keepalive(conn->cli_sock);
         set_tcp_nodelay(conn->cli_sock);
@@ -717,21 +736,40 @@ static int handle_new_connection(int listen_sock, int epfd, const struct fwd_con
         } else {
             P_LOG_ERR("connect() to %s: %s", sockaddr_to_string(dst_addr), strerror(errno));
             __sync_fetch_and_add(&g_stats.connect_errors, 1);
+            release_proxy_conn(conn, NULL, NULL, epfd);
+            continue;
         }
         __sync_fetch_and_add(&g_stats.total_accepted, 1);
-        int64_t current = __sync_fetch_and_add(&g_stats.current_active, 1) + 1;
-        if ((uint64_t)current > 0 && (uint64_t)current > g_stats.peak_concurrent)
-            g_stats.peak_concurrent = (uint64_t)current;
     }
     return 0;
 }
 
 static void print_stats_summary(void) {
-    // Implementation can be added here
+    time_t now = time(NULL);
+    time_t uptime = now - g_stats.start_time;
+    P_LOG_INFO("=== TCP Proxy Stats (uptime %lds) ===", (long)uptime);
+    P_LOG_INFO("  accepted=%lu connected=%lu failed=%lu errors=%lu rejected=%lu",
+               (unsigned long)g_stats.total_accepted,
+               (unsigned long)g_stats.total_connected,
+               (unsigned long)g_stats.total_failed,
+               (unsigned long)g_stats.connect_errors,
+               (unsigned long)g_stats.limit_rejections);
+    P_LOG_INFO("  active=%lu peak=%lu",
+               (unsigned long)g_stats.current_active,
+               (unsigned long)g_stats.peak_concurrent);
+    P_LOG_INFO("  bytes_in=%lu bytes_out=%lu",
+               (unsigned long)g_stats.bytes_received,
+               (unsigned long)g_stats.bytes_sent);
 }
 
+#define STATS_REPORT_INTERVAL 60
+
 static void report_stats_if_needed(void) {
-    // Implementation can be added here
+    time_t now = time(NULL);
+    if (now - g_stats.last_stats_report >= STATS_REPORT_INTERVAL) {
+        g_stats.last_stats_report = now;
+        print_stats_summary();
+    }
 }
 
 void usage(const char *prog) {
@@ -877,17 +915,18 @@ int main(int argc, char **argv) {
     int epfd = -1;
     int rc = 0;
 
-    memset(&g_cfg, 0, sizeof(g_cfg));
+    init_fwd_config(&g_cfg);
 
     if (parse_opts(argc, argv, &g_cfg) != 0) {
         return 1;
     }
 
-    g_sockbuf_cap_runtime = g_cfg.sockbuf_size;
-    g_ka_idle = g_cfg.ka_idle;
-    g_ka_intvl = g_cfg.ka_intvl;
-    g_ka_cnt = g_cfg.ka_cnt;
-    g_backpressure_wm = g_cfg.backpressure_wm;
+    /* Apply compile-time defaults for any config values not set by the user */
+    g_sockbuf_cap_runtime = g_cfg.sockbuf_size ? g_cfg.sockbuf_size : TCP_PROXY_SOCKBUF_CAP;
+    g_ka_idle = g_cfg.ka_idle ? g_cfg.ka_idle : TCP_PROXY_KEEPALIVE_IDLE;
+    g_ka_intvl = g_cfg.ka_intvl ? g_cfg.ka_intvl : TCP_PROXY_KEEPALIVE_INTVL;
+    g_ka_cnt = g_cfg.ka_cnt ? g_cfg.ka_cnt : TCP_PROXY_KEEPALIVE_CNT;
+    g_backpressure_wm = g_cfg.backpressure_wm ? g_cfg.backpressure_wm : TCP_PROXY_BACKPRESSURE_WM;
 
     if (g_cfg.daemonize) {
         do_daemonize();
@@ -896,7 +935,11 @@ int main(int argc, char **argv) {
     init_signals();
 
     if (g_cfg.pidfile) {
-        create_pidfile();
+        if (create_pid_file(g_cfg.pidfile) != 0) {
+            P_LOG_ERR("Failed to create PID file: %s", g_cfg.pidfile);
+            rc = 1;
+            goto cleanup;
+        }
     }
 
     if (init_stats() != 0) {
@@ -946,10 +989,6 @@ int main(int argc, char **argv) {
 
     if (g_cfg.username) {
         drop_privileges(g_cfg.username);
-        if (0) {
-            rc = 1;
-            goto cleanup;
-        }
     }
 
     proxy_loop(listen_sock, epfd, &g_cfg);
